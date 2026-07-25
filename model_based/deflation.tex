@@ -1,0 +1,24 @@
+\begin{algorithm}[H]
+\caption{Multi-mode signal generation for GLASSO}
+\label{alg:multi_mode_glasso}
+\begin{algorithmic}[1]
+\Require Observation $\y$, graph operators $\L_g,\bTheta$, weights $\lambda_g,\lambda_s$, number of modes $K$
+\Ensure Mode matrix $\X$ and empirical covariance $\C$
+\State $\A \gets \I+\lambda_g\L_g+\lambda_s\bTheta$
+\State $\U_0 \gets [\,]$, \quad $\X \gets [\,]$
+\For{$k=1,\ldots,K$}
+    \State Define $\Pi_{k-1}(\v) \gets \v-\U_{k-1}(\U_{k-1}^{\top}\v)$
+    \If{$k=1$}
+        \State $\z^{(0)} \gets \0$
+    \Else
+        \State $\z^{(0)} \gets \Pi_{k-1}(\x_{k-1})$
+    \EndIf
+    \State Solve $\Pi_{k-1}\A\Pi_{k-1}\z=\Pi_{k-1}\y$ by CG initialized at $\z^{(0)}$
+    \State $\x_k \gets \Pi_{k-1}(\z)$
+    \State $\q_k \gets \x_k/\|\x_k\|_2$, \quad $\U_k \gets [\U_{k-1},\q_k]$, \quad $\X \gets [\X,\x_k]$
+\EndFor
+\State $\bar{\x} \gets K^{-1}\sum_{k=1}^{K}\x_k$
+\State $\widetilde{\X} \gets [\x_1-\bar{\x},\ldots,\x_K-\bar{\x}]$
+\State $\C \gets (K-1)^{-1}\widetilde{\X}\widetilde{\X}^{\top}$
+\end{algorithmic}
+\end{algorithm}
