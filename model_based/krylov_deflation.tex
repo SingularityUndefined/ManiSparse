@@ -1,0 +1,167 @@
+\section{Krylov Reduced Deflation for MultiSignal}
+
+Let
+\[
+A = I + \lambda_L L + \lambda_\theta \Theta .
+\]
+The first E-step solves
+\[
+A x_1 = y .
+\]
+For \(k \ge 2\), the deflated modes in Algorithm~\ref{alg:multi_mode_glasso}
+solve
+\[
+P_{k-1} A P_{k-1} z_k = P_{k-1} y,
+\qquad
+x_k = P_{k-1}z_k,
+\]
+where
+\[
+P_{k-1}=I-Q_{k-1}Q_{k-1}^{\top},
+\qquad
+Q_{k-1}=[q_1,\ldots,q_{k-1}],
+\qquad
+q_i=\frac{x_i}{\|x_i\|_2}.
+\]
+
+\subsection{Krylov Reduction}
+
+Construct the Krylov subspace
+\[
+\mathcal K_m(A,y)
+=
+\operatorname{span}\{y,Ay,A^2y,\ldots,A^{m-1}y\}.
+\]
+Using Lanczos for symmetric \(A\), obtain an orthonormal basis \(V_m\)
+and a small tridiagonal matrix \(T_m\) such that
+\[
+V_m^{\top}V_m=I,
+\qquad
+V_m^{\top}AV_m=T_m,
+\qquad
+V_m^{\top}y=\beta e_1,
+\]
+with \(\beta=\|y\|_2\).
+Approximate each mode by
+\[
+x_k \approx V_m s_k .
+\]
+If \(q_i=V_m h_i\), the original projection becomes the small-space
+projection
+\[
+P^H_{k-1}=I-H_{k-1}H_{k-1}^{\top},
+\qquad
+H_{k-1}=[h_1,\ldots,h_{k-1}].
+\]
+The projected large system is reduced to
+\[
+P^H_{k-1}T_mP^H_{k-1}r_k
+=
+P^H_{k-1}\beta e_1,
+\qquad
+s_k=P^H_{k-1}r_k,
+\qquad
+x_k=V_m s_k .
+\]
+
+\begin{algorithm}[H]
+\caption{\(m\)-step Lanczos construction using an operator}
+\label{alg:operator_lanczos}
+\begin{algorithmic}[1]
+\Require Linear operator \(A(\cdot)\), start vector \(y\), Krylov dimension \(m\),
+tolerance \(\varepsilon\)
+\Ensure Krylov basis \(V_m=[v_1,\ldots,v_m]\), tridiagonal matrix \(T_m\),
+and \(\beta=\|y\|_2\)
+\State \(\beta\gets\|y\|_2\)
+\If{\(\beta\le\varepsilon\)}
+    \State \Return empty basis, empty \(T_m\), and \(\beta\)
+\EndIf
+\State \(v_1\gets y/\beta\), \quad \(v_0\gets 0\), \quad \(\gamma_0\gets 0\)
+\For{\(j=1,\ldots,m\)}
+    \State \(w\gets A(v_j)-\gamma_{j-1}v_{j-1}\)
+    \State \(\alpha_j\gets v_j^{\top}w\)
+    \State \(w\gets w-\alpha_jv_j\)
+    \State Reorthogonalize \(w\gets w-V_j(V_j^{\top}w)\), where
+    \(V_j=[v_1,\ldots,v_j]\)
+    \State \(\gamma_j\gets\|w\|_2\)
+    \If{\(\gamma_j\le\varepsilon\) or \(j=m\)}
+        \State Set final dimension \(m'\gets j\)
+        \State \textbf{break}
+    \EndIf
+    \State \(v_{j+1}\gets w/\gamma_j\)
+\EndFor
+\State Form \(V_{m'}=[v_1,\ldots,v_{m'}]\)
+\State Form tridiagonal \(T_{m'}\) with diagonal
+\(\alpha_1,\ldots,\alpha_{m'}\) and off-diagonal
+\(\gamma_1,\ldots,\gamma_{m'-1}\)
+\State \Return \(V_{m'},T_{m'},\beta\)
+\end{algorithmic}
+\end{algorithm}
+
+\begin{algorithm}[H]
+\caption{Projected Krylov subspace solve for one deflated mode}
+\label{alg:projected_krylov_solve}
+\begin{algorithmic}[1]
+\Require Reduced operator \(T_m\), reduced right-hand side \(b_m=\beta e_1\),
+current reduced orthonormal basis \(H_{k-1}\)
+\Ensure Reduced mode coordinate \(s_k\)
+\State Define \(P^H_{k-1}(v)\gets v-H_{k-1}(H_{k-1}^{\top}v)\)
+\State Define the projected reduced operator
+\[
+\mathcal T_{k-1}(v)\gets P^H_{k-1}T_mP^H_{k-1}v
+\]
+\State \(b_k\gets P^H_{k-1}b_m\)
+\State Solve \(\mathcal T_{k-1}(r_k)=b_k\) in \(\mathbb R^m\)
+\State \(s_k\gets P^H_{k-1}r_k\)
+\State \Return \(s_k\)
+\end{algorithmic}
+\end{algorithm}
+
+\begin{algorithm}[H]
+\caption{Krylov reduced multi-mode signal generation}
+\label{alg:krylov_reduced_multimode}
+\begin{algorithmic}[1]
+\Require Observation \(y\), operators \(L,\Theta\), weights
+\(\lambda_L,\lambda_\theta\), modes \(K\), Krylov dimension \(m\)
+\Ensure Mode matrix \(X=[x_1,\ldots,x_K]\)
+\State Define \(A(v)\gets v+\lambda_L L(v)+\lambda_\theta\Theta(v)\)
+\State Run Algorithm~\ref{alg:operator_lanczos} on \(A\) with start vector \(y\)
+\State Obtain \(V_m,T_m,\beta\), where \(V_m^{\top}y=\beta e_1\)
+\State Solve \(T_m s_1=\beta e_1\)
+\State \(x_1\gets V_m s_1\)
+\State \(h_1\gets s_1/\|s_1\|_2\), \quad \(H_1\gets[h_1]\), \quad \(X\gets[x_1]\)
+\For{\(k=2,\ldots,K\)}
+    \State Run Algorithm~\ref{alg:projected_krylov_solve} with
+    \(T_m\), \(b_m=\beta e_1\), and \(H_{k-1}\) to obtain \(s_k\)
+    \State \(x_k\gets V_m s_k\)
+    \State \(h_k\gets s_k/\|s_k\|_2\)
+    \State \(H_k\gets[H_{k-1},h_k]\), \quad \(X\gets[X,x_k]\)
+\EndFor
+\State \Return \(X\)
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{Complexity}
+
+The direct projected CG implementation costs approximately
+\[
+O\left(\sum_{k=2}^{K}t_k\cdot \operatorname{cost}(A\text{-apply})\right),
+\]
+where \(t_k\) is the number of CG iterations for the \(k\)-th deflated mode.
+The Krylov reduced method costs approximately
+\[
+O\left(m\cdot\operatorname{cost}(A\text{-apply})\right)
++O(Km^3)+O(Kmn).
+\]
+Here \(O(Km^3)\) comes from solving the small projected systems, and
+\(O(Kmn)\) comes from reconstructing \(x_k=V_m s_k\).
+When \(m\ll n\), the expensive applications of \(A\) are paid mainly during
+the Lanczos phase rather than repeatedly inside each deflated CG solve.
+
+\subsection{Remarks}
+
+The reduced method is exact only when the Krylov subspace captures the
+required solution space; otherwise it is an approximation controlled by
+\(m\). Larger \(m\) improves accuracy at the cost of memory and small-system
+work. If \(A\) is ill-conditioned, a preconditioned Krylov method may be
+needed.
