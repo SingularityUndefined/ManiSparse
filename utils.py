@@ -1,0 +1,586 @@
+import random
+import numpy as np
+import torch
+import torch.nn as nn
+import logging
+import matplotlib.pyplot as plt
+from tqdm import tqdm
+import math
+import argparse
+
+from dataset.dataset_utils import (
+    Normalization,
+    create_dataloader,
+    create_directed_dataloader,
+    create_weather_dataloader,
+)
+
+
+def seed_everything(seed=11):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+def setup_logger(name, logfile, level=logging.INFO, to_console=False):
+    # 创建logger
+    logger = logging.getLogger(name)
+    logger.setLevel(level)
+    
+    # 创建formatter
+    formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+    
+    # 创建文件handler并设置日志级别和格式
+    file_handler = logging.FileHandler(logfile)
+    file_handler.setLevel(level)
+    file_handler.setFormatter(formatter)
+    logger.addHandler(file_handler)
+    
+    # 根据参数决定是否创建控制台handler
+    if to_console:
+        console_handler = logging.StreamHandler()
+        console_handler.setLevel(level)
+        console_handler.setFormatter(formatter)
+        logger.addHandler(console_handler)
+    
+    return logger
+
+
+# def 
+class WeightedMSELoss(nn.Module):
+    def __init__(self, t, T, weights=None) -> None:
+        super().__init__()
+        self.t = t
+        self.T = T
+        if weights is None:
+            self.weights = t / (T - t)
+        else:
+            self.weights = weights
+
+    def forward(self, inputs, target):
+        rec_loss = nn.MSELoss()(inputs[:,:self.t], target[:,:self.t])# ((inputs[:,:self.t] - target[:,:self.t]) ** 2).mean()
+        pred_loss = nn.MSELoss()(inputs[:,self.t:], target[:,self.t:])# ((inputs[:,self.t:] - target[:,self.t:]) ** 2).mean()
+        return rec_loss * self.weights + pred_loss
+
+def plot_loss_curve(train_loss, val_loss, save_path, val_freq=5, use_log=False):
+    train_len, val_len = len(train_loss), len(val_loss)
+    if train_len > 1:
+        plt.figure()
+        plt.plot(list(range(1, train_len + 1)), train_loss, label='train')
+    if val_len != 0:
+        plt.plot(list(range(val_freq, val_len * val_freq + 1, val_freq)), val_loss, label='val')
+    if use_log:
+        plt.yscale('log')
+    if train_len > 1:
+        plt.legend()
+        plt.savefig(save_path)
+        plt.close()
+
+def log_gradients(epoch, num_epochs, iteration_count, train_loader, model, grad_logger, args):
+    if (iteration_count + 1) % args.loggrad == 0:
+        grad_logger.info(f'[Epoch {epoch}/{num_epochs}, Iter {iteration_count}/{len(train_loader)}]')
+    # when debug, print every (3 * args.loggrad) iterations to console
+    if (iteration_count + 1) % (3 * args.loggrad) == 0 and args.debug:
+        print(f'[Epoch {epoch}/{num_epochs}, Iter {iteration_count}/{len(train_loader)}]')
+
+    for name, param in model.named_parameters():
+        if 'agg' in name and 'weight' in name:
+            if (iteration_count + 1) % args.loggrad == 0:
+                grad_logger.info(f'{name}: ({param.min():.4f}, {param.max():.4f})\t grad (L2 norm): {param.grad.data.norm(2).item():.4f}')
+            if (iteration_count + 1) % (3 * args.loggrad) == 0 and args.debug:
+                print(f'{name}: ({param.min():.4f}, {param.max():.4f})\t grad (L2 norm): {param.grad.data.norm(2).item():.4f}')
+
+        if model.use_extrapolation and model.use_old_extrapolation and 'linear_extrapolation' in name:
+            if (iteration_count + 1) % args.loggrad == 0:
+                grad_logger.info(f'{name}: ({param.min():.4f}, {param.max():.4f})\t grad (L2 norm): {param.grad.data.norm(2).item():.4f}')
+            if (iteration_count + 1) % (3 * args.loggrad) == 0 and args.debug:
+                print(f'{name}: ({param.min():.4f}, {param.max():.4f})\t grad (L2 norm): {param.grad.data.norm(2).item():.4f}')
+
+def print_gradients(model):
+    for name, param in model.named_parameters():
+        if 'agg' in name and 'weight' in name:
+            print(f'{name}: ({param.min():.4f}, {param.max():.4f})\t grad (L2 norm): {param.grad.data.norm(2).item():.4f}')
+        if model.use_extrapolation and model.use_old_extrapolation and 'linear_extrapolation' in name:
+            print(f'{name}: ({param.min():.4f}, {param.max():.4f})\t grad (L2 norm): {param.grad.data.norm(2).item():.4f}')
+
+def change_model_location(model, model_path, device):
+    model_params = torch.load(model_path, map_location=device)
+    missing_keys, unexpected_keys = model.load_state_dict(model_params, strict=False)
+    print('missing keys:', missing_keys)
+    print('unexpected keys:', unexpected_keys)
+    # model = torch.load(model_path, map_location=device).to(device)
+    for name, module in model.named_children():
+        if hasattr(module, 'device'):
+            print(f'Loaded module: {name}')
+            module.device = device
+        if name == 'model_blocks':
+            for block in module:
+                block['feature_extractor'].device = device
+                block['ADMM_block'].device = device
+                block['graph_learning_module'].device = device
+    return model
+
+
+def test(model, val_loader, data_normalization, masked_flag, config, device, signal_channels, mode='test', loss_fn=None, use_one_channel=False, use_tqdm=True):
+    model.eval()
+    batch_count = 0
+    all_zero_batchs = 0
+    t_out = config['model']['t_out']
+    t_in = config['model']['t_in']
+    output_list = []
+    x_list = []
+    with torch.no_grad():
+        rec_mse = 0
+        pred_mse = 0
+        pred_mape = 0
+        pred_mae = 0
+        nearest_loss = 0
+        pred_mse_stepwise = torch.zeros((t_out,))
+        truth_sq_stepwise = torch.zeros((t_out,))
+        truth_sq = 0
+        if not use_one_channel:
+            rec_mse_d = np.zeros((signal_channels,))# .to(device)
+            pred_mse_d = np.zeros((signal_channels,))# .to(device)
+            pred_mape_d = np.zeros((signal_channels,))# .to(device)
+            pred_mae_d = np.zeros((signal_channels,))# .to(device)
+
+        if mode == 'val':
+            running_loss = 0
+
+        if use_tqdm:
+            val_loader_iter = tqdm(val_loader)
+        else:
+            val_loader_iter = val_loader
+
+        for y, x, t_list in val_loader_iter:
+            # if batch_count < 120:
+            #     batch_count += 1
+            #     continue
+            y, x, t_list = y.to(device), x.to(device), t_list.to(device)
+
+            # y = (y - train_mean) / train_std
+            # y = (y - train_min) / (train_max - train_min)
+            if data_normalization is not None:
+                normed_y = data_normalization.normalize_data(y)
+                normed_x = data_normalization.normalize_data(x, config['model']['use_one_channel'])
+                normed_output = model(normed_y, t_list)
+                
+                if config['normed_loss']:
+                    if loss_fn is not None:
+                        if masked_flag:
+                            loss = loss_fn(normed_output[:, config['model']['t_in']:], normed_x[:, config['model']['t_in']:])
+                        else:
+                            loss = loss_fn(normed_output, normed_x)
+                        running_loss += loss.item()
+                    # recover data
+                    output = data_normalization.recover_data(normed_output, config['model']['use_one_channel'])
+
+                else:
+                    output = data_normalization.recover_data(normed_output, config['model']['use_one_channel'])
+                    if loss_fn is not None:
+                        if masked_flag:
+                            loss = loss_fn(output[:,config['model']['t_in']:], x[:,config['model']['t_in']:])
+                        else:
+                            loss = loss_fn(output, x)
+                        running_loss += loss.item()
+            else:
+                output = model(y, t_list)
+                if loss_fn is not None:
+                    if masked_flag:
+                        loss = loss_fn(output[:,config['model']['t_in']:], x[:,config['model']['t_in']:])
+                    else:
+                        loss = loss_fn(output, x)
+                    running_loss += loss.item()
+            
+            # if args.mode == 'normalize':
+            #     output = nn.ReLU()(output)
+            # output = output * (train_max - train_min) + train_min
+            # output = output * train_std + train_mean
+            # if data_normalization is not None:
+            # metrics
+            '''
+            metrics_batch = compute_metrics(output.detach().cpu(), x.detach().cpu(), masked_flag, t_in)
+            rec_mse += metrics_batch['rec_MSE'] # ((x[:,:config['model']['t_in']] - output[:,:config['model']['t_in']]) ** 2).detach().cpu().mean().item()
+            pred_mse += metrics_batch['pred_MSE']
+            pred_mae += metrics_batch['pred_MAE']
+            if metrics_batch['pred_MAPE'] is None:
+                print('exist all zero batchs in ground-truth in pred_mape')
+                all_zero_batchs += 1
+            else:
+                pred_mape += metrics_batch['pred_MAPE']
+            pred_mse_stepwise += metrics_batch['pred_MSE_stepwise']
+            truth_sq_stepwise += metrics_batch['truth_sq_stepwise']
+            truth_sq += metrics_batch['truth_sq']
+            nearest_loss += metrics_batch['nearest_loss']
+            '''
+            output_list.append(output.detach().cpu())
+            x_list.append(x.detach().cpu())
+            if not use_one_channel:
+                rec_mse_d += ((x[:,:config['model']['t_in']] - output[:,:config['model']['t_in']]) ** 2).detach().cpu().mean((0,1,2)).cpu().numpy()# .item()
+            if masked_flag:
+                x, output = x[:,config['model']['t_in']:], output[:,config['model']['t_in']:]
+            
+            # if loss_fn is not None:
+            #     loss = loss_fn(output, x)
+            #     running_loss += loss.item()
+
+            
+            # x, output = x[:,:,:,1], output[:,:,:,1]
+            
+            if not masked_flag:
+                x_pred = x[:,t_in:]
+                output_pred = output[:,t_in:]
+                
+                # if mask.sum() == 0:
+                #     print(x_pred, output_pred)
+
+                # print('pred_mape', pred_mape)
+
+                if not use_one_channel:
+                    pred_mse_d += ((x_pred - output_pred) ** 2).detach().mean((0,1,2)).cpu().numpy()
+                    pred_mae_d += (torch.abs(output_pred - x_pred)).detach().mean((0,1,2)).cpu().numpy()
+                    for i in range(signal_channels):
+                        mask_i = x_pred[:,:,:,i] > 1e-8
+                        pred_mape_d[i] += (torch.abs(output_pred[:,:,:,i][mask_i] - x_pred[:,:,:,i][mask_i]) / x_pred[:,:,:,i][mask_i]).detach().cpu().mean().item() * 100
+            # break
+    '''
+    rec_rmse = math.sqrt(rec_mse / len(val_loader))
+    pred_rmse = math.sqrt(pred_mse / len(val_loader))
+    pred_mae = pred_mae / len(val_loader)
+    pred_mape = pred_mape / (len(val_loader) - all_zero_batchs) #len(val_loader)
+    pred_rnmse_stepwise = torch.sqrt(pred_mse_stepwise / truth_sq_stepwise)
+    pred_rnmse = torch.sqrt(pred_mse / truth_sq)
+    '''
+    full_output = torch.cat(output_list, 0)
+    full_x = torch.cat(x_list, 0)
+    metrics = compute_metrics(full_output, full_x, masked_flag, t_in)
+    metrics['rNMSE_stepwise'] = torch.sqrt(metrics['pred_MSE_stepwise'] / metrics['truth_sq_stepwise'])
+    metrics['rNMSE'] = math.sqrt(metrics['pred_MSE'] / metrics['truth_sq'])
+    metrics['rec_RMSE'] = math.sqrt(metrics['rec_MSE'])
+    metrics['pred_RMSE'] = math.sqrt(metrics['pred_MSE'])
+
+
+    if not use_one_channel:
+        rec_rmse_d = np.sqrt(rec_mse_d / len(val_loader))
+        pred_mse_d = np.sqrt(pred_mse_d / len(val_loader))
+        pred_mae_d = pred_mae_d / len(val_loader)
+        pred_mape_d = pred_mape_d / (len(val_loader) - all_zero_batchs) #len(val_loader)
+
+    if mode == 'val':
+        running_loss /= len(val_loader)
+    '''
+    metrics = {
+        'rec_RMSE': rec_rmse,
+        'pred_RMSE': pred_rmse,
+        'pred_MAE': pred_mae,
+        'pred_MAPE': pred_mape,
+        'rNMSE_stepwise': pred_rnmse_stepwise,
+        'rNMSE': pred_rnmse,
+    }
+    '''
+
+    if not use_one_channel:
+        metrics_d = {
+            'rec_RMSE': rec_rmse_d,
+            'pred_RMSE': pred_mse_d,
+            'pred_MAE': pred_mae_d,
+            'pred_MAPE': pred_mape_d 
+        }
+
+    if mode == 'val':
+        if not use_one_channel:
+            return running_loss, metrics, metrics_d
+        else:
+            return running_loss, metrics
+    elif mode == 'test':
+        if not use_one_channel:
+            return metrics, metrics_d
+        else:
+            return metrics
+    # return running_loss
+
+def test_series(model, val_loader, data_normalization, masked_flag, config, device, signal_channels, mode='test', loss_fn=None, use_one_channel=False, use_tqdm=True):
+    model.eval()
+    connect_list = model.connect_list
+    nearest_nodes = model.nearsest_nodes
+    nearest_dists = model.nearest_dists
+    batch_count = 0
+    all_zero_batchs = 0
+    t_out = config['model']['t_out']
+    t_in = config['model']['t_in']
+    output_list = []
+    x_list = []
+    normed_x_list = []
+    normed_output_list = []
+    undirected_graph_list = []
+    directed_graph_list = []
+    with torch.no_grad():
+        rec_mse = 0
+        pred_mse = 0
+        pred_mape = 0
+        pred_mae = 0
+        nearest_loss = 0
+        pred_mse_stepwise = torch.zeros((t_out,))
+        truth_sq_stepwise = torch.zeros((t_out,))
+        truth_sq = 0
+        if not use_one_channel:
+            rec_mse_d = np.zeros((signal_channels,))# .to(device)
+            pred_mse_d = np.zeros((signal_channels,))# .to(device)
+            pred_mape_d = np.zeros((signal_channels,))# .to(device)
+            pred_mae_d = np.zeros((signal_channels,))# .to(device)
+
+        if mode == 'val':
+            running_loss = 0
+
+        if use_tqdm:
+            val_loader_iter = tqdm(val_loader)
+        else:
+            val_loader_iter = val_loader
+
+        for y, x, t_list in val_loader_iter:
+            # if batch_count < 120:
+            #     batch_count += 1
+            #     continue
+            y, x, t_list = y.to(device), x.to(device), t_list.to(device)
+            # y = (y - train_mean) / train_std
+            # y = (y - train_min) / (train_max - train_min)
+            if data_normalization is not None:
+                normed_y = data_normalization.normalize_data(y)
+                normed_x = data_normalization.normalize_data(x, config['model']['use_one_channel'])
+                normed_output, undirected_graphs, directed_graphs = model(normed_y, t_list, output_graph=True)
+                print('graph shape', undirected_graphs.shape, directed_graphs.shape)
+                normed_x_list.append(normed_x.detach().cpu())
+                undirected_graph_list.append(undirected_graphs.detach().cpu())
+                directed_graph_list.append(directed_graphs.detach().cpu())
+                normed_output_list.append(normed_output.detach().cpu())
+                
+                if config['normed_loss']:
+                    if loss_fn is not None:
+                        if masked_flag:
+                            loss = loss_fn(normed_output[:, config['model']['t_in']:], normed_x[:, config['model']['t_in']:])
+                        else:
+                            loss = loss_fn(normed_output, normed_x)
+                        running_loss += loss.item()
+                    # recover data
+                    output = data_normalization.recover_data(normed_output, config['model']['use_one_channel'])
+
+                else:
+                    output = data_normalization.recover_data(normed_output, config['model']['use_one_channel'])
+                    if loss_fn is not None:
+                        if masked_flag:
+                            loss = loss_fn(output[:,config['model']['t_in']:], x[:,config['model']['t_in']:])
+                        else:
+                            loss = loss_fn(output, x)
+                        running_loss += loss.item()
+            else:
+                output, undirected_graphs, directed_graphs = model(y, t_list, output_graph=True)
+                undirected_graph_list.append(undirected_graphs.detach().cpu())
+                directed_graph_list.append(directed_graphs.detach().cpu())
+                # print('graph shape', undirected_graphs.shape, directed_graphs.shape)
+                # load graphs
+                if loss_fn is not None:
+                    if masked_flag:
+                        loss = loss_fn(output[:,config['model']['t_in']:], x[:,config['model']['t_in']:])
+                    else:
+                        loss = loss_fn(output, x)
+                    running_loss += loss.item()
+            
+            # if args.mode == 'normalize':
+            #     output = nn.ReLU()(output)
+            # output = output * (train_max - train_min) + train_min
+            # output = output * train_std + train_mean
+            # if data_normalization is not None:
+            # metrics
+            '''
+            metrics_batch = compute_metrics(output.detach().cpu(), x.detach().cpu(), masked_flag, t_in)
+            rec_mse += metrics_batch['rec_MSE'] # ((x[:,:config['model']['t_in']] - output[:,:config['model']['t_in']]) ** 2).detach().cpu().mean().item()
+            pred_mse += metrics_batch['pred_MSE']
+            pred_mae += metrics_batch['pred_MAE']
+            if metrics_batch['pred_MAPE'] is None:
+                print('exist all zero batchs in ground-truth in pred_mape')
+                all_zero_batchs += 1
+            else:
+                pred_mape += metrics_batch['pred_MAPE']
+            pred_mse_stepwise += metrics_batch['pred_MSE_stepwise']
+            truth_sq_stepwise += metrics_batch['truth_sq_stepwise']
+            truth_sq += metrics_batch['truth_sq']
+            nearest_loss += metrics_batch['nearest_loss']
+            '''
+            output_list.append(output.detach().cpu())
+            x_list.append(x.detach().cpu())
+
+    # TODO: model edge weights
+    full_output = torch.cat(output_list, 0)
+    full_x = torch.cat(x_list, 0)
+    full_normed_output = torch.cat(normed_output_list, 0)
+    full_normed_x = torch.cat(normed_x_list, 0)
+    full_undirected_graphs = torch.cat(undirected_graph_list, 0)
+    full_directed_graphs = torch.cat(directed_graph_list, 0)
+
+    return {
+        'output': full_output,
+        'x': full_x,
+        'normed_output': full_normed_output,
+        'normed_x': full_normed_x,
+        'connect_list': connect_list,
+        'nearest_nodes': nearest_nodes,
+        'nearest_dists': nearest_dists,
+        'undirected_graphs': full_undirected_graphs,
+        'directed_graphs': full_directed_graphs
+    }
+
+            
+            
+    # return running_loss
+
+def compute_metrics(output, x, masked_flag, t_in):
+    """
+    Compute the metrics for the model
+    output: model output, in (B, T, N, C)
+    x: ground truth, in (B, T, N, C)
+    masked_flag: whether to use the masked loss
+    """
+    rec_mse_batch = ((x[:,:t_in] - output[:,:t_in]) ** 2).mean().item()
+
+    if masked_flag:
+        x, output = x[:,t_in:], output[:,t_in:]
+        pred_mse = ((x - output) ** 2).mean().item()
+        pred_mae = (torch.abs(output - x)).mean().item()
+        mask = (torch.abs(x) > 1e-8)
+        if mask.sum() > 0:
+            pred_mape = (torch.abs(output[mask] - x[mask]) / torch.abs(x[mask])).mean().item() * 100
+        else:
+            pred_mape = None
+            # print('exist all zero batchs in ground-truth in pred_mape')
+            # print(x)
+        
+        # rnmse metric
+        pred_mse_stepwise = ((x - output) ** 2).mean((0,2,3))
+        truth_sq_stepwise = (x ** 2).mean((0,2,3))
+        truth_sq = (x ** 2).mean()
+        nearest_loss = ((x[:, 0] - output[:, 0]) ** 2).mean().item()
+        # rnmse_stepwise = torch.sqrt(mse_stepwise / truth_stepwise)
+        # rnmse = torch.sqrt(mse_stepwise.mean() / truth_stepwise.mean())
+
+
+    else:
+        x_pred = x[:,t_in:]
+        output_pred = output[:,t_in:]
+        mask = (torch.abs(x_pred) > 1e-8)
+        pred_mse = ((x_pred - output_pred) ** 2).mean().item()
+        pred_mae = (torch.abs(output_pred - x_pred)).mean().item()
+        if mask.sum() > 0:
+            pred_mape = (torch.abs(output_pred[mask] - x_pred[mask]) / torch.abs(x_pred[mask])).mean().item() * 100
+        else:
+            pred_mape = None
+            # print('exist all zero batchs in ground-truth in pred_mape')
+            # print(x_pred)
+        # rnmse metric
+        pred_mse_stepwise = ((x_pred - output_pred) ** 2).mean((0,2,3))
+        truth_sq_stepwise = (x_pred ** 2).mean((0,2,3))
+        truth_sq = (x_pred ** 2).mean()
+        nearest_loss = ((x[:, t_in] - output[:, t_in]) ** 2).mean().item()
+        # rnmse_stepwise = torch.sqrt(mse_stepwise / truth_stepwise)
+        # rnmse = torch.sqrt(mse_stepwise.mean() / truth_stepwise.mean())
+    
+    # dictionary for metrics
+    metrics = {
+        'rec_MSE': rec_mse_batch,
+        'pred_MSE': pred_mse,
+        'pred_MAE': pred_mae,
+        'pred_MAPE': pred_mape,
+        'pred_MSE_stepwise': pred_mse_stepwise,
+        'truth_sq_stepwise': truth_sq_stepwise,
+        'truth_sq': truth_sq,
+        'nearest_loss': nearest_loss
+    }
+
+    return metrics
+
+
+
+# check the gradients
+def check_nan_gradients(model:nn.Module):
+    # print all gradients
+    # flag = False
+    # nan_module = None # list of parameters with NaN gradients and inf gradients
+    for name, param in reversed(list(model.named_parameters())):
+        if param.grad is not None:
+            param_detached = param.detach().cpu()
+            grad_detached = param.grad.detach().cpu()
+            if torch.isnan(grad_detached).any() or torch.isnan(param_detached).any() or torch.isinf(grad_detached).any() or torch.isinf(param_detached).any():
+                return name
+                # break
+    return
+
+def log_parameters_scalars(model:nn.Module, name_list:list):
+    # num_blocks = model.num_blocks
+    param_dicts = {}
+    grad_dict = {}
+    for check_name in name_list:
+        param_dicts[check_name] = {}
+        # grad_dicts[check_name] = {}
+        for name, param in model.named_parameters():
+            if check_name in name:
+                name_split = name.split('.')
+                block_id, param_name = name_split[1], name_split[-1]
+                param_dicts[check_name][f'{param_name}_{block_id}_min'] = param.detach().cpu().min().item()
+                param_dicts[check_name][f'{param_name}_{block_id}_max'] = param.detach().cpu().max().item()
+                grad_dict[f'{param_name}_{block_id}'] = param.grad.data.detach().cpu().norm(2).item()
+                # logger.info(f'\t {name}: ({param.min():.4f}, {param.max():.4f})\t grad (L2 norm): {param.grad.data.norm(2).item():.4f}')
+    return param_dicts, grad_dict
+
+# TensorBoard utilities (legacy; not required for core training).
+def dataframe_from_tensorboard(log_dir, selected_tag):
+    """
+    处理 TensorBoard 日志数据
+    :param log_dir: TensorBoard 日志目录
+    :return: 返回处理后的数据
+    """
+    import pandas as pd
+    from tensorboard.backend.event_processing import event_accumulator
+
+    ea = event_accumulator.EventAccumulator(log_dir)
+    ea.Reload()
+
+    # 获取所有的 tags
+    tags = ea.Tags()
+    print("Available tags:", tags)
+
+    # 提取某个 tag 的数据（例如 'train/loss'）
+    scalar_data = ea.Scalars(selected_tag)
+
+    # 将数据转换为 DataFrame
+
+    df = pd.DataFrame({
+        "step": [e.step for e in scalar_data],
+        "value": [e.value for e in scalar_data]
+    })
+
+    return df
+
+def plot_dataframe(df, title="Training Loss Curve"):
+    """
+    绘制 DataFrame 数据
+    :param df: DataFrame 数据
+    :param title: 图表标题
+    """
+
+    plt.figure(figsize=(10, 5))
+    plt.plot(df["step"], df["value"])
+    plt.xlabel("Step")
+    plt.ylabel("Value")
+    plt.title(title)
+    plt.grid(True)
+    plt.show()
+
+
+def log_tensorboard():
+    pass
+
+
+def generate_experiment_name(args: argparse.Namespace, config:dict):
+    pass

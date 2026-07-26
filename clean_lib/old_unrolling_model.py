@@ -15,7 +15,14 @@ from clean_lib.feature_extractor import FeatureExtractor, GNNExtrapolation, Grap
 from clean_lib.graph_learning_module import GraphLearningModule
 
 
-def glasso_estimation(cov_matrix, alpha=0.2, method="admm", max_iter=20, tol=1e-4):
+def glasso_estimation(
+    cov_matrix,
+    alpha=0.2,
+    method="admm",
+    max_iter=20,
+    tol=1e-4,
+    allow_backward=False,
+):
     """
     Estimate the precision matrix (inverse covariance) using Graphical Lasso.
     Args:
@@ -24,6 +31,7 @@ def glasso_estimation(cov_matrix, alpha=0.2, method="admm", max_iter=20, tol=1e-
         method: One of "admm", "quic", or "sklearn".
         max_iter: Maximum solver iterations. Capped at 20 for this model.
         tol: Solver tolerance.
+        allow_backward: If False, Theta estimation is detached from autograd.
     Returns:
         Dense node precision matrix Theta, shape (N, N).
     """
@@ -32,19 +40,31 @@ def glasso_estimation(cov_matrix, alpha=0.2, method="admm", max_iter=20, tol=1e-
     max_iter = min(max_iter, 20)
     method = method.lower()
     cov_matrix = 0.5 * (cov_matrix + cov_matrix.transpose(-1, -2))
+    solver_cov = cov_matrix if allow_backward else cov_matrix.detach()
 
     if method == "admm":
         try:
             from glasso_pytorch import graphical_lasso
 
-            result = graphical_lasso(
-                cov_matrix,
-                alpha=alpha,
-                max_iter=max_iter,
-                tol=tol,
-                rtol=tol,
-                return_info=True,
-            )
+            if allow_backward:
+                result = graphical_lasso(
+                    solver_cov,
+                    alpha=alpha,
+                    max_iter=max_iter,
+                    tol=tol,
+                    rtol=tol,
+                    return_info=True,
+                )
+            else:
+                with torch.no_grad():
+                    result = graphical_lasso(
+                        solver_cov,
+                        alpha=alpha,
+                        max_iter=max_iter,
+                        tol=tol,
+                        rtol=tol,
+                        return_info=True,
+                    )
             return result.precision.to(device=device, dtype=dtype)
         except ImportError:
             method = "sklearn"
@@ -54,7 +74,7 @@ def glasso_estimation(cov_matrix, alpha=0.2, method="admm", max_iter=20, tol=1e-
             import numpy as np
             from inverse_covariance import quic
 
-            cov_np = cov_matrix.detach().cpu().numpy().astype(np.float64, copy=False)
+            cov_np = solver_cov.detach().cpu().numpy().astype(np.float64, copy=False)
             lam = np.full_like(cov_np, alpha, dtype=np.float64)
             np.fill_diagonal(lam, 0.0)
             precision, _, _, _, _, _ = quic(cov_np, lam, tol=tol, max_iter=max_iter)
@@ -66,7 +86,7 @@ def glasso_estimation(cov_matrix, alpha=0.2, method="admm", max_iter=20, tol=1e-
         from sklearn.covariance import GraphicalLasso
 
         model = GraphicalLasso(alpha=alpha, max_iter=max_iter, tol=tol)
-        model.fit(cov_matrix.detach().cpu().numpy())
+        model.fit(solver_cov.detach().cpu().numpy())
         return torch.tensor(model.precision_, dtype=dtype, device=device)
 
     raise ValueError(f"Unknown graphical lasso method: {method}")
@@ -127,6 +147,7 @@ class UnrollingModel(nn.Module):
         glasso_method="admm",
         glasso_max_iter=20,
         glasso_tol=1e-4,
+        glasso_allow_backward=False,
     ):
         super().__init__()
         graph_info = DEFAULT_GRAPH_INFO if graph_info is None else graph_info
@@ -147,6 +168,7 @@ class UnrollingModel(nn.Module):
         self.glasso_method = glasso_method
         self.glasso_max_iter = min(glasso_max_iter, 20)
         self.glasso_tol = glasso_tol
+        self.glasso_allow_backward = glasso_allow_backward
 
         self.nearsest_nodes, self.nearest_dists = find_k_nearest_neighbors(
             graph_info["n_nodes"],
@@ -377,6 +399,7 @@ class UnrollingModel(nn.Module):
                 method=self.glasso_method,
                 max_iter=self.glasso_max_iter,
                 tol=self.glasso_tol,
+                allow_backward=self.glasso_allow_backward,
             )
             ###########################################################################
 
