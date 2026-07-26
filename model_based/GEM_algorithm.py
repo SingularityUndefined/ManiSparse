@@ -369,7 +369,7 @@ class GEM(nn.Module):
             rtol=self.glasso_rtol,
         )
 
-    def M_step(self, multi_x, Theta):
+    def M_step(self, multi_x):
         # generate one precision matrix per batch
         # multi_x shape: (n_batch, n_samples, n_nodes)
         # output shape: (n_batch, n_nodes, n_nodes)
@@ -394,7 +394,7 @@ class GEM(nn.Module):
         # generate deflations from the optimal solutions x
         multi_x = self.MultiSignal(y, x, L, Theta, deflation_method=deflation_method, krylov_dim=krylov_dim) # shape (n_batch, n_samples, n_nodes)
         # M-step: generate one precision matrix per batch
-        Theta_new = self.M_step(multi_x, Theta) # shape (n_batch, n_nodes, n_nodes)
+        Theta_new = self.M_step(multi_x) # shape (n_batch, n_nodes, n_nodes)
         return x, Theta_new
 
     def forward(self, y, L_init=None, Theta_init=None):

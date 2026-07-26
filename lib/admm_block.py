@@ -14,6 +14,7 @@ class ADMMBlock(nn.Module):
                  'mu_u_init':10,
                  'mu_d1_init':10,
                  'mu_d2_init':10,
+                 'lambda_init':5,
                  }, 
                  ablation='None'):
         super().__init__()
@@ -30,7 +31,7 @@ class ADMMBlock(nn.Module):
         self.connect_list = connect_list
         self.nearest_nodes = nearest_nodes.to(torch.int64)
         self.ablation = ablation
-        assert self.ablation in ['None', 'DGLR', 'DGTV', 'UT', 'simple'], 'ablation should be None, DGLR, DGTV or UT'
+        assert self.ablation in ['None', 'DGLR', 'DGTV', 'UT', 'simple', 'Theta'], 'ablation should be None,Theta, DGLR, DGTV or UT'
 
         self.u_ew = None # place holder # dict: i: [B, T, k, n_heads]
         self.d_ew = None # place holder
@@ -43,22 +44,31 @@ class ADMMBlock(nn.Module):
         self.mu_u_init = ADMM_info['mu_u_init'] #3
         self.mu_d1_init = ADMM_info['mu_d1_init'] #$ 3
         self.mu_d2_init = ADMM_info['mu_d2_init'] # 3
+
+        # added data correlations
+        self.lambda_init = ADMM_info['lambda_init']
+
         self.mu_u = Parameter(torch.ones((self.ADMM_iters,), device=self.device) * self.mu_u_init, requires_grad=True)
         if self.ablation != 'DGTV':
             self.mu_d1 = Parameter(torch.ones((self.ADMM_iters,), device=self.device) * self.mu_d1_init, requires_grad=True)
         if self.ablation != 'DGLR':
             self.mu_d2 = Parameter(torch.ones((self.ADMM_iters,), device=self.device) * self.mu_d2_init, requires_grad=True)
+        if self.ablation != 'Theta':
+            self.lambda_theta = Parameter(torch.ones((self.ADMM_iters,), device=self.device) * self.lambda_init, requires_grad=True)
 
         # ADMM params, empirical initialized?
         self.rho_init = math.sqrt(self.n_nodes / self.T)
         self.rho_u_init = math.sqrt(self.n_nodes / self.T)
         self.rho_d_init = math.sqrt(self.n_nodes / self.T)
+        self.rho_theta = math.sqrt(self.n_nodes / self.T)
 
         if self.ablation != 'DGTV':
             self.rho = Parameter(torch.ones((self.ADMM_iters,), device=self.device) * self.rho_init, requires_grad=True)
 
         if self.ablation != 'simple':
             self.rho_u = Parameter(torch.ones((self.ADMM_iters,), device=self.device) * self.rho_u_init, requires_grad=True)
+        if self.ablation != 'Theta':
+            self.rho_theta = Parameter(torch.ones((self.ADMM_iters,), device=self.device) * self.rho_theta, requires_grad=True)
 
         if self.ablation not in ['DGLR', 'simple']:
             self.rho_d = Parameter(torch.ones((self.ADMM_iters,), device=self.device) * self.rho_d_init, requires_grad=True)
@@ -101,6 +111,9 @@ class ADMMBlock(nn.Module):
         return x - (self.u_ew.unsqueeze(-1) * pad_x[:,:,self.nearest_nodes[:,1:].reshape(-1)].view(B, T, self.n_nodes, -1, self.n_heads, self.n_channels)).sum(3)
         # return x - (self.u_ew.unsqueeze(-1) * pad_x[:,:,self.connect_list[:, 1:].reshape(-1)].view(B, T, self.n_nodes, -1, self.n_heads, self.n_channels)).sum(3)
 
+    def apply_op_Theta(self, x):
+        pass
+
 ########################### Dense line graph version ##########################
     def apply_op_Ldr(self, x):
         '''
@@ -129,11 +142,7 @@ class ADMMBlock(nn.Module):
         y[:,0] = x[:,0] * 0
         y[:,:-1] = y[:,:-1] - features # in (B, T-1, N, n_heads, n_channels)
         return y
-    
-    # def apply_op_Ldr(self, x):
-    #     '''
-    #     Args:
-    #         x in (B, T, n_nodes, n_head, n_channel) # B: batchsize
+
     #         edges in (B, T, interval, N, n_heads)
     #     '''
     #     B, T = x.size(0), x.size(1)
@@ -264,7 +273,7 @@ class ADMMBlock(nn.Module):
         HtHx[:,y.size(1):] = torch.zeros_like(x[:,y.size(1):])
         if self.ablation in ['DGTV', 'UT']:
             output = HtHx + (self.rho_u[iters] + self.rho_d[iters]) / 2 * x
-        elif self.ablation == 'None':
+        elif self.ablation in ['Theta', 'None']: # does not affect the 
             output = HtHx + (self.rho_u[iters] + self.rho_d[iters]) / 2 * x + self.rho[iters] / 2 * self.apply_op_cLdr(x)
         # elif self.ablation == 'UT':
         #     output = HtHx + (self.rho_u[iters] + self.rho_d[iters]) / 2 * x
