@@ -19,9 +19,26 @@ DEFAULT_ADMM_INFO = {
 
 
 class CGSolver(nn.Module):
-    """Unrolled conjugate-gradient-style solver with learnable step parameters."""
+    """Unrolled conjugate-gradient-style solver.
 
-    def __init__(self, ADMM_iters, CG_iters, n_heads, device, alpha_init=0.08, beta_init=0.08):
+    All solver tensors follow the ADMM block convention:
+        RHS, x0, residuals: (B, T, N, H, C)
+
+    The learnable step sizes are indexed by outer ADMM iteration and inner CG
+    iteration:
+        alpha, beta: (ADMM_iters, CG_iters, H, 1)
+    """
+
+    def __init__(
+        self,
+        ADMM_iters,
+        CG_iters,
+        n_heads,
+        device,
+        alpha_init=0.08,
+        beta_init=0.08,
+        name=None,
+    ):
         super().__init__()
         self.ADMM_iters = ADMM_iters
         self.CG_iters = CG_iters
@@ -29,6 +46,7 @@ class CGSolver(nn.Module):
         self.device = device
         self.alpha_init = alpha_init
         self.beta_init = beta_init
+        self.name = name
 
         param_shape = (ADMM_iters, CG_iters, n_heads, 1)
         self.alpha = Parameter(
@@ -41,9 +59,12 @@ class CGSolver(nn.Module):
         )
 
     def forward(self, LHS_func, RHS, x0, ADMM_iters, args=None):
+        """Approximately solve LHS_func(x) = RHS for one ADMM iteration."""
         if x0 is None:
             x0 = RHS.clone()
 
+        # r and p are the CG residual/search direction. They keep the same
+        # shape as the signal estimate: (B, T, N, H, C).
         r = RHS - self._apply_lhs(LHS_func, x0, ADMM_iters, args)
         p = r.clone()
 
@@ -70,6 +91,21 @@ class ADMMBlock(nn.Module):
 
     `u_ew`, `d_ew`, and optionally `Theta` are populated by the caller before
     `forward`.
+
+    External input/output convention:
+        y:      (B, observed_or_full_T, N, C)
+        output: (B, T, N, C)
+
+    Internal convention after expanding graph heads:
+        x, y, zu, zd, gamma_*: (B, T, N, H, C)
+        u_ew: (B, T, N, K, H), where K is nearest_nodes.size(1) - 1
+        d_ew: (B, T - 1, interval, N, H)
+        Theta: optional dense node precision/affinity matrix, (N, N)
+
+    Each ADMMBlock owns its own x/zu/zd CG solvers. Since UnrollingModel
+    constructs one ADMMBlock per unrolled layer, CG parameters are not shared
+    across layers. Within each solver, alpha/beta are indexed by ADMM
+    iteration, so different outer iterations use different parameter slices.
     """
 
     VALID_ABLATIONS = {"None", "DGLR", "DGTV", "UT", "simple", "Theta"}
@@ -105,6 +141,8 @@ class ADMMBlock(nn.Module):
             "ablation should be one of: None, Theta, DGLR, DGTV, UT, simple"
         )
 
+        # temp_indice[t-1, v] gives the source time index t - (v + 1) for
+        # directed temporal edges into target time t. Shape: (T - 1, interval).
         self.temp_indice = torch.arange(1, T).reshape(-1, 1) - torch.arange(1, interval + 1)
 
         self.u_ew = None
@@ -127,6 +165,18 @@ class ADMMBlock(nn.Module):
             torch.ones((self.n_heads,), device=self.device) / self.n_heads,
             requires_grad=True,
         )
+
+    @property
+    def x_solver(self):
+        return self._x_solver
+
+    @property
+    def zu_solver(self):
+        return self._zu_solver
+
+    @property
+    def zd_solver(self):
+        return self._zd_solver
 
     @property
     def alpha_x(self):
@@ -185,14 +235,26 @@ class ADMMBlock(nn.Module):
         self.beta_zu_init = beta_init
         self.beta_zd_init = beta_init
 
-        self.x_solver = self._make_cg_solver(self.alpha_x_init, self.beta_x_init)
+        # One ADMM update has multiple linear solves. Keep x, z_u, and z_d as
+        # distinct child modules so they have independent alpha/beta
+        # parameters. Each solver still has an ADMM_iters dimension, so every
+        # outer ADMM iteration uses its own parameter slice.
+        self._x_solver = self._make_cg_solver("x", self.alpha_x_init, self.beta_x_init)
 
         if self.ablation != "simple":
-            self.zu_solver = self._make_cg_solver(self.alpha_zu_init, self.beta_zu_init)
+            self._zu_solver = self._make_cg_solver(
+                "zu",
+                self.alpha_zu_init,
+                self.beta_zu_init,
+            )
         if self.ablation not in ["DGLR", "simple"]:
-            self.zd_solver = self._make_cg_solver(self.alpha_zd_init, self.beta_zd_init)
+            self._zd_solver = self._make_cg_solver(
+                "zd",
+                self.alpha_zd_init,
+                self.beta_zd_init,
+            )
 
-    def _make_cg_solver(self, alpha_init, beta_init):
+    def _make_cg_solver(self, name, alpha_init, beta_init):
         return CGSolver(
             ADMM_iters=self.ADMM_iters,
             CG_iters=self.CG_iters,
@@ -200,6 +262,7 @@ class ADMMBlock(nn.Module):
             device=self.device,
             alpha_init=alpha_init,
             beta_init=beta_init,
+            name=name,
         )
 
     def _vector_parameter(self, init_value):
@@ -209,10 +272,21 @@ class ADMMBlock(nn.Module):
         )
 
     def apply_op_Lu(self, x):
+        """Apply the learned spatial graph operator.
+
+        Args:
+            x: (B, T, N, H, C)
+
+        Returns:
+            (I - W_u) x with shape (B, T, N, H, C).
+        """
         batch_size, time_steps = x.size(0), x.size(1)
         pad_x = torch.zeros_like(x[:, :, 0], device=self.device).unsqueeze(2)
         pad_x = torch.cat((x, pad_x), dim=2)
 
+        # nearest_nodes[:, 0] is the node itself; columns 1: are spatial
+        # neighbors. Missing neighbors are expected to point to the padded zero
+        # node prepared above.
         neighbor_x = pad_x[:, :, self.nearest_nodes[:, 1:].reshape(-1)].view(
             batch_size,
             time_steps,
@@ -224,11 +298,31 @@ class ADMMBlock(nn.Module):
         return x - (self.u_ew.unsqueeze(-1) * neighbor_x).sum(3)
 
     def apply_op_Theta(self, x):
+        """Apply the optional dense node-level Theta matrix.
+
+        Args:
+            x: (B, T, N, H, C)
+
+        Returns:
+            Theta @ x over the node dimension, also (B, T, N, H, C).
+        """
         if self.Theta is None:
             return torch.zeros_like(x)
         return torch.einsum("ij,btjhc->btihc", self.Theta, x)
 
     def apply_op_Ldr(self, x):
+        """Apply directed temporal difference operator L_d.
+
+        For each target time t=1..T-1, each node receives `interval` previous
+        time states from temp_indice. The first time slice has no history and is
+        forced to zero.
+
+        Args:
+            x: (B, T, N, H, C)
+
+        Returns:
+            L_d x with shape (B, T, N, H, C).
+        """
         batch_size, time_steps = x.size(0), x.size(1)
         history = x[:, self.temp_indice.view(-1)].reshape(
             batch_size,
@@ -246,6 +340,14 @@ class ADMMBlock(nn.Module):
         return y
 
     def apply_op_Ldr_T(self, x):
+        """Apply transpose of directed temporal operator L_d^T.
+
+        Args:
+            x: (B, T, N, H, C)
+
+        Returns:
+            L_d^T x with shape (B, T, N, H, C).
+        """
         time_steps = x.size(1)
         features = self.d_ew.unsqueeze(-1) * x[:, 1:].unsqueeze(2)
         features = torch.stack(
@@ -262,9 +364,11 @@ class ADMMBlock(nn.Module):
         return y
 
     def apply_op_cLdr(self, x):
+        """Apply L_d^T L_d."""
         return self.apply_op_Ldr_T(self.apply_op_Ldr(x))
 
     def apply_op_Ln(self, x):
+        """Apply the undirected temporal operator used by the UT ablation."""
         batch_size, time_steps = x.size(0), x.size(1)
         history = x[:, self.temp_indice.view(-1)].reshape(
             batch_size,
@@ -290,37 +394,19 @@ class ADMMBlock(nn.Module):
         y[:, :-1] = y[:, :-1] - out_features
         return y
 
-    def CG_solver(self, LHS_func, RHS, x0, ADMM_iters, alpha=None, beta=None, args=None):
-        """Compatibility wrapper. New code should call a CGSolver module."""
-        if alpha is self.alpha_x and beta is self.beta_x:
-            return self.x_solver(LHS_func, RHS, x0, ADMM_iters, args=args)
-        if self.ablation != "simple" and alpha is self.alpha_zu and beta is self.beta_zu:
-            return self.zu_solver(LHS_func, RHS, x0, ADMM_iters, args=args)
-        if self.ablation not in ["DGLR", "simple"] and alpha is self.alpha_zd and beta is self.beta_zd:
-            return self.zd_solver(LHS_func, RHS, x0, ADMM_iters, args=args)
-
-        solver = CGSolver(
-            self.ADMM_iters,
-            self.CG_iters,
-            self.n_heads,
-            self.device,
-        )
-        if alpha is not None:
-            solver.alpha = Parameter(alpha, requires_grad=alpha.requires_grad)
-        if beta is not None:
-            solver.beta = Parameter(beta, requires_grad=beta.requires_grad)
-        return solver(LHS_func, RHS, x0, ADMM_iters, args=args)
-
     def LHS_simple_x(self, x, y, iters):
+        """Left-hand side for the single-variable/simple ADMM update."""
         HtHx = x.clone()
         HtHx[:, y.size(1) :] = torch.zeros_like(x[:, y.size(1) :])
         return (
             HtHx
             + self.mu_u[iters] * self.apply_op_Lu(x)
+            + self.lambda_theta[iters] * self.apply_op_Theta(x)
             + (self.mu_d2[iters] + self.rho[iters] / 2) * self.apply_op_cLdr(x)
         )
 
     def LHS_x(self, x, y, iters):
+        """Left-hand side for the x update in the split ADMM formulation."""
         HtHx = x.clone()
         HtHx[:, y.size(1) :] = torch.zeros_like(x[:, y.size(1) :])
 
@@ -344,36 +430,36 @@ class ADMMBlock(nn.Module):
         raise ValueError(f"Unsupported ablation: {self.ablation}")
 
     def LHS_zu(self, zu, iters):
+        """Left-hand side for the spatial auxiliary variable z_u."""
         output = self.mu_u[iters] * self.apply_op_Lu(zu) + self.rho_u[iters] / 2 * zu
         if self.ablation != "Theta":
             output = output + self.lambda_theta[iters] * self.apply_op_Theta(zu)
         return output
 
     def LHS_zd(self, zd, iters):
+        """Left-hand side for the temporal auxiliary variable z_d."""
         if self.ablation == "UT":
             return self.mu_d2[iters] * self.apply_op_Ln(zd) + self.rho_d[iters] / 2 * zd
         return self.mu_d2[iters] * self.apply_op_cLdr(zd) + self.rho_d[iters] / 2 * zd
 
-    def soft_threshold(self, phi, lambda_):
-        u = torch.abs(phi) - lambda_
-        return torch.sign(phi) * u * (u > 0)
-
-    def Phi_PGD(self, phi, x, gamma, ADMM_iters):
-        for i in range(self.PGD_iters):
-            df = gamma + self.rho[ADMM_iters] * (phi - self.apply_op_Ldr(x))
-            phi = self.soft_threshold(
-                phi - self.epsilon[ADMM_iters, i] * df,
-                self.epsilon[ADMM_iters, i] * self.mu_d1[ADMM_iters],
-            )
-        return phi
-
     def phi_direct(self, x, gamma, ADMM_iters):
+        """Closed-form soft-threshold update for temporal sparsity variable phi."""
         s = self.apply_op_Ldr(x) - gamma / self.rho[ADMM_iters]
         d = self.mu_d1[ADMM_iters] / self.rho[ADMM_iters]
         u = torch.abs(s) - d
         return torch.sign(s) * u * (u > 0)
 
     def forward(self, y, mask=None):
+        """Run one ADMM block over a sequence.
+
+        Args:
+            y: (B, t, N, C) if only observed steps are provided, or
+               (B, T, N, C) if the sequence has already been extrapolated.
+            mask: observed length t when y already has T time steps.
+
+        Returns:
+            Reconstructed sequence with shape (B, T, N, C).
+        """
         if y.size(1) < self.T:
             x = LR_guess(y, self.T, self.device)
         else:
@@ -381,14 +467,18 @@ class ADMMBlock(nn.Module):
             x = y[:, 0 : self.T]
             y = y[:, 0:mask]
 
+        # ADMM operates on H learned graph heads. The final head dimension is
+        # collapsed by comb_weights before returning.
         y = y.unsqueeze(-2).repeat(1, 1, 1, self.n_heads, 1)
         x = x.unsqueeze(-2).repeat(1, 1, 1, self.n_heads, 1)
 
+        # Dual variables for x = z_u and x = z_d constraints.
         gamma_u = torch.ones_like(x) * 0.05
         gamma_d = torch.ones_like(x) * 0.1
         zu = x.clone()
         zd = x.clone()
 
+        # phi/gamma are only used when the directed temporal L1 term is active.
         if self.ablation in ["None", "DGLR", "simple"]:
             gamma = torch.ones_like(x) * 0.1
             phi = self.apply_op_Ldr(x)
@@ -422,6 +512,7 @@ class ADMMBlock(nn.Module):
         return torch.einsum("btnhc, h -> btnc", x, self.comb_weights)
 
     def _update_simple_x(self, x, y, Hty, phi, gamma, iteration):
+        """Update x for the simplified formulation without z_u/z_d solves."""
         RHS_x = self.apply_op_Ldr_T(self.rho[iteration] * phi + gamma) / 2 + Hty
         self._assert_finite(RHS_x, "RHS_x", iteration)
         x = self.x_solver(self.LHS_simple_x, RHS_x, x, iteration, args=y)
@@ -441,6 +532,7 @@ class ADMMBlock(nn.Module):
         gamma=None,
         phi=None,
     ):
+        """Update x, z_u, z_d and their dual variables for one ADMM iteration."""
         RHS_x = self._build_RHS_x(Hty, zu, zd, gamma_u, gamma_d, iteration, gamma, phi)
         self._assert_finite(RHS_x, "RHS_x", iteration)
 
@@ -463,6 +555,7 @@ class ADMMBlock(nn.Module):
         return x, zu, zd, gamma_u, gamma_d
 
     def _build_RHS_x(self, Hty, zu, zd, gamma_u, gamma_d, iteration, gamma, phi):
+        """Build the right-hand side of the x linear solve for each ablation."""
         if self.ablation in ["DGTV", "UT"]:
             return (
                 (self.rho_u[iteration] * zu + self.rho_d[iteration] * zd) / 2

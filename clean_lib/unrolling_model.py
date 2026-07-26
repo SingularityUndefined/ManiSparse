@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 from torch.nn.parameter import Parameter
 
-from clean_lib.old_admm_block import ADMMBlock
+from clean_lib.admm_block import ADMMBlock
 from clean_lib.backup_modules import (
     LR_guess,
     SpatialTemporalEmbedding,
@@ -15,23 +15,61 @@ from clean_lib.feature_extractor import FeatureExtractor, GNNExtrapolation, Grap
 from clean_lib.graph_learning_module import GraphLearningModule
 
 
-#### TODO: add gpu supports for Graphical Lasso ##########
-def glasso_estimation(cov_matrix, alpha=0.2):
+def glasso_estimation(cov_matrix, alpha=0.2, method="quic", max_iter=20, tol=1e-4):
     """
     Estimate the precision matrix (inverse covariance) using Graphical Lasso.
     Args:
-        cov_matrix: The covariance matrix to be inverted.
+        cov_matrix: Dense node covariance matrix, shape (N, N).
         alpha: Regularization parameter for Graphical Lasso.
+        method: One of "admm", "quic", or "sklearn".
+        max_iter: Maximum solver iterations. Capped at 20 for this model.
+        tol: Solver tolerance.
     Returns:
-        The estimated precision matrix.
+        Dense node precision matrix Theta, shape (N, N).
     """
-    from sklearn.covariance import GraphicalLasso
-
     device = cov_matrix.device
+    dtype = cov_matrix.dtype
+    max_iter = min(max_iter, 20)
+    method = method.lower()
+    cov_matrix = 0.5 * (cov_matrix + cov_matrix.transpose(-1, -2))
 
-    model = GraphicalLasso(alpha=alpha, max_iter=100)
-    model.fit(cov_matrix.detach().cpu().numpy())
-    return torch.tensor(model.precision_, dtype=torch.float32).to(device)
+    if method == "admm":
+        try:
+            from glasso_pytorch import graphical_lasso
+
+            result = graphical_lasso(
+                cov_matrix,
+                alpha=alpha,
+                max_iter=max_iter,
+                tol=tol,
+                rtol=tol,
+                return_info=True,
+            )
+            return result.precision.to(device=device, dtype=dtype)
+        except ImportError:
+            method = "sklearn"
+
+    if method == "quic":
+        try:
+            import numpy as np
+            from inverse_covariance import quic
+
+            cov_np = cov_matrix.detach().cpu().numpy().astype(np.float64, copy=False)
+            lam = np.full_like(cov_np, alpha, dtype=np.float64)
+            np.fill_diagonal(lam, 0.0)
+            precision, _, _, _, _, _ = quic(cov_np, lam, tol=tol, max_iter=max_iter)
+            return torch.tensor(precision, dtype=dtype, device=device)
+        except ImportError:
+            method = "sklearn"
+
+    if method == "sklearn":
+        from sklearn.covariance import GraphicalLasso
+
+        model = GraphicalLasso(alpha=alpha, max_iter=max_iter, tol=tol)
+        model.fit(cov_matrix.detach().cpu().numpy())
+        return torch.tensor(model.precision_, dtype=dtype, device=device)
+
+    raise ValueError(f"Unknown graphical lasso method: {method}")
 
 DEFAULT_GRAPH_INFO = {
     "n_nodes": None,
@@ -57,6 +95,19 @@ DEFAULT_ST_EMB_INFO = {
 
 
 class UnrollingModel(nn.Module):
+    """Stacked unrolling model.
+
+    High-level data flow:
+        observed y -> extrapolated output -> optional ST embedding
+        -> feature extractor -> graph learning -> ADMM block
+        -> skip connection -> next block
+
+    Main external tensor convention:
+        y:      (B, t_in, N, C_signal)
+        t_list: (B, T), integer time indices used by ST embedding
+        output: (B, T, N, C_signal) or (B, T, N, 1) when use_one_channel=True
+    """
+
     def __init__(
         self,
         num_blocks,
@@ -86,6 +137,9 @@ class UnrollingModel(nn.Module):
         diff_interval=True,
         predict_only=False,
         le_emb=False,
+        glasso_method="quic",
+        glasso_max_iter=20,
+        glasso_tol=1e-4,
     ):
         super().__init__()
         graph_info = DEFAULT_GRAPH_INFO if graph_info is None else graph_info
@@ -103,7 +157,16 @@ class UnrollingModel(nn.Module):
         self.predict_only = predict_only
         self.use_extrapolation = use_extrapolation
         self.use_st_emb = use_st_emb
+        self.glasso_method = glasso_method
+        self.glasso_max_iter = min(glasso_max_iter, 20)
+        self.glasso_tol = glasso_tol
 
+        # Graph metadata:
+        #   u_edges: physical/direct graph edges, shape (E, 2)
+        #   u_dist: edge distances, shape (E,)
+        #   nearest_nodes: k-hop nearest list, shape (N, k_hop + 1). Column 0
+        #       is the node itself; later columns are neighbors or -1 padding.
+        #   nearest_dists: same shape as nearest_nodes.
         self.nearsest_nodes, self.nearest_dists = find_k_nearest_neighbors(
             graph_info["n_nodes"],
             graph_info["u_edges"],
@@ -117,6 +180,7 @@ class UnrollingModel(nn.Module):
         if self.use_extrapolation:
             self.use_old_extrapolation = use_old_extrapolation
             if self.use_old_extrapolation:
+                # Input: (B, t_in, N, C_signal); output: (B, T, N, C_signal).
                 self.linear_extrapolation = GNNExtrapolation(
                     graph_info["n_nodes"],
                     t_in,
@@ -128,6 +192,8 @@ class UnrollingModel(nn.Module):
                     sigma_ratio=sigma_ratio,
                 )
             else:
+                # GraphSAGE extrapolates missing future steps before ADMM starts.
+                # Input/output shapes match GNNExtrapolation above.
                 self.linear_extrapolation = GraphSAGEExtrapolation(
                     graph_info["n_nodes"],
                     t_in,
@@ -141,6 +207,8 @@ class UnrollingModel(nn.Module):
                 )
 
         if self.use_st_emb:
+            # st_emb(t_list) returns (B, T, N, C_st), where
+            # C_st = spatial_dim + t_dim + tid_dim + diw_dim.
             self.st_emb = SpatialTemporalEmbedding(
                 graph_info["n_nodes"],
                 graph_info["u_edges"],
@@ -164,6 +232,9 @@ class UnrollingModel(nn.Module):
             signal_emb_channels = signal_channels
 
         if self.use_one_channel:
+            # Only the first signal channel is reconstructed by ADMM. The
+            # embedding channels are still appended to the single reconstructed
+            # signal channel before feature extraction in later blocks.
             signal_rec_channels = 1
             signal_rec_emb_channels = signal_emb_channels - signal_channels + 1
         else:
@@ -182,6 +253,9 @@ class UnrollingModel(nn.Module):
             self.model_blocks.append(
                 nn.ModuleDict(
                     {
+                        # FeatureExtractor:
+                        #   input:  (B, T, N, block_input_channels)
+                        #   output: (B, T, N, H, feature_channels)
                         "feature_extractor": FeatureExtractor(
                             in_features=block_input_channels,
                             out_features=feature_channels,
@@ -191,6 +265,14 @@ class UnrollingModel(nn.Module):
                             interval=interval,
                             n_layers=extrapolation_agg_layers,
                         ),
+                        # ADMMBlock:
+                        #   input:  (B, T, N, signal_rec_channels)
+                        #   output: (B, T, N, signal_rec_channels)
+                        # Its graph weights are assigned just before forward.
+                        # This constructor is inside the layer loop, so every
+                        # unrolled layer owns an independent ADMMBlock and an
+                        # independent set of CGSolver modules/parameters:
+                        #   x_solver, zu_solver, zd_solver
                         "ADMM_block": ADMMBlock(
                             T=T,
                             n_nodes=graph_info["n_nodes"],
@@ -203,6 +285,9 @@ class UnrollingModel(nn.Module):
                             ADMM_info=ADMM_info,
                             ablation=self.ablation,
                         ),
+                        # GraphLearningModule consumes features and returns:
+                        #   u_ew: (B, T, N, K, H)
+                        #   d_ew: (B, T - 1, interval, N, H)
                         "graph_learning_module": GraphLearningModule(
                             T=T,
                             n_nodes=graph_info["n_nodes"],
@@ -225,6 +310,15 @@ class UnrollingModel(nn.Module):
         self.norm_shape = [self.T, graph_info["n_nodes"], signal_channels]
 
     def regularized_terms(self, x, t=None):
+        """Compute diagnostic regularization magnitudes on a full sequence.
+
+        Args:
+            x: full sequence, shape (B, T, N, C_signal).
+
+        Returns:
+            Per-block lists/tensors for signal norm, spatial Lu norm, temporal
+            Ld L1 norm, and temporal Ld L2 norm.
+        """
         assert not self.training, "only on validation and test"
         if self.use_norm:
             x, _, _ = layer_norm_on_data(x, self.norm_shape)
@@ -240,7 +334,9 @@ class UnrollingModel(nn.Module):
                 graph_learn = block["graph_learning_module"]
                 admm_block = block["ADMM_block"]
 
+                # features: (B, T, N, H, feature_channels)
                 features = feature_extractor(x)
+                # u_ew/d_ew become the graph operators used inside ADMMBlock.
                 u_ew, d_ew = graph_learn(features)
                 admm_block.u_ew = u_ew
                 admm_block.d_ew = d_ew
@@ -263,6 +359,7 @@ class UnrollingModel(nn.Module):
         )
 
     def clamp_param(self, alpha_max=None, beta_max=None):
+        """Clamp learnable CG step sizes after optimizer updates."""
         for block in self.model_blocks:
             admm_block = block["ADMM_block"]
             self._clamp_cg_param(admm_block, "alpha", alpha_max)
@@ -277,9 +374,28 @@ class UnrollingModel(nn.Module):
 
         for suffix in suffixes:
             param = getattr(admm_block, f"{prefix}_{suffix}")
-            param.data = torch.clamp(param.data, 0.0, max_value) if max_value is not None else torch.clamp(param.data, 0.0)
+            if max_value is None:
+                param.data = torch.clamp(param.data, 0.0)
+            else:
+                param.data = torch.clamp(param.data, 0.0, max_value)
 
     def forward(self, y, t_list, output_graph=False):
+        """Run the stacked unrolling model.
+
+        Args:
+            y: observed sequence, shape (B, t_in, N, C_signal).
+            t_list: time index sequence for the reconstructed horizon,
+                shape (B, T).
+            output_graph: when True, also return learned graph weights from
+                each block.
+
+        Returns:
+            output: (B, T, N, C_signal) unless use_one_channel=True, in which
+                case the reconstructed path uses C=1 internally.
+            If output_graph=True:
+                undirected_graphs: (B, num_blocks, T, N, K, H)
+                directed_graphs: (B, num_blocks, T - 1, interval, N, H)
+        """
         batch_size = y.size(0)
         if output_graph:
             directed_graph_list = []
@@ -288,6 +404,7 @@ class UnrollingModel(nn.Module):
         if self.use_norm:
             y, mean, std = layer_norm_on_data(y, self.y_norm_shape)
 
+        # Initial guess for the full horizon. Shape: (B, T, N, C_signal).
         if self.use_extrapolation:
             output = self.linear_extrapolation(y)
         else:
@@ -295,23 +412,29 @@ class UnrollingModel(nn.Module):
 
         assert not torch.isnan(output).any(), "linear extrapolation has nan"
         if self.use_st_emb:
+            # Shared across blocks because t_list and static node embeddings do
+            # not depend on the current reconstructed signal.
             shared_output_emb = self.st_emb(t_list)
 
         for i, block in enumerate(self.model_blocks):
+            # output_emb is what graph learning sees. It may include raw signal
+            # channels plus spatial/temporal embedding channels.
             output_emb = torch.cat((output, shared_output_emb), -1) if self.use_st_emb else output
             output_old = output[..., 0:1] if self.use_one_channel and i == 0 else output
 
             feature_extractor = block["feature_extractor"]
             graph_learn = block["graph_learning_module"]
             admm_block = block["ADMM_block"]
-            # glasso_block = block["glasso_block"] if "glasso_block" in block else None
 
             try:
+                # features: (B, T, N, H, feature_channels)
                 features = feature_extractor(output_emb)
             except ValueError as exc:
                 raise ValueError(f"Error in Feature extractor in Block {i}: {exc}") from exc
 
             try:
+                # u_ew: (B, T, N, K, H)
+                # d_ew: (B, T - 1, interval, N, H)
                 u_ew, d_ew = graph_learn(features)
             except AssertionError as exc:
                 raise ValueError(f"Error in Graph Learning Module in Block {i}: {exc}") from exc
@@ -322,19 +445,29 @@ class UnrollingModel(nn.Module):
 
             admm_block.u_ew = u_ew
             admm_block.d_ew = d_ew
-            ##################### THETA add ####################################
-            # TODO: add theta updation
-            # signal: output (B, T, N, C)
-            # USE ONE CHANNEL ONLY
-            cov_matrix = torch.einsum("btic,btjc->ij", output[..., 0:1], output[..., 0:1]) / (batch_size * self.T)
-            # cov_matrix = cov_matrix.detach().cpu().numpy()
-            admm_block.Theta =  glasso_estimation(cov_matrix) # if self.use_one_channel else None
-            ###########################################################################
+            # Theta branch:
+            #   output[..., 0:1] is (B, T, N, 1).
+            #   cov_matrix aggregates over batch, time and channel -> (N, N).
+            #   glasso_estimation returns Theta with shape (N, N), consumed by
+            #   ADMMBlock.apply_op_Theta over the node dimension.
+            cov_matrix = torch.einsum(
+                "btic,btjc->ij",
+                output[..., 0:1],
+                output[..., 0:1],
+            ) / (batch_size * self.T)
+            admm_block.Theta = glasso_estimation(
+                cov_matrix,
+                method=self.glasso_method,
+                max_iter=self.glasso_max_iter,
+                tol=self.glasso_tol,
+            )
 
             try:
                 if self.predict_only:
+                    # Keep the observed prefix fixed before each ADMM correction.
                     output[:, : self.t_in] = y[..., 0:1] if self.use_one_channel else y
 
+                # ADMM receives signal channels only, not ST embedding channels.
                 if self.use_one_channel:
                     output_new = admm_block(output[..., 0:1], self.t_in)
                 else:
@@ -345,6 +478,8 @@ class UnrollingModel(nn.Module):
             assert not torch.isnan(output_new).any(), f"output_new has NaN value in block {i}"
             p = self.skip_connection_weights[i]
             assert not torch.isnan(self.skip_connection_weights).any(), f"skip connection has NaN Values in block {i}"
+            # Learned residual/skip blend between the ADMM correction and the
+            # previous block output.
             output = p * output_new + (1 - p) * output_old
 
         if self.use_norm:
@@ -353,7 +488,3 @@ class UnrollingModel(nn.Module):
         if output_graph:
             return output, torch.cat(undirected_graph_list, 1), torch.cat(directed_graph_list, 1)
         return output
-
-
-def get_max_in_dict(ew):
-    return max(v.max() for v in ew.values())

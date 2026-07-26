@@ -263,6 +263,7 @@ class ADMMBlock(nn.Module):
         return (
             HtHx
             + self.mu_u[iters] * self.apply_op_Lu(x)
+            + self.lambda_theta[iters] * self.apply_op_Theta(x)
             + (self.mu_d2[iters] + self.rho[iters] / 2) * self.apply_op_cLdr(x)
         )
 
