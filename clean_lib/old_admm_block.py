@@ -18,58 +18,15 @@ DEFAULT_ADMM_INFO = {
 }
 
 
-class CGSolver(nn.Module):
-    """Unrolled conjugate-gradient-style solver with learnable step parameters."""
-
-    def __init__(self, ADMM_iters, CG_iters, n_heads, device, alpha_init=0.08, beta_init=0.08):
-        super().__init__()
-        self.ADMM_iters = ADMM_iters
-        self.CG_iters = CG_iters
-        self.n_heads = n_heads
-        self.device = device
-        self.alpha_init = alpha_init
-        self.beta_init = beta_init
-
-        param_shape = (ADMM_iters, CG_iters, n_heads, 1)
-        self.alpha = Parameter(
-            torch.ones(param_shape, device=device) * alpha_init,
-            requires_grad=True,
-        )
-        self.beta = Parameter(
-            torch.ones(param_shape, device=device) * beta_init,
-            requires_grad=True,
-        )
-
-    def forward(self, LHS_func, RHS, x0, ADMM_iters, args=None):
-        if x0 is None:
-            x0 = RHS.clone()
-
-        r = RHS - self._apply_lhs(LHS_func, x0, ADMM_iters, args)
-        p = r.clone()
-
-        for i in range(self.CG_iters):
-            Ap = self._apply_lhs(LHS_func, p, ADMM_iters, args)
-            x0 = x0 + self.alpha[ADMM_iters, i] * p
-            r = r - self.alpha[ADMM_iters, i] * Ap
-            p = r + self.beta[ADMM_iters, i] * p
-
-        return x0
-
-    @staticmethod
-    def _apply_lhs(LHS_func, x, ADMM_iters, args):
-        if args is None:
-            return LHS_func(x, ADMM_iters)
-        return LHS_func(x, args, ADMM_iters)
-
-
 class ADMMBlock(nn.Module):
     """Unrolled ADMM block.
 
     Tensor convention inside the block is:
         (batch, time, node, head, channel)
 
-    `u_ew`, `d_ew`, and optionally `Theta` are populated by the caller before
-    `forward`.
+    `u_ew` and `d_ew` are populated by the caller before `forward`.
+    The theta-related parameters and operation hook are intentionally kept as
+    interfaces only; theta logic is not implemented here.
     """
 
     VALID_ABLATIONS = {"None", "DGLR", "DGTV", "UT", "simple", "Theta"}
@@ -107,7 +64,7 @@ class ADMMBlock(nn.Module):
 
         self.temp_indice = torch.arange(1, T).reshape(-1, 1) - torch.arange(1, interval + 1)
 
-        self.u_ew = None
+        self.u_ew = None # place holders
         self.d_ew = None
         self.Theta = None
 
@@ -121,36 +78,12 @@ class ADMMBlock(nn.Module):
         self.lambda_init = ADMM_info["lambda_init"]
 
         self._init_admm_parameters()
-        self._init_cg_solvers()
+        self._init_cg_parameters()
 
         self.comb_weights = Parameter(
             torch.ones((self.n_heads,), device=self.device) / self.n_heads,
             requires_grad=True,
         )
-
-    @property
-    def alpha_x(self):
-        return self.x_solver.alpha
-
-    @property
-    def beta_x(self):
-        return self.x_solver.beta
-
-    @property
-    def alpha_zu(self):
-        return self.zu_solver.alpha
-
-    @property
-    def beta_zu(self):
-        return self.zu_solver.beta
-
-    @property
-    def alpha_zd(self):
-        return self.zd_solver.alpha
-
-    @property
-    def beta_zd(self):
-        return self.zd_solver.beta
 
     def _init_admm_parameters(self):
         self.mu_u = self._vector_parameter(self.mu_u_init)
@@ -172,35 +105,30 @@ class ADMMBlock(nn.Module):
             self.rho = self._vector_parameter(self.rho_init)
         if self.ablation != "simple":
             self.rho_u = self._vector_parameter(self.rho_u_init)
+        # if self.ablation != "Theta":
+        #     self.rho_theta = self._vector_parameter(self.rho_theta_init)
         if self.ablation not in ["DGLR", "simple"]:
             self.rho_d = self._vector_parameter(self.rho_d_init)
 
-    def _init_cg_solvers(self):
+    def _init_cg_parameters(self):
         alpha_init = 0.08
-        beta_init = 0.08
         self.alpha_x_init = alpha_init
         self.alpha_zu_init = alpha_init
         self.alpha_zd_init = alpha_init
-        self.beta_x_init = beta_init
-        self.beta_zu_init = beta_init
-        self.beta_zd_init = beta_init
+        self.beta_x_init = alpha_init
+        self.beta_zu_init = alpha_init
+        self.beta_zd_init = alpha_init
 
-        self.x_solver = self._make_cg_solver(self.alpha_x_init, self.beta_x_init)
+        self.alpha_x = self._cg_parameter(self.alpha_x_init)
+        self.beta_x = self._cg_parameter(self.beta_x_init)
 
         if self.ablation != "simple":
-            self.zu_solver = self._make_cg_solver(self.alpha_zu_init, self.beta_zu_init)
-        if self.ablation not in ["DGLR", "simple"]:
-            self.zd_solver = self._make_cg_solver(self.alpha_zd_init, self.beta_zd_init)
+            self.alpha_zu = self._cg_parameter(self.alpha_zu_init)
+            self.beta_zu = self._cg_parameter(self.beta_zu_init)
 
-    def _make_cg_solver(self, alpha_init, beta_init):
-        return CGSolver(
-            ADMM_iters=self.ADMM_iters,
-            CG_iters=self.CG_iters,
-            n_heads=self.n_heads,
-            device=self.device,
-            alpha_init=alpha_init,
-            beta_init=beta_init,
-        )
+        if self.ablation not in ["DGLR", "simple"]:
+            self.alpha_zd = self._cg_parameter(self.alpha_zd_init)
+            self.beta_zd = self._cg_parameter(self.beta_zd_init)
 
     def _vector_parameter(self, init_value):
         return Parameter(
@@ -208,7 +136,18 @@ class ADMMBlock(nn.Module):
             requires_grad=True,
         )
 
+    def _cg_parameter(self, init_value):
+        return Parameter(
+            torch.ones(
+                (self.ADMM_iters, self.CG_iters, self.n_heads, 1),
+                device=self.device,
+            )
+            * init_value,
+            requires_grad=True,
+        )
+
     def apply_op_Lu(self, x):
+        """Spatial graph operator."""
         batch_size, time_steps = x.size(0), x.size(1)
         pad_x = torch.zeros_like(x[:, :, 0], device=self.device).unsqueeze(2)
         pad_x = torch.cat((x, pad_x), dim=2)
@@ -224,11 +163,14 @@ class ADMMBlock(nn.Module):
         return x - (self.u_ew.unsqueeze(-1) * neighbor_x).sum(3)
 
     def apply_op_Theta(self, x):
+        """Theta operator interface. Implementation is intentionally deferred."""
+        # Theta in (n_node, n_nodes), x in (B, T, n_nodes, n_head, n_channels)
         if self.Theta is None:
-            return torch.zeros_like(x)
+            return 0 # no theta component if Theta is not set
         return torch.einsum("ij,btjhc->btihc", self.Theta, x)
 
     def apply_op_Ldr(self, x):
+        """Directed temporal graph operator."""
         batch_size, time_steps = x.size(0), x.size(1)
         history = x[:, self.temp_indice.view(-1)].reshape(
             batch_size,
@@ -246,7 +188,8 @@ class ADMMBlock(nn.Module):
         return y
 
     def apply_op_Ldr_T(self, x):
-        time_steps = x.size(1)
+        """Transpose of the directed temporal graph operator."""
+        _, time_steps = x.size(0), x.size(1)
         features = self.d_ew.unsqueeze(-1) * x[:, 1:].unsqueeze(2)
         features = torch.stack(
             [
@@ -265,6 +208,7 @@ class ADMMBlock(nn.Module):
         return self.apply_op_Ldr_T(self.apply_op_Ldr(x))
 
     def apply_op_Ln(self, x):
+        """Undirected temporal graph operator used by UT ablation."""
         batch_size, time_steps = x.size(0), x.size(1)
         history = x[:, self.temp_indice.view(-1)].reshape(
             batch_size,
@@ -290,26 +234,28 @@ class ADMMBlock(nn.Module):
         y[:, :-1] = y[:, :-1] - out_features
         return y
 
-    def CG_solver(self, LHS_func, RHS, x0, ADMM_iters, alpha=None, beta=None, args=None):
-        """Compatibility wrapper. New code should call a CGSolver module."""
-        if alpha is self.alpha_x and beta is self.beta_x:
-            return self.x_solver(LHS_func, RHS, x0, ADMM_iters, args=args)
-        if self.ablation != "simple" and alpha is self.alpha_zu and beta is self.beta_zu:
-            return self.zu_solver(LHS_func, RHS, x0, ADMM_iters, args=args)
-        if self.ablation not in ["DGLR", "simple"] and alpha is self.alpha_zd and beta is self.beta_zd:
-            return self.zd_solver(LHS_func, RHS, x0, ADMM_iters, args=args)
+    def CG_solver(self, LHS_func, RHS, x0, ADMM_iters, alpha, beta, args=None):
+        """Conjugate-gradient-style unrolled solver for LHS_func(x) = RHS."""
+        if x0 is None:
+            x0 = RHS.clone()
 
-        solver = CGSolver(
-            self.ADMM_iters,
-            self.CG_iters,
-            self.n_heads,
-            self.device,
-        )
-        if alpha is not None:
-            solver.alpha = Parameter(alpha, requires_grad=alpha.requires_grad)
-        if beta is not None:
-            solver.beta = Parameter(beta, requires_grad=beta.requires_grad)
-        return solver(LHS_func, RHS, x0, ADMM_iters, args=args)
+        if args is None:
+            r = RHS - LHS_func(x0, ADMM_iters)
+        else:
+            r = RHS - LHS_func(x0, args, ADMM_iters)
+
+        p = r.clone()
+        for i in range(self.CG_iters):
+            if args is None:
+                Ap = LHS_func(p, ADMM_iters)
+            else:
+                Ap = LHS_func(p, args, ADMM_iters)
+
+            x0 = x0 + alpha[ADMM_iters, i] * p
+            r = r - alpha[ADMM_iters, i] * Ap
+            p = r + beta[ADMM_iters, i] * p
+
+        return x0
 
     def LHS_simple_x(self, x, y, iters):
         HtHx = x.clone()
@@ -343,15 +289,15 @@ class ADMMBlock(nn.Module):
 
         raise ValueError(f"Unsupported ablation: {self.ablation}")
 
-    def LHS_zu(self, zu, iters):
-        output = self.mu_u[iters] * self.apply_op_Lu(zu) + self.rho_u[iters] / 2 * zu
-        if self.ablation != "Theta":
-            output = output + self.lambda_theta[iters] * self.apply_op_Theta(zu)
-        return output
+    def LHS_zu(self, zu, iters): # added theta support
+        if self.ablation == "Theta":
+            return self.mu_u[iters] * self.apply_op_Lu(zu) + self.rho_u[iters] / 2 * zu
+        return self.mu_u[iters] * self.apply_op_Lu(zu) + self.lambda_theta[iters] * self.apply_op_Theta(zu) + self.rho_u[iters] / 2 * zu
 
     def LHS_zd(self, zd, iters):
         if self.ablation == "UT":
             return self.mu_d2[iters] * self.apply_op_Ln(zd) + self.rho_d[iters] / 2 * zd
+
         return self.mu_d2[iters] * self.apply_op_cLdr(zd) + self.rho_d[iters] / 2 * zd
 
     def soft_threshold(self, phi, lambda_):
@@ -374,6 +320,12 @@ class ADMMBlock(nn.Module):
         return torch.sign(s) * u * (u > 0)
 
     def forward(self, y, mask=None):
+        """Run the ADMM block.
+
+        Args:
+            y: Input tensor in (batch, time, node, channel).
+            mask: Number of observed time steps when y already contains T steps.
+        """
         if y.size(1) < self.T:
             x = LR_guess(y, self.T, self.device)
         else:
@@ -386,32 +338,86 @@ class ADMMBlock(nn.Module):
 
         gamma_u = torch.ones_like(x) * 0.05
         gamma_d = torch.ones_like(x) * 0.1
-        zu = x.clone()
-        zd = x.clone()
 
         if self.ablation in ["None", "DGLR", "simple"]:
             gamma = torch.ones_like(x) * 0.1
             phi = self.apply_op_Ldr(x)
+
+        zu = x.clone()
+        zd = x.clone()
 
         for i in range(self.ADMM_iters):
             Hty = torch.zeros_like(x)
             Hty[:, 0 : y.size(1)] = y
 
             if self.ablation == "simple":
-                x = self._update_simple_x(x, y, Hty, phi, gamma, i)
-            else:
-                x, zu, zd, gamma_u, gamma_d = self._update_split_variables(
+                RHS_x = self.apply_op_Ldr_T(self.rho[i] * phi + gamma) / 2 + Hty
+                self._assert_finite(RHS_x, "RHS_x", i)
+                x = self.CG_solver(
+                    self.LHS_simple_x,
+                    RHS_x,
                     x,
-                    y,
-                    Hty,
-                    zu,
-                    zd,
-                    gamma_u,
-                    gamma_d,
                     i,
-                    gamma=gamma if self.ablation in ["None", "DGLR"] else None,
-                    phi=phi if self.ablation in ["None", "DGLR"] else None,
+                    self.alpha_x,
+                    self.beta_x,
+                    args=y,
                 )
+                self._assert_finite(x, "x", i)
+            else:
+                if self.ablation in ["DGTV", "UT"]:
+                    RHS_x = (
+                        (self.rho_u[i] * zu + self.rho_d[i] * zd) / 2
+                        - (gamma_u + gamma_d) / 2
+                        + Hty
+                    )
+                elif self.ablation in ["None", "Theta"]:
+                    RHS_x = (
+                        self.apply_op_Ldr_T(gamma + self.rho[i] * phi) / 2
+                        + (self.rho_u[i] * zu + self.rho_d[i] * zd) / 2
+                        - (gamma_u + gamma_d) / 2
+                        + Hty
+                    )
+                elif self.ablation == "DGLR":
+                    RHS_x = (
+                        self.apply_op_Ldr_T(gamma + self.rho[i] * phi) / 2
+                        + self.rho_u[i] * zu / 2
+                        - gamma_u / 2
+                        + Hty
+                    )
+                else:
+                    raise ValueError(f"Unsupported ablation: {self.ablation}")
+
+                self._assert_finite(RHS_x, "RHS_x", i)
+                x = self.CG_solver(
+                    self.LHS_x,
+                    RHS_x,
+                    x,
+                    i,
+                    self.alpha_x,
+                    self.beta_x,
+                    args=y,
+                )
+                self._assert_finite(x, "x", i)
+
+                RHS_zu = gamma_u / 2 + self.rho_u[i] / 2 * x
+                zu = self.CG_solver(self.LHS_zu, RHS_zu, zu, i, self.alpha_zu, self.beta_zu)
+                self._assert_finite(RHS_zu, "RHS_zu", i)
+
+                if self.ablation != "DGLR":
+                    RHS_zd = gamma_d / 2 + self.rho_d[i] / 2 * x
+                    zd = self.CG_solver(
+                        self.LHS_zd,
+                        RHS_zd,
+                        zd,
+                        i,
+                        self.alpha_zd,
+                        self.beta_zd,
+                    )
+                    self._assert_finite(RHS_zd, "RHS_zd", i)
+
+                gamma_u = gamma_u + self.rho_u[i] * (x - zu)
+                if self.ablation != "DGLR":
+                    gamma_d = gamma_d + self.rho_d[i] * (x - zd)
 
             if self.ablation in ["None", "DGLR", "simple"]:
                 phi = self.phi_direct(x, gamma, i)
@@ -420,73 +426,6 @@ class ADMMBlock(nn.Module):
                 self._assert_finite(phi, "phi", i)
 
         return torch.einsum("btnhc, h -> btnc", x, self.comb_weights)
-
-    def _update_simple_x(self, x, y, Hty, phi, gamma, iteration):
-        RHS_x = self.apply_op_Ldr_T(self.rho[iteration] * phi + gamma) / 2 + Hty
-        self._assert_finite(RHS_x, "RHS_x", iteration)
-        x = self.x_solver(self.LHS_simple_x, RHS_x, x, iteration, args=y)
-        self._assert_finite(x, "x", iteration)
-        return x
-
-    def _update_split_variables(
-        self,
-        x,
-        y,
-        Hty,
-        zu,
-        zd,
-        gamma_u,
-        gamma_d,
-        iteration,
-        gamma=None,
-        phi=None,
-    ):
-        RHS_x = self._build_RHS_x(Hty, zu, zd, gamma_u, gamma_d, iteration, gamma, phi)
-        self._assert_finite(RHS_x, "RHS_x", iteration)
-
-        x = self.x_solver(self.LHS_x, RHS_x, x, iteration, args=y)
-        self._assert_finite(x, "x", iteration)
-
-        RHS_zu = gamma_u / 2 + self.rho_u[iteration] / 2 * x
-        zu = self.zu_solver(self.LHS_zu, RHS_zu, zu, iteration)
-        self._assert_finite(RHS_zu, "RHS_zu", iteration)
-
-        if self.ablation != "DGLR":
-            RHS_zd = gamma_d / 2 + self.rho_d[iteration] / 2 * x
-            zd = self.zd_solver(self.LHS_zd, RHS_zd, zd, iteration)
-            self._assert_finite(RHS_zd, "RHS_zd", iteration)
-
-        gamma_u = gamma_u + self.rho_u[iteration] * (x - zu)
-        if self.ablation != "DGLR":
-            gamma_d = gamma_d + self.rho_d[iteration] * (x - zd)
-
-        return x, zu, zd, gamma_u, gamma_d
-
-    def _build_RHS_x(self, Hty, zu, zd, gamma_u, gamma_d, iteration, gamma, phi):
-        if self.ablation in ["DGTV", "UT"]:
-            return (
-                (self.rho_u[iteration] * zu + self.rho_d[iteration] * zd) / 2
-                - (gamma_u + gamma_d) / 2
-                + Hty
-            )
-
-        if self.ablation in ["None", "Theta"]:
-            return (
-                self.apply_op_Ldr_T(gamma + self.rho[iteration] * phi) / 2
-                + (self.rho_u[iteration] * zu + self.rho_d[iteration] * zd) / 2
-                - (gamma_u + gamma_d) / 2
-                + Hty
-            )
-
-        if self.ablation == "DGLR":
-            return (
-                self.apply_op_Ldr_T(gamma + self.rho[iteration] * phi) / 2
-                + self.rho_u[iteration] * zu / 2
-                - gamma_u / 2
-                + Hty
-            )
-
-        raise ValueError(f"Unsupported ablation: {self.ablation}")
 
     @staticmethod
     def _assert_finite(tensor, name, iteration):

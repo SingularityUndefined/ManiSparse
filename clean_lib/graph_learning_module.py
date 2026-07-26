@@ -24,7 +24,7 @@ class GraphLearningModule(nn.Module):
         diff_interval=True,
         directed_time=True,
         use_m_disp=True,
-    ):
+    ) -> None:
         super().__init__()
         self.directed_time = directed_time
         self.use_m_disp = use_m_disp

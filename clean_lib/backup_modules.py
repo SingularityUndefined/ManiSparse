@@ -114,7 +114,7 @@ class SpatialTemporalEmbedding(nn.Module):
         self.half_diw_dim = diw_dim // 2
 
         if self.learnable:
-            self.spatial_emb = Parameter(torch.randn(n_nodes, s_dim, device=device))
+            self.spatial_emb = Parameter(torch.randn(n_nodes, s_dim))
             self.tid_emb = nn.Embedding(12 * 24, tid_dim)
             self.diw_emb = nn.Embedding(7, diw_dim)
         else:
@@ -207,7 +207,7 @@ def connect_list(n_nodes, edges, device):
     return neighbors
 
 
-def k_hop_neighbors(n_nodes, edges, k):
+def k_hop_neighbors(n_nodes, edges: torch.Tensor, k):
     graph = nx.DiGraph()
     graph.add_edges_from(edges.detach().cpu().numpy())
 
@@ -220,7 +220,7 @@ def k_hop_neighbors(n_nodes, edges, k):
     return torch.LongTensor(np.array(list(new_edges)))
 
 
-def visualise_graph(edges, distances, dataset_name, fig_name):
+def visualise_graph(edges: torch.Tensor, distances: torch.Tensor, dataset_name, fig_name):
     import matplotlib.pyplot as plt
 
     edges = edges.detach().cpu().numpy()
@@ -238,7 +238,7 @@ def visualise_graph(edges, distances, dataset_name, fig_name):
     plt.savefig(fig_name, dpi=800)
 
 
-def find_k_nearest_neighbors(n_nodes, edges, distances, k, device):
+def find_k_nearest_neighbors(n_nodes, edges: torch.Tensor, distances: torch.Tensor, k, device):
     edges = edges.detach().cpu().numpy()
     distances = distances.detach().cpu().numpy()
 
@@ -259,7 +259,7 @@ def find_k_nearest_neighbors(n_nodes, edges, distances, k, device):
     return nearest_nodes, nearest_distance
 
 
-def layer_norm_on_data(x, norm_shape):
+def layer_norm_on_data(x: torch.Tensor, norm_shape):
     norm_dims = len(norm_shape)
     assert torch.Size(norm_shape) == x.shape[-norm_dims:], f"get {x[-norm_dims].size()} for {norm_shape}"
 

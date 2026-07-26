@@ -11,7 +11,14 @@ class Swish(nn.Module):
         return x * torch.sigmoid(self.beta * x)
 
 
-def spatial_gcn_aggregation(x, nearest_nodes, nearest_dist, n_heads, device, sigma):
+def spatial_gcn_aggregation(
+    x: torch.Tensor,
+    nearest_nodes: torch.Tensor,
+    nearest_dist: torch.Tensor,
+    n_heads,
+    device,
+    sigma,
+):
     batch_size, time_steps, n_nodes, n_in = x.size(0), x.size(1), x.size(2), x.size(-1)
     pad_x = torch.zeros_like(x[:, :, 0]).unsqueeze(2)
     pad_x = torch.cat((x, pad_x), dim=2)
