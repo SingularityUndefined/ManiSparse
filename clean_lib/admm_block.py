@@ -18,7 +18,7 @@ DEFAULT_ADMM_INFO = {
 }
 
 
-class CGSolver(nn.Module):
+class UnrolledCGSolver(nn.Module):
     """Unrolled conjugate-gradient-style solver.
 
     All solver tensors follow the ADMM block convention:
@@ -81,6 +81,62 @@ class CGSolver(nn.Module):
         if args is None:
             return LHS_func(x, ADMM_iters)
         return LHS_func(x, args, ADMM_iters)
+
+
+class DeflationCGSolver(nn.Module):
+    """Non-parametric CG solver used by multi-signal deflation.
+
+    Unlike `UnrolledCGSolver`, this solver has no learnable step sizes and is
+    always executed under `torch.no_grad()`.  It works on ADMM output tensors
+    shaped (B, T, N, C), and treats all dimensions except batch as one
+    flattened vector space.
+    """
+
+    def __init__(self, max_iter=10, tol=1e-6):
+        super().__init__()
+        self.max_iter = max_iter
+        self.tol = tol
+
+    def solve(self, A_func, b, x0=None):
+        with torch.no_grad():
+            return self._solve_no_grad(A_func, b.detach(), None if x0 is None else x0.detach())
+
+    def _solve_no_grad(self, A_func, b, x0=None):
+        if x0 is None:
+            x = torch.zeros_like(b)
+        else:
+            x = x0.clone()
+
+        reduce_dims = tuple(range(1, b.ndim))
+        r = b - A_func(x)
+        p = r.clone()
+        rsold = (r * r).sum(dim=reduce_dims)
+        eps = torch.finfo(b.dtype).eps
+
+        if torch.all(torch.sqrt(rsold) < self.tol):
+            return x
+
+        for _ in range(self.max_iter):
+            Ap = A_func(p)
+            denom = (p * Ap).sum(dim=reduce_dims)
+            valid_denom = torch.abs(denom) > eps
+            denom_safe = torch.where(valid_denom, denom, torch.ones_like(denom))
+            alpha = torch.where(valid_denom, rsold / denom_safe, torch.zeros_like(rsold))
+            view_shape = (b.size(0),) + (1,) * (b.ndim - 1)
+
+            x = x + alpha.view(view_shape) * p
+            r = r - alpha.view(view_shape) * Ap
+            rsnew = (r * r).sum(dim=reduce_dims)
+            if torch.all(torch.sqrt(rsnew) < self.tol):
+                break
+
+            valid_rsold = rsold > eps
+            rsold_safe = torch.where(valid_rsold, rsold, torch.ones_like(rsold))
+            beta = torch.where(valid_rsold, rsnew / rsold_safe, torch.zeros_like(rsold))
+            p = r + beta.view(view_shape) * p
+            rsold = rsnew
+
+        return x
 
 
 class ADMMBlock(nn.Module):
@@ -152,6 +208,9 @@ class ADMMBlock(nn.Module):
         self.ADMM_iters = ADMM_info["ADMM_iters"]
         self.CG_iters = ADMM_info["CG_iters"]
         self.PGD_iters = ADMM_info["PGD_iters"]
+        self.deflation_samples = ADMM_info.get("deflation_samples", 2)
+        self.deflation_CG_iters = ADMM_info.get("deflation_CG_iters", self.CG_iters)
+        self.deflation_tol = ADMM_info.get("deflation_tol", 1e-6)
 
         self.mu_u_init = ADMM_info["mu_u_init"]
         self.mu_d1_init = ADMM_info["mu_d1_init"]
@@ -160,6 +219,7 @@ class ADMMBlock(nn.Module):
 
         self._init_admm_parameters()
         self._init_cg_solvers()
+        self._init_deflation_solver()
 
         self.comb_weights = Parameter(
             torch.ones((self.n_heads,), device=self.device) / self.n_heads,
@@ -209,7 +269,7 @@ class ADMMBlock(nn.Module):
             self.mu_d1 = self._vector_parameter(self.mu_d1_init)
         if self.ablation != "DGLR":
             self.mu_d2 = self._vector_parameter(self.mu_d2_init)
-        if self.ablation != "Theta":
+        if self._uses_theta_regularizer():
             self.lambda_theta = self._vector_parameter(self.lambda_init)
 
         rho_init = math.sqrt(self.n_nodes / self.T)
@@ -254,8 +314,14 @@ class ADMMBlock(nn.Module):
                 self.beta_zd_init,
             )
 
+    def _init_deflation_solver(self):
+        self.deflation_solver = DeflationCGSolver(
+            max_iter=self.deflation_CG_iters,
+            tol=self.deflation_tol,
+        )
+
     def _make_cg_solver(self, name, alpha_init, beta_init):
-        return CGSolver(
+        return UnrolledCGSolver(
             ADMM_iters=self.ADMM_iters,
             CG_iters=self.CG_iters,
             n_heads=self.n_heads,
@@ -270,6 +336,10 @@ class ADMMBlock(nn.Module):
             torch.ones((self.ADMM_iters,), device=self.device) * init_value,
             requires_grad=True,
         )
+
+    def _uses_theta_regularizer(self):
+        """Whether this block includes the dense Theta regularizer."""
+        return self.ablation != "Theta"
 
     def apply_op_Lu(self, x):
         """Apply the learned spatial graph operator.
@@ -302,13 +372,22 @@ class ADMMBlock(nn.Module):
 
         Args:
             x: (B, T, N, H, C)
+            self.Theta: (N, N), shared by the batch, or (B, N, N), one dense
+                node matrix per batch sample.
 
         Returns:
             Theta @ x over the node dimension, also (B, T, N, H, C).
         """
         if self.Theta is None:
             return torch.zeros_like(x)
-        return torch.einsum("ij,btjhc->btihc", self.Theta, x)
+        Theta = torch.as_tensor(self.Theta, device=x.device, dtype=x.dtype)
+        if Theta.ndim == 2:
+            return torch.einsum("ij,btjhc->btihc", Theta, x)
+        if Theta.ndim == 3:
+            if Theta.size(0) != x.size(0):
+                raise ValueError("batched Theta must have the same batch size as x")
+            return torch.einsum("bij,btjhc->btihc", Theta, x)
+        raise ValueError("Theta must have shape (N, N) or (B, N, N)")
 
     def apply_op_Ldr(self, x):
         """Apply directed temporal difference operator L_d.
@@ -449,16 +528,124 @@ class ADMMBlock(nn.Module):
         u = torch.abs(s) - d
         return torch.sign(s) * u * (u > 0)
 
-    def forward(self, y, mask=None):
+    def _expand_heads(self, x):
+        """Expand a returned signal (B, T, N, C) to ADMM head space."""
+        return x.unsqueeze(-2).repeat(1, 1, 1, self.n_heads, 1)
+
+    def _combine_heads(self, x):
+        """Collapse ADMM head space (B, T, N, H, C) back to (B, T, N, C)."""
+        return torch.einsum("btnhc,h->btnc", x, self.comb_weights)
+
+    def _apply_deflation_Lu(self, x):
+        """Apply the same learned Lu operator used by ADMM to output-scale x."""
+        return self._combine_heads(self.apply_op_Lu(self._expand_heads(x)))
+
+    def _apply_deflation_Theta(self, x):
+        """Apply the block's current Theta parameter to output-scale x."""
+        if self.Theta is None:
+            return torch.zeros_like(x)
+        Theta = torch.as_tensor(self.Theta, device=x.device, dtype=x.dtype)
+        if Theta.ndim == 2:
+            return torch.einsum("ij,btjc->btic", Theta, x)
+        if Theta.ndim == 3:
+            return torch.einsum("bij,btjc->btic", Theta, x)
+        raise ValueError("Theta must have shape (N, N) or (B, N, N)")
+
+    def _deflation_lhs(self, x, iteration):
+        """Apply I + mu_u Lu + lambda_theta Theta for deflation solves."""
+        output = x + self.mu_u[iteration] * self._apply_deflation_Lu(x)
+        if self._uses_theta_regularizer():
+            output = output + self.lambda_theta[iteration] * self._apply_deflation_Theta(x)
+        return output
+
+    @staticmethod
+    def _mode_inner(x, y):
+        """Batchwise inner product over all non-batch dimensions."""
+        return (x * y).sum(dim=tuple(range(1, x.ndim)), keepdim=True)
+
+    def _normalize_mode(self, x):
+        norm = torch.sqrt(self._mode_inner(x, x))
+        eps = torch.finfo(x.dtype).eps
+        return torch.where(norm > 0, x / norm.clamp_min(eps), torch.zeros_like(x))
+
+    def _remove_mode_projection(self, x, q):
+        return x - self._mode_inner(x, q) * q
+
+    def _project_orthogonal(self, x, basis, n_basis):
+        if n_basis == 0:
+            return x
+        output = x
+        for basis_idx in range(n_basis):
+            output = self._remove_mode_projection(output, basis[:, basis_idx])
+        return output
+
+    def _initial_deflation_state(self, rhs, e_step_x, n_modes):
+        """Initialize multi_x so mode 0 is exactly the original ADMM output."""
+        multi_x = torch.zeros(
+            (e_step_x.size(0), n_modes) + tuple(e_step_x.shape[1:]),
+            dtype=e_step_x.dtype,
+            device=e_step_x.device,
+        )
+        multi_x[:, 0] = e_step_x
+
+        basis = torch.zeros_like(multi_x)
+        first_q = self._normalize_mode(e_step_x)
+        basis[:, 0] = first_q
+        projected_rhs = self._remove_mode_projection(rhs, first_q)
+        return multi_x, basis, projected_rhs
+
+    def _run_deflation(self, rhs, e_step_x, n_modes, iteration):
+        """Generate multi-signal deflation modes from the original ADMM output.
+
+        Args:
+            rhs: full sequence used as the deflation right-hand side, (B, T, N, C).
+            e_step_x: original ADMM forward output, (B, T, N, C).
+            n_modes: number of modes to return. Mode 0 is always e_step_x.
+            iteration: ADMM parameter index used for mu_u/lambda_theta.
+
+        Returns:
+            multi_x: (B, n_modes, T, N, C).
+        """
+        if n_modes < 1:
+            raise ValueError("deflation requires at least one mode")
+
+        multi_x, basis, projected_rhs = self._initial_deflation_state(rhs, e_step_x, n_modes)
+        for mode_idx in range(1, n_modes):
+            def projected_A_func(v, current_basis=basis, current_mode=mode_idx):
+                pv = self._project_orthogonal(v, current_basis, current_mode)
+                Apv = self._deflation_lhs(pv, iteration)
+                return self._project_orthogonal(Apv, current_basis, current_mode)
+
+            z = self.deflation_solver.solve(projected_A_func, projected_rhs)
+            x_k = self._project_orthogonal(z, basis, mode_idx)
+            multi_x[:, mode_idx] = x_k
+
+            q_k = self._normalize_mode(x_k)
+            basis[:, mode_idx] = q_k
+            projected_rhs = self._remove_mode_projection(projected_rhs, q_k)
+
+        return multi_x
+
+    def forward(self, y, mask=None, deflation=False, deflation_samples=None, deflation_iteration=None):
         """Run one ADMM block over a sequence.
 
         Args:
             y: (B, t, N, C) if only observed steps are provided, or
                (B, T, N, C) if the sequence has already been extrapolated.
             mask: observed length t when y already has T time steps.
+            deflation: when True, also run multi-signal deflation after the
+                original ADMM forward result is computed.
+            deflation_samples: number of deflated modes. The first mode is
+                exactly the original ADMM output.
+            deflation_iteration: ADMM parameter index for mu_u/lambda_theta in
+                the deflation linear operator. Defaults to the final iteration.
 
         Returns:
-            Reconstructed sequence with shape (B, T, N, C).
+            If deflation=False:
+                output: (B, T, N, C).
+            If deflation=True:
+                output, multi_x where multi_x is (B, K, T, N, C) and
+                multi_x[:, 0] is exactly output.
         """
         if y.size(1) < self.T:
             x = LR_guess(y, self.T, self.device)
@@ -466,6 +653,7 @@ class ADMMBlock(nn.Module):
             assert mask is not None, "mask should be t for sequential inputs"
             x = y[:, 0 : self.T]
             y = y[:, 0:mask]
+        deflation_rhs = x.clone()
 
         # ADMM operates on H learned graph heads. The final head dimension is
         # collapsed by comb_weights before returning.
@@ -478,8 +666,9 @@ class ADMMBlock(nn.Module):
         zu = x.clone()
         zd = x.clone()
 
-        # phi/gamma are only used when the directed temporal L1 term is active.
-        if self.ablation in ["None", "DGLR", "simple"]:
+        # phi/gamma are used by the directed temporal L1 term. Ablating Theta
+        # removes only the dense Theta regularizer, not this temporal term.
+        if self.ablation in ["None", "DGLR", "simple", "Theta"]:
             gamma = torch.ones_like(x) * 0.1
             phi = self.apply_op_Ldr(x)
 
@@ -499,17 +688,38 @@ class ADMMBlock(nn.Module):
                     gamma_u,
                     gamma_d,
                     i,
-                    gamma=gamma if self.ablation in ["None", "DGLR"] else None,
-                    phi=phi if self.ablation in ["None", "DGLR"] else None,
+                    gamma=gamma if self.ablation in ["None", "DGLR", "Theta"] else None,
+                    phi=phi if self.ablation in ["None", "DGLR", "Theta"] else None,
                 )
 
-            if self.ablation in ["None", "DGLR", "simple"]:
+            if self.ablation in ["None", "DGLR", "simple", "Theta"]:
                 phi = self.phi_direct(x, gamma, i)
                 gamma = gamma + self.rho[i] * (phi - self.apply_op_Ldr(x))
                 self._assert_finite(gamma, "gamma", i)
                 self._assert_finite(phi, "phi", i)
 
-        return torch.einsum("btnhc, h -> btnc", x, self.comb_weights)
+        output = self._combine_heads(x)
+        if not deflation or not self._uses_theta_regularizer():
+            return output
+
+        if deflation_samples is None:
+            deflation_samples = self.deflation_samples
+        if deflation_iteration is None:
+            deflation_iteration = self.ADMM_iters - 1
+        if not 0 <= deflation_iteration < self.ADMM_iters:
+            raise ValueError("deflation_iteration must be in [0, ADMM_iters)")
+        multi_x = self._run_deflation(
+            deflation_rhs.detach(),
+            output.detach(),
+            deflation_samples,
+            deflation_iteration,
+        )
+
+        # This is assigned directly in _initial_deflation_state. `multi_x` is
+        # detached from autograd, while `output` keeps the original forward
+        # gradient path.
+        assert torch.equal(multi_x[:, 0], output), "multi_x[:, 0] must be the original ADMM output"
+        return output, multi_x
 
     def _update_simple_x(self, x, y, Hty, phi, gamma, iteration):
         """Update x for the simplified formulation without z_u/z_d solves."""
@@ -583,5 +793,14 @@ class ADMMBlock(nn.Module):
 
     @staticmethod
     def _assert_finite(tensor, name, iteration):
-        assert not torch.isnan(tensor).any(), f"{name} has NaN value in loop {iteration}"
-        assert not torch.isinf(tensor).any(), f"{name} has inf value in loop {iteration}"
+        if torch.isfinite(tensor).all():
+            return
+        finite_count = torch.isfinite(tensor).sum().item()
+        total = tensor.numel()
+        nan_count = torch.isnan(tensor).sum().item()
+        inf_count = torch.isinf(tensor).sum().item()
+        raise AssertionError(
+            f"{name} is not finite in ADMM iteration {iteration}: "
+            f"shape={tuple(tensor.shape)}, finite={finite_count}/{total}, "
+            f"nan={nan_count}, inf={inf_count}"
+        )

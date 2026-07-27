@@ -15,31 +15,18 @@ from clean_lib.feature_extractor import FeatureExtractor, GNNExtrapolation, Grap
 from clean_lib.graph_learning_module import GraphLearningModule
 
 
-def glasso_estimation(
+def _single_glasso_estimation(
     cov_matrix,
-    alpha=0.2,
-    method="quic",
-    max_iter=20,
-    tol=1e-4,
-    allow_backward=False,
+    alpha,
+    method,
+    rho,
+    max_iter,
+    tol,
+    allow_backward,
+    device,
+    dtype,
 ):
-    """
-    Estimate the precision matrix (inverse covariance) using Graphical Lasso.
-    Args:
-        cov_matrix: Dense node covariance matrix, shape (N, N).
-        alpha: Regularization parameter for Graphical Lasso.
-        method: One of "admm", "quic", or "sklearn".
-        max_iter: Maximum solver iterations. Capped at 20 for this model.
-        tol: Solver tolerance.
-        allow_backward: If False, Theta estimation is detached from autograd.
-    Returns:
-        Dense node precision matrix Theta, shape (N, N).
-    """
-    device = cov_matrix.device
-    dtype = cov_matrix.dtype
-    max_iter = min(max_iter, 20)
-    method = method.lower()
-    cov_matrix = 0.5 * (cov_matrix + cov_matrix.transpose(-1, -2))
+    """Estimate one dense precision matrix from one covariance matrix."""
     solver_cov = cov_matrix if allow_backward else cov_matrix.detach()
 
     if method == "admm":
@@ -50,6 +37,7 @@ def glasso_estimation(
                 result = graphical_lasso(
                     solver_cov,
                     alpha=alpha,
+                    rho=rho,
                     max_iter=max_iter,
                     tol=tol,
                     rtol=tol,
@@ -60,6 +48,7 @@ def glasso_estimation(
                     result = graphical_lasso(
                         solver_cov,
                         alpha=alpha,
+                        rho=rho,
                         max_iter=max_iter,
                         tol=tol,
                         rtol=tol,
@@ -90,6 +79,127 @@ def glasso_estimation(
         return torch.tensor(model.precision_, dtype=dtype, device=device)
 
     raise ValueError(f"Unknown graphical lasso method: {method}")
+
+
+def glasso_estimation(
+    cov_matrix,
+    alpha=0.2,
+    method="admm",
+    rho=1.0,
+    max_iter=20,
+    tol=1e-4,
+    allow_backward=False,
+):
+    """
+    Estimate the precision matrix (inverse covariance) using Graphical Lasso.
+    Args:
+        cov_matrix: Dense node covariance matrix, shape (N, N), or batched
+            covariance matrices, shape (B, N, N).
+        alpha: Regularization parameter for Graphical Lasso.
+        method: One of "admm", "quic", or "sklearn".
+        rho: ADMM penalty parameter used only when method is "admm".
+        max_iter: Maximum solver iterations. Capped at 20 for this model.
+        tol: Solver tolerance.
+        allow_backward: If False, Theta estimation is detached from autograd.
+    Returns:
+        Dense node precision matrix Theta, shape (N, N), or batched precision
+        matrices, shape (B, N, N).
+    """
+    device = cov_matrix.device
+    dtype = cov_matrix.dtype
+    max_iter = min(max_iter, 20)
+    method = method.lower()
+    cov_matrix = 0.5 * (cov_matrix + cov_matrix.transpose(-1, -2))
+
+    if cov_matrix.ndim == 2:
+        return normalize_theta(
+            _single_glasso_estimation(
+                cov_matrix,
+                alpha,
+                method,
+                rho,
+                max_iter,
+                tol,
+                allow_backward,
+                device,
+                dtype,
+            )
+        )
+    if cov_matrix.ndim == 3:
+        theta_list = [
+            _single_glasso_estimation(
+                cov_matrix[i],
+                alpha,
+                method,
+                rho,
+                max_iter,
+                tol,
+                allow_backward,
+                device,
+                dtype,
+            )
+            for i in range(cov_matrix.size(0))
+        ]
+        return normalize_theta(torch.stack(theta_list, dim=0))
+    raise ValueError("cov_matrix must have shape (N, N) or (B, N, N)")
+
+
+def normalize_theta(theta):
+    """Normalize Theta by its diagonal scale.
+
+    The normalization is:
+        Theta_ij = Theta_ij / sqrt(Theta_ii * Theta_jj)
+
+    Any negative diagonal entry is first clamped to zero. Entries whose
+    denominator is zero are set to zero to avoid NaN/Inf values.
+    """
+    if theta.ndim not in (2, 3):
+        raise ValueError("theta must have shape (N, N) or (B, N, N)")
+
+    theta = theta.clone()
+    diag = torch.diagonal(theta, dim1=-2, dim2=-1).clamp_min(0)
+    node_idx = torch.arange(theta.size(-1), device=theta.device)
+
+    if theta.ndim == 2:
+        theta[node_idx, node_idx] = diag
+        denom = torch.sqrt(diag.unsqueeze(0) * diag.unsqueeze(1))
+    else:
+        theta[:, node_idx, node_idx] = diag
+        denom = torch.sqrt(diag.unsqueeze(-1) * diag.unsqueeze(-2))
+
+    eps = torch.finfo(theta.dtype).eps
+    normalized = theta / denom.clamp_min(eps)
+    return torch.where(denom > 0, normalized, torch.zeros_like(theta))
+
+
+def node_covariance(signal, unbiased=True):
+    """Compute centered node covariance for Theta estimation.
+
+    Args:
+        signal: either `(B, T, N, C)` for one shared covariance matrix, or
+            `(B, K, T, N, C)` for one covariance matrix per batch item.
+        unbiased: when True, divide by the number of samples minus one.
+
+    Returns:
+        `(N, N)` for a 4-D input, or `(B, N, N)` for a 5-D input.
+    """
+    if signal.ndim == 4:
+        n_nodes = signal.size(2)
+        samples = signal.permute(0, 1, 3, 2).reshape(-1, n_nodes)
+        samples = samples - samples.mean(dim=0, keepdim=True)
+        denom = samples.size(0) - 1 if unbiased else samples.size(0)
+        denom = max(denom, 1)
+        return torch.einsum("sn,sm->nm", samples, samples) / denom
+
+    if signal.ndim == 5:
+        batch_size, _, _, n_nodes, _ = signal.shape
+        samples = signal.permute(0, 1, 2, 4, 3).reshape(batch_size, -1, n_nodes)
+        samples = samples - samples.mean(dim=1, keepdim=True)
+        denom = samples.size(1) - 1 if unbiased else samples.size(1)
+        denom = max(denom, 1)
+        return torch.einsum("bsn,bsm->bnm", samples, samples) / denom
+
+    raise ValueError("signal must have shape (B, T, N, C) or (B, K, T, N, C)")
 
 DEFAULT_GRAPH_INFO = {
     "n_nodes": None,
@@ -157,10 +267,13 @@ class UnrollingModel(nn.Module):
         diff_interval=True,
         predict_only=False,
         le_emb=False,
-        glasso_method="quic",
+        glasso_method="admm",
+        glasso_rho=1.0,
         glasso_max_iter=20,
         glasso_tol=1e-4,
         glasso_allow_backward=False,
+        use_deflation=False,
+        deflation_samples=None,
     ):
         super().__init__()
         graph_info = DEFAULT_GRAPH_INFO if graph_info is None else graph_info
@@ -179,9 +292,13 @@ class UnrollingModel(nn.Module):
         self.use_extrapolation = use_extrapolation
         self.use_st_emb = use_st_emb
         self.glasso_method = glasso_method
+        self.glasso_rho = glasso_rho
         self.glasso_max_iter = min(glasso_max_iter, 20)
         self.glasso_tol = glasso_tol
         self.glasso_allow_backward = glasso_allow_backward
+        self.use_deflation = use_deflation
+        self.deflation_samples = deflation_samples
+        self.last_deflation_multi_x = None
 
         # Graph metadata:
         #   u_edges: physical/direct graph edges, shape (E, 2)
@@ -292,7 +409,7 @@ class UnrollingModel(nn.Module):
                         # Its graph weights are assigned just before forward.
                         # This constructor is inside the layer loop, so every
                         # unrolled layer owns an independent ADMMBlock and an
-                        # independent set of CGSolver modules/parameters:
+                        # independent set of UnrolledCGSolver modules/parameters:
                         #   x_solver, zu_solver, zd_solver
                         "ADMM_block": ADMMBlock(
                             T=T,
@@ -409,6 +526,10 @@ class UnrollingModel(nn.Module):
                 shape (B, T).
             output_graph: when True, also return learned graph weights from
                 each block.
+            If `self.use_deflation` is True, each ADMM block also computes
+                multi-signal deflation modes. They are stored in
+                `self.last_deflation_multi_x` and are not used in the current
+                forward logic or returned by this method.
 
         Returns:
             output: (B, T, N, C_signal) unless use_one_channel=True, in which
@@ -421,6 +542,8 @@ class UnrollingModel(nn.Module):
         if output_graph:
             directed_graph_list = []
             undirected_graph_list = []
+        self.last_deflation_multi_x = [] if self.use_deflation else None
+        multi_x = None  # Used for deflation across blocks.
 
         if self.use_norm:
             y, mean, std = layer_norm_on_data(y, self.y_norm_shape)
@@ -431,7 +554,7 @@ class UnrollingModel(nn.Module):
         else:
             output = LR_guess(y, self.T, self.device)
 
-        assert not torch.isnan(output).any(), "linear extrapolation has nan"
+        assert torch.isfinite(output).all(), "initial full-horizon guess contains NaN or Inf"
         if self.use_st_emb:
             # Shared across blocks because t_list and static node embeddings do
             # not depend on the current reconstructed signal.
@@ -451,14 +574,20 @@ class UnrollingModel(nn.Module):
                 # features: (B, T, N, H, feature_channels)
                 features = feature_extractor(output_emb)
             except ValueError as exc:
-                raise ValueError(f"Error in Feature extractor in Block {i}: {exc}") from exc
+                raise ValueError(
+                    f"FeatureExtractor failed in block {i}: {exc}. "
+                    f"output_emb_shape={tuple(output_emb.shape)}, ablation={self.ablation}"
+                ) from exc
 
             try:
                 # u_ew: (B, T, N, K, H)
                 # d_ew: (B, T - 1, interval, N, H)
                 u_ew, d_ew = graph_learn(features)
             except AssertionError as exc:
-                raise ValueError(f"Error in Graph Learning Module in Block {i}: {exc}") from exc
+                raise ValueError(
+                    f"GraphLearningModule failed in block {i}: {exc}. "
+                    f"features_shape={tuple(features.shape)}, ablation={self.ablation}"
+                ) from exc
 
             if output_graph:
                 undirected_graph_list.append(u_ew.unsqueeze(1))
@@ -468,21 +597,34 @@ class UnrollingModel(nn.Module):
             admm_block.d_ew = d_ew
             # Theta branch:
             #   output[..., 0:1] is (B, T, N, 1).
-            #   cov_matrix aggregates over batch, time and channel -> (N, N).
-            #   glasso_estimation returns Theta with shape (N, N), consumed by
-            #   ADMMBlock.apply_op_Theta over the node dimension.
-            cov_matrix = torch.einsum(
-                "btic,btjc->ij",
-                output[..., 0:1],
-                output[..., 0:1],
-            ) / (batch_size * self.T)
-            admm_block.Theta = glasso_estimation(
-                cov_matrix,
-                method=self.glasso_method,
-                max_iter=self.glasso_max_iter,
-                tol=self.glasso_tol,
-                allow_backward=self.glasso_allow_backward,
-            )
+            #   node_covariance centers each node signal before computing the
+            #   unbiased covariance matrix. Plain output gives (N, N);
+            #   deflated multi_x gives one covariance per batch, (B, N, N).
+            #   glasso_estimation returns normalized Theta with shape (N, N)
+            #   or (B, N, N), consumed by ADMMBlock.apply_op_Theta over the
+            #   node dimension.
+            if self.ablation == "Theta" or i == 0:
+                admm_block.Theta = None # No Theta estimation in the first block or when ablation is "Theta".
+            elif multi_x is None or len(self.last_deflation_multi_x) == 0:
+                cov_matrix = node_covariance(output[..., 0:1], unbiased=True)
+                admm_block.Theta = glasso_estimation(
+                    cov_matrix,
+                    method=self.glasso_method,
+                    rho=self.glasso_rho,
+                    max_iter=self.glasso_max_iter,
+                    tol=self.glasso_tol,
+                    allow_backward=self.glasso_allow_backward,
+                )
+            else:
+                cov_matrix = node_covariance(multi_x[..., 0:1], unbiased=True)
+                admm_block.Theta = glasso_estimation(
+                    cov_matrix,
+                    method=self.glasso_method,
+                    rho=self.glasso_rho,
+                    max_iter=self.glasso_max_iter,
+                    tol=self.glasso_tol,
+                    allow_backward=self.glasso_allow_backward,
+                )
 
             try:
                 if self.predict_only:
@@ -490,16 +632,36 @@ class UnrollingModel(nn.Module):
                     output[:, : self.t_in] = y[..., 0:1] if self.use_one_channel else y
 
                 # ADMM receives signal channels only, not ST embedding channels.
+                run_deflation = self.use_deflation and admm_block.ablation != "Theta"
                 if self.use_one_channel:
-                    output_new = admm_block(output[..., 0:1], self.t_in)
+                    admm_result = admm_block(
+                        output[..., 0:1],
+                        self.t_in,
+                        deflation=run_deflation,
+                        deflation_samples=self.deflation_samples,
+                    )
                 else:
-                    output_new = admm_block(output, self.t_in)
+                    admm_result = admm_block(
+                        output,
+                        self.t_in,
+                        deflation=run_deflation,
+                        deflation_samples=self.deflation_samples,
+                    )
+                if run_deflation:
+                    output_new, multi_x = admm_result
+                    self.last_deflation_multi_x.append(multi_x)
+                else:
+                    output_new = admm_result
             except AssertionError as exc:
-                raise ValueError(f"Assertation Error in ADMM block in block {i} - {exc}") from exc
+                raise ValueError(
+                    f"ADMMBlock assertion failed in block {i}: {exc}. "
+                    f"input_shape={tuple(output.shape)}, ablation={self.ablation}, "
+                    f"use_deflation={self.use_deflation}, run_deflation={run_deflation}"
+                ) from exc
 
-            assert not torch.isnan(output_new).any(), f"output_new has NaN value in block {i}"
+            assert torch.isfinite(output_new).all(), f"output_new contains NaN or Inf in block {i}"
             p = self.skip_connection_weights[i]
-            assert not torch.isnan(self.skip_connection_weights).any(), f"skip connection has NaN Values in block {i}"
+            assert torch.isfinite(self.skip_connection_weights).all(), f"skip connection contains NaN or Inf in block {i}"
             # Learned residual/skip blend between the ADMM correction and the
             # previous block output.
             output = p * output_new + (1 - p) * output_old

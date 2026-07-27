@@ -25,7 +25,7 @@ from dataset.dataset_utils import (
     create_dataloader,
     create_directed_dataloader,
 )
-from lib.unrolling_model import UnrollingModel
+from clean_lib.unrolling_model import UnrollingModel
 from utils import WeightedMSELoss, seed_everything, setup_logger
 
 
@@ -70,8 +70,20 @@ def load_config(config_path):
         return yaml.safe_load(f)
 
 
+def _add_bool_override(parser, name, dest, help_text):
+    """Add paired boolean flags that leave config unchanged when omitted."""
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument(f"--{name}", dest=dest, action="store_true", default=None, help=help_text)
+    group.add_argument(f"--no-{name}", dest=dest, action="store_false", help=f"disable {help_text}")
+
+
 def parse_args(argv=None):
-    """Parse command-line arguments for traffic training."""
+    """Parse command-line arguments for traffic training.
+
+    YAML is the source of persistent defaults.  Most model/data hyperparameters
+    therefore default to `None` here and only overwrite the loaded config when
+    the user explicitly passes a CLI flag.
+    """
     pre_parser = argparse.ArgumentParser(add_help=False)
     pre_parser.add_argument("--config", default="config.yaml", help="Path to config YAML")
     pre_args, _ = pre_parser.parse_known_args(argv)
@@ -83,8 +95,8 @@ def parse_args(argv=None):
     parser.add_argument("--batchsize", help="batch size", type=int, required=True)
     parser.add_argument("--mode", help="normalization mode", default="standardize", type=str)
 
-    parser.add_argument("--neighbors", help="kNN neighbors", default=config["model"]["kNN"], type=int)
-    parser.add_argument("--interval", help="intervals for time graph", default=config["model"]["interval"], type=int)
+    parser.add_argument("--neighbors", help="temporary override for model.kNN", default=None, type=int)
+    parser.add_argument("--interval", help="temporary override for model.interval", default=None, type=int)
     parser.add_argument("--FElayers", help="feature extractor layers", default=1, type=int)
     parser.add_argument("--ablation", help="operator to eliminate in ablation study", default="None", type=str)
 
@@ -97,27 +109,35 @@ def parse_args(argv=None):
     parser.add_argument("--stepsize", help="stepLR stepsize", default=8, type=int)
     parser.add_argument("--gamma", help="stepLR gamma", default=0.2, type=float)
 
-    parser.add_argument("--sharedM", dest="sharedM", action="store_true")
-    parser.set_defaults(sharedM=config["model"]["sharedM"])
-    parser.add_argument("--sharedQ", dest="sharedQ", action="store_true")
-    parser.set_defaults(sharedQ=config["model"]["sharedQ"])
-    parser.add_argument("--sharedV", dest="diff_interval", action="store_false")
-    parser.set_defaults(diff_interval=config["model"]["diff_interval"])
+    _add_bool_override(parser, "sharedM", "sharedM", "temporary override for model.sharedM")
+    _add_bool_override(parser, "sharedQ", "sharedQ", "temporary override for model.sharedQ")
+    _add_bool_override(parser, "diff-interval", "diff_interval", "temporary override for model.diff_interval")
 
     parser.add_argument("--epochs", help="running epochs", default=70, type=int)
     parser.add_argument("--start_epochs", help="start epochs", default=0, type=int)
     parser.add_argument("--loggrad", help="log gradient norms; -1 disables it", default=-1, type=int)
 
-    parser.add_argument("--tout", help="t_out", default=config["model"]["t_out"], type=int)
+    parser.add_argument("--tout", help="temporary override for model.t_out", default=None, type=int)
     parser.add_argument("--trunc", dest="trunc", action="store_true")
     parser.set_defaults(trunc=False)
     parser.add_argument("--le-emb", help="learnable embedding", dest="le_emb", action="store_true")
     parser.set_defaults(le_emb=False)
-    parser.add_argument("--blocks", help="number of ADMM blocks", default=config["model"]["num_blocks"], type=int)
-    parser.add_argument("--layers", help="number of ADMM iterations per block", default=config["model"]["num_layers"], type=int)
-    parser.add_argument("--CGiters", help="number of CG iterations", default=config["model"]["CG_iters"], type=int)
-    parser.add_argument("--stride", help="sampling stride of dataset", default=config["data_stride"], type=int)
-    parser.add_argument("--lr", help="learning rate", default=config["learning_rate"], type=float)
+    parser.add_argument("--blocks", help="temporary override for model.num_blocks", default=None, type=int)
+    parser.add_argument("--layers", help="temporary override for model.num_layers", default=None, type=int)
+    parser.add_argument("--CGiters", help="temporary override for model.CG_iters", default=None, type=int)
+    _add_bool_override(parser, "deflation", "deflation", "temporary override for model.use_deflation")
+    parser.add_argument("--deflation-samples", help="temporary override for model.deflation_samples", default=None, type=int)
+    parser.add_argument(
+        "--deflation-CGiters",
+        help="temporary override for model.deflation_CG_iters",
+        default=None,
+        type=int,
+    )
+    parser.add_argument("--deflation-tol", help="temporary override for model.deflation_tol", default=None, type=float)
+    parser.add_argument("--glasso-method", help="temporary override for model.glasso_method", default=None, type=str)
+    parser.add_argument("--glasso-rho", help="temporary override for model.glasso_rho", default=None, type=float)
+    parser.add_argument("--stride", help="temporary override for data_stride", default=None, type=int)
+    parser.add_argument("--lr", help="temporary override for learning_rate", default=None, type=float)
     parser.add_argument("--predonly", dest="pred_only", action="store_true")
     parser.set_defaults(pred_only=False)
 
@@ -127,15 +147,40 @@ def parse_args(argv=None):
 
 def apply_args_to_config(config, args):
     """Apply CLI overrides to the loaded config in-place."""
-    config["model"]["kNN"] = args.neighbors
-    config["model"]["interval"] = args.interval
-    config["model"]["sharedM"] = args.sharedM
-    config["model"]["sharedQ"] = args.sharedQ
-    config["model"]["diff_interval"] = args.diff_interval
-    config["model"]["num_blocks"] = args.blocks
-    config["model"]["num_layers"] = args.layers
-    config["model"]["CG_iters"] = args.CGiters
-    config["model"]["t_out"] = args.tout
+    model_config = config["model"]
+    arg_to_config_key = {
+        "neighbors": "kNN",
+        "interval": "interval",
+        "sharedM": "sharedM",
+        "sharedQ": "sharedQ",
+        "diff_interval": "diff_interval",
+        "blocks": "num_blocks",
+        "layers": "num_layers",
+        "CGiters": "CG_iters",
+        "tout": "t_out",
+        "deflation_samples": "deflation_samples",
+        "deflation_CGiters": "deflation_CG_iters",
+        "deflation_tol": "deflation_tol",
+        "deflation": "use_deflation",
+        "glasso_method": "glasso_method",
+        "glasso_rho": "glasso_rho",
+    }
+    for arg_name, config_key in arg_to_config_key.items():
+        value = getattr(args, arg_name)
+        if value is not None:
+            model_config[config_key] = value
+
+    model_config.setdefault("use_deflation", False)
+    model_config.setdefault("deflation_samples", 5)
+    model_config.setdefault("deflation_CG_iters", model_config["CG_iters"])
+    model_config.setdefault("deflation_tol", 1e-6)
+    model_config.setdefault("glasso_method", "admm")
+    model_config.setdefault("glasso_rho", 1.0)
+
+    if args.stride is not None:
+        config["data_stride"] = args.stride
+    if args.lr is not None:
+        config["learning_rate"] = args.lr
     return config
 
 
@@ -170,9 +215,10 @@ def resolve_dataset_dir(dataset_name, base_dir="../TS_datasets/"):
     return dataset_dir
 
 
-def build_experiment_names(config, args, learning_rate):
+def build_experiment_names(config, args):
     """Create log/model directory names without touching the filesystem."""
     logs_dir = "logs_learnable_emb" if args.le_emb else "dense_logs_new"
+    learning_rate = config["learning_rate"]
     experiment_dir = f"lr_{learning_rate:.0e}_seed_{args.seed}"
 
     dataset_name = args.dataset
@@ -183,9 +229,11 @@ def build_experiment_names(config, args, learning_rate):
     feature_channels = config["model"]["feature_channels"]
     loss_name = config["loss_function"]
 
-    name = f"{dataset_name}_s{args.stride}_{num_blocks}b{num_layers}_{num_heads}h_{feature_channels}f_{args.FElayers}FE"
+    name = f"{dataset_name}_s{config['data_stride']}_{num_blocks}b{num_layers}_{num_heads}h_{feature_channels}f_{args.FElayers}FE"
     if args.pred_only:
         name = "predOnly_" + name
+    if config["model"].get("use_deflation", False):
+        name = f"deflate{config['model']['deflation_samples']}_" + name
     if args.trunc:
         name = "trunc_" + name
     if args.ablation != "None":
@@ -245,6 +293,7 @@ def create_data(config, args, device):
     dataset_dir = resolve_dataset_dir(args.dataset)
     T = config["model"]["t_in"] + config["model"]["t_out"]
     t_in = config["model"]["t_in"]
+    stride = config["data_stride"]
     return_time = True
 
     if "PEMS0" in args.dataset:
@@ -253,7 +302,7 @@ def create_data(config, args, device):
             args.dataset,
             T,
             t_in,
-            args.stride,
+            stride,
             args.batchsize,
             config["num_workers"],
             return_time,
@@ -266,7 +315,7 @@ def create_data(config, args, device):
             args.dataset,
             T,
             t_in,
-            args.stride,
+            stride,
             args.batchsize,
             config["num_workers"],
             return_time,
@@ -280,13 +329,18 @@ def create_data(config, args, device):
 
 def build_admm_info(config):
     """Collect ADMM hyperparameters in the format expected by `UnrollingModel`."""
+    model_config = config["model"]
     return {
-        "ADMM_iters": config["model"]["num_layers"],
-        "CG_iters": config["model"]["CG_iters"],
-        "PGD_iters": config["model"]["PGD_iters"],
+        "ADMM_iters": model_config["num_layers"],
+        "CG_iters": model_config["CG_iters"],
+        "PGD_iters": model_config["PGD_iters"],
         "mu_u_init": config["ADMM_params"]["mu_u"],
         "mu_d1_init": config["ADMM_params"]["mu_d1"],
         "mu_d2_init": config["ADMM_params"]["mu_d2"],
+        "lambda_init": config["ADMM_params"]["lambda_theta"],
+        "deflation_samples": model_config["deflation_samples"],
+        "deflation_CG_iters": model_config["deflation_CG_iters"],
+        "deflation_tol": model_config["deflation_tol"],
     }
 
 
@@ -319,16 +373,21 @@ def create_model(config, args, train_set, device):
         diff_interval=config["model"]["diff_interval"],
         predict_only=args.pred_only,
         le_emb=args.le_emb,
+        use_deflation=config["model"].get("use_deflation", False),
+        deflation_samples=config["model"]["deflation_samples"],
+        glasso_method=config["model"]["glasso_method"],
+        glasso_rho=config["model"]["glasso_rho"],
     ).to(device)
     return model, admm_info
 
 
 def create_optimizer_and_scheduler(config, args, model):
     """Create optimizer and optional ReduceLROnPlateau scheduler."""
+    learning_rate = config["learning_rate"]
     if config["optim"] == "adam":
-        optimizer = optim.Adam(model.parameters(), lr=args.lr)
+        optimizer = optim.Adam(model.parameters(), lr=learning_rate)
     elif config["optim"] == "adamw":
-        optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=config["weight_decay"])
+        optimizer = optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=config["weight_decay"])
     else:
         raise ValueError("config['optim'] should be adam or adamw")
 
@@ -345,15 +404,64 @@ def create_optimizer_and_scheduler(config, args, model):
     return optimizer, scheduler
 
 
-def log_run_header(logger, args, config, model, train_set, signal_channels, admm_info, model_pretrained_path=None):
-    """Write command, arguments, config, and model summary to the main log."""
-    logger.info("#################################################")
-    logger.info("Training CMD:\t" + " ".join(sys.argv))
-    logger.info("PARAMETER SETTINGS:")
-    for arg, value in vars(args).items():
-        logger.info("\t %s: %s", arg, value)
+def collect_theta_nnz_ratios(model):
+    """Return per-block Theta sparsity ratios for the current forward state.
 
-    logger.info("CONFIG SETTINGS:")
+    Theta is estimated inside `UnrollingModel.forward`, so these values describe
+    the most recent batch that passed through the model.  A `None` Theta means
+    the branch was skipped, for example when `ablation="Theta"`.
+    """
+    stats = []
+    for block_idx, block in enumerate(model.model_blocks):
+        theta = getattr(block["ADMM_block"], "Theta", None)
+        if theta is None:
+            stats.append(
+                {
+                    "block_idx": block_idx,
+                    "ratio": None,
+                    "nnz": 0,
+                    "numel": 0,
+                    "shape": None,
+                }
+            )
+            continue
+
+        theta = torch.as_tensor(theta)
+        nnz = torch.count_nonzero(theta).item()
+        numel = theta.numel()
+        stats.append(
+            {
+                "block_idx": block_idx,
+                "ratio": nnz / numel if numel > 0 else float("nan"),
+                "nnz": nnz,
+                "numel": numel,
+                "shape": tuple(theta.shape),
+            }
+        )
+    return stats
+
+
+def format_theta_nnz_batch(theta_stats, epoch, iteration_count, total_batches):
+    """Format current-batch per-block Theta sparsity for tqdm-safe training output."""
+    prefix = f"Theta nnz ratios [epoch {epoch + 1}, batch {iteration_count}/{total_batches}]"
+    if not theta_stats:
+        return f"{prefix}: no ADMM blocks"
+
+    parts = []
+    for stat in theta_stats:
+        block_name = f"block_{stat['block_idx']}"
+        if stat["ratio"] is None:
+            parts.append(f"{block_name}=skipped")
+            continue
+        parts.append(
+            f"{block_name}={stat['ratio']:.6f} "
+            f"({stat['nnz']}/{stat['numel']}, shape={stat['shape']})"
+        )
+    return f"{prefix}: " + "; ".join(parts)
+
+
+def _log_nested_config(logger, config):
+    """Write the effective config after CLI overrides are applied."""
     for key, value in config.items():
         if isinstance(value, dict):
             logger.info("\t%s:", key)
@@ -362,14 +470,75 @@ def log_run_header(logger, args, config, model, train_set, signal_channels, admm
         else:
             logger.info("\t%s: %s", key, value)
 
+
+def _log_cli_arguments(logger, args):
+    """Write runtime args and only the CLI overrides that were actually used."""
+    config_override_args = {
+        "neighbors",
+        "interval",
+        "sharedM",
+        "sharedQ",
+        "diff_interval",
+        "blocks",
+        "layers",
+        "CGiters",
+        "tout",
+        "deflation",
+        "deflation_samples",
+        "deflation_CGiters",
+        "deflation_tol",
+        "glasso_method",
+        "glasso_rho",
+        "stride",
+        "lr",
+    }
+    logger.info("RUNTIME ARGUMENTS AND CLI OVERRIDES:")
+    for arg, value in vars(args).items():
+        if arg in config_override_args and value is None:
+            continue
+        logger.info("\t%s: %s", arg, value)
+
+
+def _log_effective_model_flags(logger, config, model):
+    """Log key effective flags, including what reached GraphLearningModule."""
+    model_config = config["model"]
+    logger.info(
+        "Effective graph flags from config: sharedM=%s, sharedQ=%s, diff_interval=%s",
+        model_config["sharedM"],
+        model_config["sharedQ"],
+        model_config["diff_interval"],
+    )
+    if len(model.model_blocks) == 0:
+        return
+
+    graph_learn = model.model_blocks[0]["graph_learning_module"]
+    logger.info(
+        "GraphLearningModule flags in block_0: sharedM=%s, sharedQ=%s, diff_interval=%s, directed_time=%s",
+        graph_learn.sharedM,
+        graph_learn.sharedQ,
+        graph_learn.diff_interval,
+        graph_learn.directed_time,
+    )
+
+
+def log_run_header(logger, args, config, model, train_set, signal_channels, admm_info, model_pretrained_path=None):
+    """Write command, arguments, config, and model summary to the main log."""
+    logger.info("#################################################")
+    logger.info("Training CMD:\t" + " ".join(sys.argv))
+    _log_cli_arguments(logger, args)
+
+    logger.info("EFFECTIVE CONFIG SETTINGS:")
+    _log_nested_config(logger, config)
+
     total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     logger.info("~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~")
+    logger.info("MODEL SUMMARY:")
     logger.info("pretrained path: %s", model_pretrained_path)
     logger.info("feature channels: %d", config["model"]["feature_channels"])
     logger.info("Total parameters: %d", total_params)
-    logger.info("PARAMETER SETTINGS:")
     logger.info("ADMM blocks: %d", config["model"]["num_blocks"])
     logger.info("ADMM info: %s", admm_info)
+    _log_effective_model_flags(logger, config, model)
     logger.info(
         "graph info: nodes %d, edges %d, signal channels %d",
         train_set.n_nodes,

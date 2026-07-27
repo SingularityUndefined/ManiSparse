@@ -17,6 +17,12 @@ model:
   num_layers: 25
   CG_iters: 3
   PGD_iters: 3
+  use_deflation: False
+  deflation_samples: 5
+  deflation_CG_iters: 3
+  deflation_tol: 1.0e-6
+  glasso_method: admm
+  glasso_rho: 2.0
   num_heads: 4
   feature_channels: 6
   use_extrapolation: True
@@ -29,6 +35,7 @@ ADMM_params:
   mu_u: 3
   mu_d1: 3
   mu_d2: 3
+  lambda_theta: 3
 
 st_emb_info:
   spatial_dim: 5

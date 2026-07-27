@@ -426,18 +426,18 @@ def compute_metrics(output, x, masked_flag, t_in):
 
 
 def check_nan_gradients(model: nn.Module):
-    """检查模型参数或梯度中是否存在 NaN/Inf，返回第一个异常参数名。"""
+    """检查模型参数或梯度中是否存在 NaN/Inf，返回第一个异常位置。"""
     for name, param in reversed(list(model.named_parameters())):
         param_detached = param.detach().cpu()
         if torch.isnan(param_detached).any() or torch.isinf(param_detached).any():
-            return name
+            return {"name": name, "kind": "parameter"}
 
         if param.grad is None:
             continue
         grad_detached = param.grad.detach().cpu()
         if torch.isnan(grad_detached).any() or torch.isinf(grad_detached).any():
-            return name
-    return
+            return {"name": name, "kind": "gradient"}
+    return None
 
 
 def log_parameters_scalars(model: nn.Module, name_list: list):

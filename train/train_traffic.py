@@ -20,12 +20,14 @@ from train.train_utils import (
     apply_args_to_config,
     build_experiment_names,
     build_loss_fn,
+    collect_theta_nnz_ratios,
     create_data,
     create_loggers,
     create_model,
     create_optimizer_and_scheduler,
     create_training_paths,
     create_writer,
+    format_theta_nnz_batch,
     log_run_header,
     parse_args,
     prepare_runtime,
@@ -60,6 +62,56 @@ def _compute_loss(loss_fn, output, target, masked_flag, t_in):
     if masked_flag:
         return loss_fn(output[:, t_in:], target[:, t_in:])
     return loss_fn(output, target)
+
+
+def _tensor_health(name, tensor):
+    """Return a compact numeric summary for NaN/Inf diagnostics."""
+    detached = tensor.detach()
+    if not torch.is_floating_point(detached) and not torch.is_complex(detached):
+        total = detached.numel()
+        if total == 0:
+            return f"{name}: shape={tuple(detached.shape)}, dtype={detached.dtype}, numel=0"
+        values = detached.to(torch.float32)
+        return (
+            f"{name}: shape={tuple(detached.shape)}, dtype={detached.dtype}, finite={total}/{total}, "
+            f"min={values.min().item():.6g}, max={values.max().item():.6g}, "
+            f"mean={values.mean().item():.6g}"
+        )
+
+    finite_mask = torch.isfinite(detached)
+    finite_count = finite_mask.sum().item()
+    total = detached.numel()
+    nan_count = torch.isnan(detached).sum().item()
+    inf_count = torch.isinf(detached).sum().item()
+
+    if finite_count == 0:
+        return f"{name}: shape={tuple(detached.shape)}, finite=0/{total}, nan={nan_count}, inf={inf_count}"
+
+    finite_values = detached[finite_mask]
+    return (
+        f"{name}: shape={tuple(detached.shape)}, finite={finite_count}/{total}, "
+        f"nan={nan_count}, inf={inf_count}, min={finite_values.min().item():.6g}, "
+        f"max={finite_values.max().item():.6g}, mean={finite_values.mean().item():.6g}"
+    )
+
+
+def _training_location(epoch, num_epochs, iteration_count, train_loader):
+    """Format the current training location in one consistent way."""
+    return f"epoch {epoch + 1}/{num_epochs}, iter {iteration_count}/{len(train_loader)}"
+
+
+def _raise_training_numerical_error(reason, epoch, num_epochs, iteration_count, train_loader, tensors, logger, extra_lines=None):
+    """Log and raise a readable numerical failure message."""
+    lines = [
+        f"Numerical failure during training: {reason}",
+        f"Location: {_training_location(epoch, num_epochs, iteration_count, train_loader)}",
+    ]
+    lines.extend(_tensor_health(name, tensor) for name, tensor in tensors)
+    if extra_lines:
+        lines.extend(extra_lines)
+    message = "\n".join(lines)
+    logger.error(message)
+    raise ValueError(message)
 
 
 def _train_forward(model, y, x, t_list, data_normalization, config, loss_fn, masked_flag, args):
@@ -155,29 +207,32 @@ def _handle_training_value_error(error, model, test_loader, data_normalization, 
     """Save current loss curve, run a final test pass, then re-raise the training error."""
     plot_loss_curve(train_loss_list, val_loss_list, plot_path)
     use_one_channel = config["model"]["use_one_channel"]
-    if use_one_channel:
-        metrics = test(model, test_loader, data_normalization, False, config, device, signal_channels, use_one_channel=True)
-        metrics_d = None
-    else:
-        metrics, metrics_d = test(model, test_loader, data_normalization, False, config, device, signal_channels, use_one_channel=False)
+    try:
+        if use_one_channel:
+            metrics = test(model, test_loader, data_normalization, False, config, device, signal_channels, use_one_channel=True)
+            metrics_d = None
+        else:
+            metrics, metrics_d = test(model, test_loader, data_normalization, False, config, device, signal_channels, use_one_channel=False)
 
-    logger.info(
-        "Test (ALL): rec_RMSE:%.4f, RMSE:%.4f, MAE:%.4f, MAPE(%%):%.4f",
-        metrics["rec_RMSE"],
-        metrics["pred_RMSE"],
-        metrics["pred_MAE"],
-        metrics["pred_MAPE"],
-    )
-    if metrics_d is not None:
-        for i in range(signal_channels):
-            logger.info(
-                "Test (%s): rec_RMSE:%.4f, RMSE:%.4f, MAE:%.4f, MAPE(%%):%.4f",
-                SIGNAL_NAMES[i] if i < len(SIGNAL_NAMES) else f"channel_{i}",
-                metrics_d["rec_RMSE"][i],
-                metrics_d["pred_RMSE"][i],
-                metrics_d["pred_MAE"][i],
-                metrics_d["pred_MAPE"][i],
-            )
+        logger.info(
+            "Test (ALL): rec_RMSE:%.4f, RMSE:%.4f, MAE:%.4f, MAPE(%%):%.4f",
+            metrics["rec_RMSE"],
+            metrics["pred_RMSE"],
+            metrics["pred_MAE"],
+            metrics["pred_MAPE"],
+        )
+        if metrics_d is not None:
+            for i in range(signal_channels):
+                logger.info(
+                    "Test (%s): rec_RMSE:%.4f, RMSE:%.4f, MAE:%.4f, MAPE(%%):%.4f",
+                    SIGNAL_NAMES[i] if i < len(SIGNAL_NAMES) else f"channel_{i}",
+                    metrics_d["rec_RMSE"][i],
+                    metrics_d["pred_RMSE"][i],
+                    metrics_d["pred_MAE"][i],
+                    metrics_d["pred_MAPE"][i],
+                )
+    except Exception as test_error:
+        logger.error("Skipped final test after training failure because evaluation also failed: %s", test_error)
     raise ValueError(str(error)) from error
 
 
@@ -205,6 +260,7 @@ def train_one_epoch(
     rmse_per_time = torch.zeros((T,))
     loss_acc = 0.0
     metric_sums = _empty_train_metrics()
+    total_batches = len(train_loader)
 
     for iter_idx, (y, x, t_list) in enumerate(tqdm(train_loader)):
         if iter_idx > 0 and iter_idx % 128 == 0:
@@ -215,23 +271,96 @@ def train_one_epoch(
         optimizer.zero_grad()
         y, x, t_list = y.to(device), x.to(device), t_list.to(device)
 
-        loss, output = _train_forward(model, y, x, t_list, data_normalization, config, loss_fn, masked_flag, args)
-        if torch.isnan(loss).any():
-            message = f"Loss is NaN in [Epoch {epoch + 1}/{num_epochs}, Iter {iteration_count}/{len(train_loader)}]"
-            logger.error(message)
-            raise ValueError(message)
+        try:
+            loss, output = _train_forward(model, y, x, t_list, data_normalization, config, loss_fn, masked_flag, args)
+        except (AssertionError, ValueError) as error:
+            _raise_training_numerical_error(
+                "model forward or loss computation failed",
+                epoch,
+                num_epochs,
+                iteration_count,
+                train_loader,
+                [
+                    ("input_y_raw", y),
+                    ("target_x_raw", x),
+                    ("time_list", t_list),
+                ],
+                logger,
+                extra_lines=[
+                    f"forward_error: {error}",
+                    f"mode={args.mode}, normed_loss={config['normed_loss']}, "
+                    f"use_one_channel={config['model']['use_one_channel']}",
+                ],
+            )
+        if iteration_count % 10 == 0:
+            theta_stats = collect_theta_nnz_ratios(model)
+            tqdm.write(format_theta_nnz_batch(theta_stats, epoch, iteration_count, total_batches))
+
+        if not torch.isfinite(loss).all():
+            _raise_training_numerical_error(
+                "loss is NaN or Inf before backward",
+                epoch,
+                num_epochs,
+                iteration_count,
+                train_loader,
+                [
+                    ("loss", loss),
+                    ("input_y_raw", y),
+                    ("target_x_raw", x),
+                    ("model_output_recovered", output),
+                ],
+                logger,
+                extra_lines=[
+                    f"mode={args.mode}, normed_loss={config['normed_loss']}, "
+                    f"use_one_channel={config['model']['use_one_channel']}"
+                ],
+            )
 
         loss.backward()
-        nan_name = check_nan_gradients(model)
-        if nan_name is not None:
-            message = (
-                f"Gradient has NaN/Inf value in [Epoch {epoch + 1}/{num_epochs}, "
-                f"Iter {iteration_count}/{len(train_loader)}] first in {nan_name}"
+        nan_info = check_nan_gradients(model)
+        if nan_info is not None:
+            _raise_training_numerical_error(
+                f"{nan_info['kind']} has NaN or Inf after backward",
+                epoch,
+                num_epochs,
+                iteration_count,
+                train_loader,
+                [
+                    ("loss", loss),
+                    ("input_y_raw", y),
+                    ("target_x_raw", x),
+                    ("model_output_recovered", output),
+                ],
+                logger,
+                extra_lines=[
+                    f"first_bad_{nan_info['kind']}: {nan_info['name']}",
+                    f"mode={args.mode}, normed_loss={config['normed_loss']}, "
+                    f"use_one_channel={config['model']['use_one_channel']}",
+                ],
             )
-            logger.error(message)
-            raise ValueError(message)
 
         optimizer.step()
+        nan_info = check_nan_gradients(model)
+        if nan_info is not None:
+            _raise_training_numerical_error(
+                f"{nan_info['kind']} has NaN or Inf after optimizer step",
+                epoch,
+                num_epochs,
+                iteration_count,
+                train_loader,
+                [
+                    ("loss", loss),
+                    ("input_y_raw", y),
+                    ("target_x_raw", x),
+                    ("model_output_recovered", output),
+                ],
+                logger,
+                extra_lines=[
+                    f"first_bad_{nan_info['kind']}: {nan_info['name']}",
+                    f"mode={args.mode}, normed_loss={config['normed_loss']}, "
+                    f"use_one_channel={config['model']['use_one_channel']}",
+                ],
+            )
         if args.loggrad != -1:
             log_gradients(epoch, num_epochs, iteration_count, train_loader, model, grad_logger, args)
 
@@ -360,7 +489,7 @@ def main(argv=None):
     config = apply_args_to_config(config, args)
     device = prepare_runtime(args)
     loss_fn = build_loss_fn(config)
-    names = build_experiment_names(config, args, args.lr)
+    names = build_experiment_names(config, args)
     paths = create_training_paths(names)
     writer = create_writer(paths.tensorboard_logdir)
     logger, grad_logger = create_loggers(paths, names, args)
@@ -441,7 +570,6 @@ def main(argv=None):
                 train_metrics["pred_MAE"],
                 train_metrics["pred_MAPE"],
             )
-
             val_loss, metrics, metrics_d = evaluate(
                 model,
                 val_loader,

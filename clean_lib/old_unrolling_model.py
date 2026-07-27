@@ -15,31 +15,17 @@ from clean_lib.feature_extractor import FeatureExtractor, GNNExtrapolation, Grap
 from clean_lib.graph_learning_module import GraphLearningModule
 
 
-def glasso_estimation(
+def _single_glasso_estimation(
     cov_matrix,
-    alpha=0.2,
-    method="admm",
-    max_iter=20,
-    tol=1e-4,
-    allow_backward=False,
+    alpha,
+    method,
+    max_iter,
+    tol,
+    allow_backward,
+    device,
+    dtype,
 ):
-    """
-    Estimate the precision matrix (inverse covariance) using Graphical Lasso.
-    Args:
-        cov_matrix: Dense node covariance matrix, shape (N, N).
-        alpha: Regularization parameter for Graphical Lasso.
-        method: One of "admm", "quic", or "sklearn".
-        max_iter: Maximum solver iterations. Capped at 20 for this model.
-        tol: Solver tolerance.
-        allow_backward: If False, Theta estimation is detached from autograd.
-    Returns:
-        Dense node precision matrix Theta, shape (N, N).
-    """
-    device = cov_matrix.device
-    dtype = cov_matrix.dtype
-    max_iter = min(max_iter, 20)
-    method = method.lower()
-    cov_matrix = 0.5 * (cov_matrix + cov_matrix.transpose(-1, -2))
+    """Estimate one dense precision matrix from one covariance matrix."""
     solver_cov = cov_matrix if allow_backward else cov_matrix.detach()
 
     if method == "admm":
@@ -90,6 +76,93 @@ def glasso_estimation(
         return torch.tensor(model.precision_, dtype=dtype, device=device)
 
     raise ValueError(f"Unknown graphical lasso method: {method}")
+
+
+def glasso_estimation(
+    cov_matrix,
+    alpha=0.2,
+    method="admm",
+    max_iter=20,
+    tol=1e-4,
+    allow_backward=False,
+):
+    """
+    Estimate the precision matrix (inverse covariance) using Graphical Lasso.
+    Args:
+        cov_matrix: Dense node covariance matrix, shape (N, N), or batched
+            covariance matrices, shape (B, N, N).
+        alpha: Regularization parameter for Graphical Lasso.
+        method: One of "admm", "quic", or "sklearn".
+        max_iter: Maximum solver iterations. Capped at 20 for this model.
+        tol: Solver tolerance.
+        allow_backward: If False, Theta estimation is detached from autograd.
+    Returns:
+        Dense node precision matrix Theta, shape (N, N), or batched precision
+        matrices, shape (B, N, N).
+    """
+    device = cov_matrix.device
+    dtype = cov_matrix.dtype
+    max_iter = min(max_iter, 20)
+    method = method.lower()
+    cov_matrix = 0.5 * (cov_matrix + cov_matrix.transpose(-1, -2))
+
+    if cov_matrix.ndim == 2:
+        return _single_glasso_estimation(
+            cov_matrix,
+            alpha,
+            method,
+            max_iter,
+            tol,
+            allow_backward,
+            device,
+            dtype,
+        )
+    if cov_matrix.ndim == 3:
+        theta_list = [
+            _single_glasso_estimation(
+                cov_matrix[i],
+                alpha,
+                method,
+                max_iter,
+                tol,
+                allow_backward,
+                device,
+                dtype,
+            )
+            for i in range(cov_matrix.size(0))
+        ]
+        return torch.stack(theta_list, dim=0)
+    raise ValueError("cov_matrix must have shape (N, N) or (B, N, N)")
+
+
+def node_covariance(signal, unbiased=True):
+    """Compute centered node covariance for Theta estimation.
+
+    Args:
+        signal: either `(B, T, N, C)` for one shared covariance matrix, or
+            `(B, K, T, N, C)` for one covariance matrix per batch item.
+        unbiased: when True, divide by the number of samples minus one.
+
+    Returns:
+        `(N, N)` for a 4-D input, or `(B, N, N)` for a 5-D input.
+    """
+    if signal.ndim == 4:
+        n_nodes = signal.size(2)
+        samples = signal.permute(0, 1, 3, 2).reshape(-1, n_nodes)
+        samples = samples - samples.mean(dim=0, keepdim=True)
+        denom = samples.size(0) - 1 if unbiased else samples.size(0)
+        denom = max(denom, 1)
+        return torch.einsum("sn,sm->nm", samples, samples) / denom
+
+    if signal.ndim == 5:
+        batch_size, _, _, n_nodes, _ = signal.shape
+        samples = signal.permute(0, 1, 2, 4, 3).reshape(batch_size, -1, n_nodes)
+        samples = samples - samples.mean(dim=1, keepdim=True)
+        denom = samples.size(1) - 1 if unbiased else samples.size(1)
+        denom = max(denom, 1)
+        return torch.einsum("bsn,bsm->bnm", samples, samples) / denom
+
+    raise ValueError("signal must have shape (B, T, N, C) or (B, K, T, N, C)")
 
 DEFAULT_GRAPH_INFO = {
     "n_nodes": None,
@@ -391,7 +464,7 @@ class UnrollingModel(nn.Module):
             # TODO: add theta updation
             # signal: output (B, T, N, C)
             # USE ONE CHANNEL ONLY
-            cov_matrix = torch.einsum("btic,btjc->ij", output[..., 0:1], output[..., 0:1]) / (batch_size * self.T)
+            cov_matrix = node_covariance(output[..., 0:1], unbiased=True)
             # cov_matrix = cov_matrix.detach().cpu().numpy()
             admm_block.Theta = glasso_estimation(
                 cov_matrix,
