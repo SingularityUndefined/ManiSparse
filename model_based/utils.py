@@ -10,29 +10,29 @@ class CG_Solver(nn.Module):
     def solve(self, A_func, b, x0=None):
         # Solve the linear system Ax = b using the Conjugate Gradient method
         # A_func: function that computes the matrix-vector product Ax
-        # b: (n_batchs, n_nodes,) right-hand side vector
-        # x0: (n_batchs, n_nodes,) initial guess for the solution
+        # b: (n_batches, n_nodes,) right-hand side vector
+        # x0: (n_batches, n_nodes,) initial guess for the solution
         if not torch.is_tensor(b):
             b = torch.as_tensor(b, dtype=torch.get_default_dtype())
         elif not b.is_floating_point():
             b = b.to(dtype=torch.get_default_dtype())
-        n_batchs, n_nodes = b.shape
+        n_batches, n_nodes = b.shape
         if x0 is None:
-            x = torch.zeros((n_batchs, n_nodes), dtype=b.dtype, device=b.device)
+            x = torch.zeros((n_batches, n_nodes), dtype=b.dtype, device=b.device)
         else:
             if not torch.is_tensor(x0):
                 x0 = torch.as_tensor(x0, dtype=b.dtype, device=b.device)
             x = x0.to(dtype=b.dtype, device=b.device).clone()
         
-        r = b - A_func(x)  # initial residual, shape (n_batchs, n_nodes)
+        r = b - A_func(x)  # initial residual, shape (n_batches, n_nodes)
         p = r.clone()
-        rsold = (r * r).sum(dim=1) # shape (n_batchs)
+        rsold = (r * r).sum(dim=1) # shape (n_batches)
         eps = torch.finfo(b.dtype).eps
         if torch.all(torch.sqrt(rsold) < self.tol):
             return x
 
         for i in range(self.max_iter):
-            Ap = A_func(p)  # shape (n_batchs, n_nodes)
+            Ap = A_func(p)  # shape (n_batches, n_nodes)
             denom = (p * Ap).sum(dim=1)
             valid_denom = torch.abs(denom) > eps
             denom_safe = torch.where(valid_denom, denom, torch.ones_like(denom))

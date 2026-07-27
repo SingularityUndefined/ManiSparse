@@ -119,9 +119,9 @@ class GraphSAGELayer(nn.Module):
         self.use_single_fc = use_single_fc # use single linear layer for all heads
 
         if self.use_single_fc:
-            if self.use_multihead_fc: # use all in heads for n heads cauculation
+            if self.use_multihead_fc: # use all input heads for n-head calculation
                 self.agg_fc = nn.Linear(self.in_heads * (self.k + 1), self.n_heads)
-            else: # number of heads unchanged, cauculate each head features seperately and uniformly
+            else: # number of heads unchanged, calculate each head feature separately and uniformly
                 self.agg_fc = nn.Linear(self.k + 1, 1)
         else:
             self.agg_fc = nn.Linear(self.k + 1, 1)

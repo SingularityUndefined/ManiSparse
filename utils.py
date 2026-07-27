@@ -17,6 +17,7 @@ from dataset.dataset_utils import (
 
 
 def seed_everything(seed=11):
+    """固定 Python、NumPy、PyTorch 的随机种子，减少实验复现误差。"""
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -25,21 +26,18 @@ def seed_everything(seed=11):
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
 
+
 def setup_logger(name, logfile, level=logging.INFO, to_console=False):
-    # 创建logger
+    """创建一个写入文件的 logger，可选同时输出到控制台。"""
     logger = logging.getLogger(name)
     logger.setLevel(level)
-    
-    # 创建formatter
+
     formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-    
-    # 创建文件handler并设置日志级别和格式
     file_handler = logging.FileHandler(logfile)
     file_handler.setLevel(level)
     file_handler.setFormatter(formatter)
     logger.addHandler(file_handler)
-    
-    # 根据参数决定是否创建控制台handler
+
     if to_console:
         console_handler = logging.StreamHandler()
         console_handler.setLevel(level)
@@ -49,23 +47,23 @@ def setup_logger(name, logfile, level=logging.INFO, to_console=False):
     return logger
 
 
-# def 
 class WeightedMSELoss(nn.Module):
+    """加权 MSE：前 `t` 步重建误差乘权重，后 `T - t` 步预测误差保持原权重。"""
+
     def __init__(self, t, T, weights=None) -> None:
         super().__init__()
         self.t = t
         self.T = T
-        if weights is None:
-            self.weights = t / (T - t)
-        else:
-            self.weights = weights
+        self.weights = t / (T - t) if weights is None else weights
 
     def forward(self, inputs, target):
-        rec_loss = nn.MSELoss()(inputs[:,:self.t], target[:,:self.t])# ((inputs[:,:self.t] - target[:,:self.t]) ** 2).mean()
-        pred_loss = nn.MSELoss()(inputs[:,self.t:], target[:,self.t:])# ((inputs[:,self.t:] - target[:,self.t:]) ** 2).mean()
+        rec_loss = nn.MSELoss()(inputs[:, :self.t], target[:, :self.t])
+        pred_loss = nn.MSELoss()(inputs[:, self.t:], target[:, self.t:])
         return rec_loss * self.weights + pred_loss
 
+
 def plot_loss_curve(train_loss, val_loss, save_path, val_freq=5, use_log=False):
+    """保存训练/验证 loss 曲线，验证 loss 的横轴按 `val_freq` 对齐。"""
     train_len, val_len = len(train_loss), len(val_loss)
     if train_len > 1:
         plt.figure()
@@ -79,39 +77,59 @@ def plot_loss_curve(train_loss, val_loss, save_path, val_freq=5, use_log=False):
         plt.savefig(save_path)
         plt.close()
 
+
+def _should_log_gradient(iteration_count, interval):
+    """判断当前 iteration 是否到达指定日志间隔。"""
+    return (iteration_count + 1) % interval == 0
+
+
+def _is_logged_parameter(model, name):
+    """筛选需要记录梯度的参数，目前只看图聚合权重和旧 extrapolation 线性层。"""
+    if 'agg' in name and 'weight' in name:
+        return True
+    uses_old_extrapolation = getattr(model, 'use_extrapolation', False) and getattr(model, 'use_old_extrapolation', False)
+    return uses_old_extrapolation and 'linear_extrapolation' in name
+
+
+def _gradient_summary(name, param):
+    """格式化单个参数的取值范围和梯度 L2 范数。"""
+    grad_norm = param.grad.data.norm(2).item() if param.grad is not None else float('nan')
+    return f'{name}: ({param.min():.4f}, {param.max():.4f})\t grad (L2 norm): {grad_norm:.4f}'
+
+
 def log_gradients(epoch, num_epochs, iteration_count, train_loader, model, grad_logger, args):
-    if (iteration_count + 1) % args.loggrad == 0:
+    """按 `args.loggrad` 周期把关键参数的数值范围和梯度写入日志。"""
+    should_log_file = _should_log_gradient(iteration_count, args.loggrad)
+    should_print_debug = args.debug and _should_log_gradient(iteration_count, 3 * args.loggrad)
+
+    if should_log_file:
         grad_logger.info(f'[Epoch {epoch}/{num_epochs}, Iter {iteration_count}/{len(train_loader)}]')
-    # when debug, print every (3 * args.loggrad) iterations to console
-    if (iteration_count + 1) % (3 * args.loggrad) == 0 and args.debug:
+    if should_print_debug:
         print(f'[Epoch {epoch}/{num_epochs}, Iter {iteration_count}/{len(train_loader)}]')
 
     for name, param in model.named_parameters():
-        if 'agg' in name and 'weight' in name:
-            if (iteration_count + 1) % args.loggrad == 0:
-                grad_logger.info(f'{name}: ({param.min():.4f}, {param.max():.4f})\t grad (L2 norm): {param.grad.data.norm(2).item():.4f}')
-            if (iteration_count + 1) % (3 * args.loggrad) == 0 and args.debug:
-                print(f'{name}: ({param.min():.4f}, {param.max():.4f})\t grad (L2 norm): {param.grad.data.norm(2).item():.4f}')
+        if not _is_logged_parameter(model, name):
+            continue
+        summary = _gradient_summary(name, param)
+        if should_log_file:
+            grad_logger.info(summary)
+        if should_print_debug:
+            print(summary)
 
-        if model.use_extrapolation and model.use_old_extrapolation and 'linear_extrapolation' in name:
-            if (iteration_count + 1) % args.loggrad == 0:
-                grad_logger.info(f'{name}: ({param.min():.4f}, {param.max():.4f})\t grad (L2 norm): {param.grad.data.norm(2).item():.4f}')
-            if (iteration_count + 1) % (3 * args.loggrad) == 0 and args.debug:
-                print(f'{name}: ({param.min():.4f}, {param.max():.4f})\t grad (L2 norm): {param.grad.data.norm(2).item():.4f}')
 
 def print_gradients(model):
+    """直接打印关键参数的数值范围和梯度，用于临时 debug。"""
     for name, param in model.named_parameters():
-        if 'agg' in name and 'weight' in name:
-            print(f'{name}: ({param.min():.4f}, {param.max():.4f})\t grad (L2 norm): {param.grad.data.norm(2).item():.4f}')
-        if model.use_extrapolation and model.use_old_extrapolation and 'linear_extrapolation' in name:
-            print(f'{name}: ({param.min():.4f}, {param.max():.4f})\t grad (L2 norm): {param.grad.data.norm(2).item():.4f}')
+        if _is_logged_parameter(model, name):
+            print(_gradient_summary(name, param))
+
 
 def change_model_location(model, model_path, device):
+    """加载模型参数，并同步带有 `device` 属性的子模块位置标记。"""
     model_params = torch.load(model_path, map_location=device)
     missing_keys, unexpected_keys = model.load_state_dict(model_params, strict=False)
     print('missing keys:', missing_keys)
     print('unexpected keys:', unexpected_keys)
-    # model = torch.load(model_path, map_location=device).to(device)
     for name, module in model.named_children():
         if hasattr(module, 'device'):
             print(f'Loaded module: {name}')
@@ -124,371 +142,279 @@ def change_model_location(model, model_path, device):
     return model
 
 
-def test(model, val_loader, data_normalization, masked_flag, config, device, signal_channels, mode='test', loss_fn=None, use_one_channel=False, use_tqdm=True):
-    model.eval()
-    batch_count = 0
-    all_zero_batchs = 0
-    t_out = config['model']['t_out']
+def _loader_iter(loader, use_tqdm):
+    """根据配置返回普通 dataloader 迭代器或 tqdm 包装后的迭代器。"""
+    return tqdm(loader) if use_tqdm else loader
+
+
+def _model_uses_one_channel(config, fallback):
+    """从 config 读取是否只使用单通道；缺省时使用调用方传入的 fallback。"""
+    return config.get('model', {}).get('use_one_channel', fallback)
+
+
+def _loss_on_requested_span(loss_fn, output, target, masked_flag, t_in):
+    """计算训练/验证 loss；masked 模式只在预测区间 `t_in:` 上计算。"""
+    if loss_fn is None:
+        return None
+    if masked_flag:
+        return loss_fn(output[:, t_in:], target[:, t_in:])
+    return loss_fn(output, target)
+
+
+def _forward_eval_batch(model, y, x, t_list, data_normalization, masked_flag, config, loss_fn, output_graph=False, use_one_channel=False):
+    """完成一个 batch 的评估前向过程。
+
+    输入:
+        y: 观测序列前缀，shape 通常为 (B, t_in, N, C)
+        x: 完整目标序列，shape 通常为 (B, T, N, C)
+        t_list: 时间索引，shape 通常为 (B, T)
+
+    返回:
+        output: 恢复到原始数据尺度后的模型输出
+        loss: 按配置计算的 loss；如果 `loss_fn is None` 则为 None
+        normed_output/normed_x: 归一化尺度上的输出和目标，供 test_series 保存
+        undirected_graphs/directed_graphs: `output_graph=True` 时模型额外返回的图序列
+    """
     t_in = config['model']['t_in']
-    output_list = []
-    x_list = []
-    with torch.no_grad():
-        rec_mse = 0
-        pred_mse = 0
-        pred_mape = 0
-        pred_mae = 0
-        nearest_loss = 0
-        pred_mse_stepwise = torch.zeros((t_out,))
-        truth_sq_stepwise = torch.zeros((t_out,))
-        truth_sq = 0
-        if not use_one_channel:
-            rec_mse_d = np.zeros((signal_channels,))# .to(device)
-            pred_mse_d = np.zeros((signal_channels,))# .to(device)
-            pred_mape_d = np.zeros((signal_channels,))# .to(device)
-            pred_mae_d = np.zeros((signal_channels,))# .to(device)
+    normalize_one_channel = _model_uses_one_channel(config, use_one_channel)
 
-        if mode == 'val':
-            running_loss = 0
-
-        if use_tqdm:
-            val_loader_iter = tqdm(val_loader)
+    if data_normalization is None:
+        model_result = model(y, t_list, output_graph=True) if output_graph else model(y, t_list)
+        if output_graph:
+            output, undirected_graphs, directed_graphs = model_result
         else:
-            val_loader_iter = val_loader
+            output, undirected_graphs, directed_graphs = model_result, None, None
+        loss = _loss_on_requested_span(loss_fn, output, x, masked_flag, t_in)
+        return output, loss, output, x, undirected_graphs, directed_graphs
 
-        for y, x, t_list in val_loader_iter:
-            # if batch_count < 120:
-            #     batch_count += 1
-            #     continue
-            y, x, t_list = y.to(device), x.to(device), t_list.to(device)
+    normed_y = data_normalization.normalize_data(y)
+    normed_x = data_normalization.normalize_data(x, normalize_one_channel)
+    model_result = model(normed_y, t_list, output_graph=True) if output_graph else model(normed_y, t_list)
+    if output_graph:
+        normed_output, undirected_graphs, directed_graphs = model_result
+    else:
+        normed_output, undirected_graphs, directed_graphs = model_result, None, None
 
-            # y = (y - train_mean) / train_std
-            # y = (y - train_min) / (train_max - train_min)
-            if data_normalization is not None:
-                normed_y = data_normalization.normalize_data(y)
-                normed_x = data_normalization.normalize_data(x, config['model']['use_one_channel'])
-                normed_output = model(normed_y, t_list)
-                
-                if config['normed_loss']:
-                    if loss_fn is not None:
-                        if masked_flag:
-                            loss = loss_fn(normed_output[:, config['model']['t_in']:], normed_x[:, config['model']['t_in']:])
-                        else:
-                            loss = loss_fn(normed_output, normed_x)
-                        running_loss += loss.item()
-                    # recover data
-                    output = data_normalization.recover_data(normed_output, config['model']['use_one_channel'])
+    output = data_normalization.recover_data(normed_output, normalize_one_channel)
+    if config.get('normed_loss', False):
+        loss = _loss_on_requested_span(loss_fn, normed_output, normed_x, masked_flag, t_in)
+    else:
+        loss = _loss_on_requested_span(loss_fn, output, x, masked_flag, t_in)
+    return output, loss, normed_output, normed_x, undirected_graphs, directed_graphs
 
-                else:
-                    output = data_normalization.recover_data(normed_output, config['model']['use_one_channel'])
-                    if loss_fn is not None:
-                        if masked_flag:
-                            loss = loss_fn(output[:,config['model']['t_in']:], x[:,config['model']['t_in']:])
-                        else:
-                            loss = loss_fn(output, x)
-                        running_loss += loss.item()
-            else:
-                output = model(y, t_list)
-                if loss_fn is not None:
-                    if masked_flag:
-                        loss = loss_fn(output[:,config['model']['t_in']:], x[:,config['model']['t_in']:])
-                    else:
-                        loss = loss_fn(output, x)
-                    running_loss += loss.item()
-            
-            # if args.mode == 'normalize':
-            #     output = nn.ReLU()(output)
-            # output = output * (train_max - train_min) + train_min
-            # output = output * train_std + train_mean
-            # if data_normalization is not None:
-            # metrics
-            '''
-            metrics_batch = compute_metrics(output.detach().cpu(), x.detach().cpu(), masked_flag, t_in)
-            rec_mse += metrics_batch['rec_MSE'] # ((x[:,:config['model']['t_in']] - output[:,:config['model']['t_in']]) ** 2).detach().cpu().mean().item()
-            pred_mse += metrics_batch['pred_MSE']
-            pred_mae += metrics_batch['pred_MAE']
-            if metrics_batch['pred_MAPE'] is None:
-                print('exist all zero batchs in ground-truth in pred_mape')
-                all_zero_batchs += 1
-            else:
-                pred_mape += metrics_batch['pred_MAPE']
-            pred_mse_stepwise += metrics_batch['pred_MSE_stepwise']
-            truth_sq_stepwise += metrics_batch['truth_sq_stepwise']
-            truth_sq += metrics_batch['truth_sq']
-            nearest_loss += metrics_batch['nearest_loss']
-            '''
-            output_list.append(output.detach().cpu())
-            x_list.append(x.detach().cpu())
-            if not use_one_channel:
-                rec_mse_d += ((x[:,:config['model']['t_in']] - output[:,:config['model']['t_in']]) ** 2).detach().cpu().mean((0,1,2)).cpu().numpy()# .item()
-            if masked_flag:
-                x, output = x[:,config['model']['t_in']:], output[:,config['model']['t_in']:]
-            
-            # if loss_fn is not None:
-            #     loss = loss_fn(output, x)
-            #     running_loss += loss.item()
 
-            
-            # x, output = x[:,:,:,1], output[:,:,:,1]
-            
-            if not masked_flag:
-                x_pred = x[:,t_in:]
-                output_pred = output[:,t_in:]
-                
-                # if mask.sum() == 0:
-                #     print(x_pred, output_pred)
+def _empty_channel_metrics(signal_channels):
+    """初始化逐通道 metric 的累加器。"""
+    return {
+        'rec_mse': np.zeros((signal_channels,)),
+        'pred_mse': np.zeros((signal_channels,)),
+        'pred_mae': np.zeros((signal_channels,)),
+        'pred_mape': np.zeros((signal_channels,)),
+        'pred_mape_count': np.zeros((signal_channels,)),
+    }
 
-                # print('pred_mape', pred_mape)
 
-                if not use_one_channel:
-                    pred_mse_d += ((x_pred - output_pred) ** 2).detach().mean((0,1,2)).cpu().numpy()
-                    pred_mae_d += (torch.abs(output_pred - x_pred)).detach().mean((0,1,2)).cpu().numpy()
-                    for i in range(signal_channels):
-                        mask_i = x_pred[:,:,:,i] > 1e-8
-                        pred_mape_d[i] += (torch.abs(output_pred[:,:,:,i][mask_i] - x_pred[:,:,:,i][mask_i]) / x_pred[:,:,:,i][mask_i]).detach().cpu().mean().item() * 100
-            # break
-    '''
-    rec_rmse = math.sqrt(rec_mse / len(val_loader))
-    pred_rmse = math.sqrt(pred_mse / len(val_loader))
-    pred_mae = pred_mae / len(val_loader)
-    pred_mape = pred_mape / (len(val_loader) - all_zero_batchs) #len(val_loader)
-    pred_rnmse_stepwise = torch.sqrt(pred_mse_stepwise / truth_sq_stepwise)
-    pred_rnmse = torch.sqrt(pred_mse / truth_sq)
-    '''
-    full_output = torch.cat(output_list, 0)
-    full_x = torch.cat(x_list, 0)
-    metrics = compute_metrics(full_output, full_x, masked_flag, t_in)
+def _update_channel_metrics(sums, output, x, t_in):
+    """累加逐通道指标。
+
+    逐通道指标只在 `test` 中使用，最终会变成 `metrics_d`:
+        rec_RMSE: 前 `t_in` 步重建区间的逐通道 RMSE
+        pred_RMSE: `t_in:` 预测区间的逐通道 RMSE
+        pred_MAE: `t_in:` 预测区间的逐通道 MAE
+        pred_MAPE: `t_in:` 预测区间的逐通道 MAPE，忽略接近 0 的真实值
+    """
+    x_pred = x[:, t_in:]
+    output_pred = output[:, t_in:]
+    sums['rec_mse'] += ((x[:, :t_in] - output[:, :t_in]) ** 2).detach().mean((0, 1, 2)).cpu().numpy()
+    sums['pred_mse'] += ((x_pred - output_pred) ** 2).detach().mean((0, 1, 2)).cpu().numpy()
+    sums['pred_mae'] += torch.abs(output_pred - x_pred).detach().mean((0, 1, 2)).cpu().numpy()
+
+    for channel_id in range(x_pred.size(-1)):
+        mask = torch.abs(x_pred[..., channel_id]) > 1e-8
+        if mask.any():
+            percentage_error = torch.abs(output_pred[..., channel_id][mask] - x_pred[..., channel_id][mask])
+            percentage_error = percentage_error / torch.abs(x_pred[..., channel_id][mask])
+            sums['pred_mape'][channel_id] += percentage_error.detach().mean().cpu().item() * 100
+            sums['pred_mape_count'][channel_id] += 1
+
+
+def _finalize_channel_metrics(sums, num_batches):
+    """把逐 batch 累加的逐通道误差转换成最终 `metrics_d` 字典。"""
+    pred_mape = np.divide(
+        sums['pred_mape'],
+        sums['pred_mape_count'],
+        out=np.full_like(sums['pred_mape'], np.nan),
+        where=sums['pred_mape_count'] > 0,
+    )
+    return {
+        'rec_RMSE': np.sqrt(sums['rec_mse'] / num_batches),
+        'pred_RMSE': np.sqrt(sums['pred_mse'] / num_batches),
+        'pred_MAE': sums['pred_mae'] / num_batches,
+        'pred_MAPE': pred_mape,
+    }
+
+
+def _add_rmse_metrics(metrics):
+    """基于 `compute_metrics` 的基础 MSE 结果补充 RMSE 和 rNMSE。"""
     metrics['rNMSE_stepwise'] = torch.sqrt(metrics['pred_MSE_stepwise'] / metrics['truth_sq_stepwise'])
     metrics['rNMSE'] = math.sqrt(metrics['pred_MSE'] / metrics['truth_sq'])
     metrics['rec_RMSE'] = math.sqrt(metrics['rec_MSE'])
     metrics['pred_RMSE'] = math.sqrt(metrics['pred_MSE'])
+    return metrics
 
 
-    if not use_one_channel:
-        rec_rmse_d = np.sqrt(rec_mse_d / len(val_loader))
-        pred_mse_d = np.sqrt(pred_mse_d / len(val_loader))
-        pred_mae_d = pred_mae_d / len(val_loader)
-        pred_mape_d = pred_mape_d / (len(val_loader) - all_zero_batchs) #len(val_loader)
+def test(model, val_loader, data_normalization, masked_flag, config, device, signal_channels, mode='test', loss_fn=None, use_one_channel=False, use_tqdm=True):
+    """评估模型并返回汇总 metric。
+
+    `test` 做的是“评价指标汇总”，不是保存每个样本的完整过程:
+    1. 把每个 batch 的 `(y, x, t_list)` 放到 `device`。
+       `y` 是观测前缀，通常为 (B, t_in, N, C)；
+       `x` 是完整目标序列，通常为 (B, T, N, C)。
+    2. 如果传入 `data_normalization`，先在归一化尺度上跑模型，再把输出恢复
+       到原始数据尺度用于 metric。
+    3. 如果 `mode == 'val'` 且传入 `loss_fn`，额外返回平均 validation loss。
+       loss 的计算尺度由 `config['normed_loss']` 决定；`masked_flag=True` 时
+       loss 只看预测区间 `t_in:`。
+    4. 拼接所有 batch 后调用 `compute_metrics` 计算全局 metric:
+       `rec_MSE/rec_RMSE` 衡量前 `t_in` 步重建；
+       `pred_MSE/pred_RMSE/pred_MAE/pred_MAPE/rNMSE` 衡量 `t_in:` 后的预测。
+    5. 多通道输入时额外返回 `metrics_d`，即每个 channel 各自的
+       `rec_RMSE/pred_RMSE/pred_MAE/pred_MAPE`。
+    """
+    assert mode in ['val', 'test']
+    model.eval()
+    t_in = config['model']['t_in']
+    output_list = []
+    x_list = []
+    running_loss = 0.0
+    channel_sums = None if use_one_channel else _empty_channel_metrics(signal_channels)
+
+    with torch.no_grad():
+        for y, x, t_list in _loader_iter(val_loader, use_tqdm):
+            y, x, t_list = y.to(device), x.to(device), t_list.to(device)
+            output, loss, _, _, _, _ = _forward_eval_batch(
+                model,
+                y,
+                x,
+                t_list,
+                data_normalization,
+                masked_flag,
+                config,
+                loss_fn,
+                use_one_channel=use_one_channel,
+            )
+            if loss is not None:
+                running_loss += loss.item()
+
+            output_list.append(output.detach().cpu())
+            x_list.append(x.detach().cpu())
+            if channel_sums is not None:
+                _update_channel_metrics(channel_sums, output, x, t_in)
+
+    full_output = torch.cat(output_list, 0)
+    full_x = torch.cat(x_list, 0)
+    metrics = _add_rmse_metrics(compute_metrics(full_output, full_x, masked_flag, t_in))
+    metrics_d = None if use_one_channel else _finalize_channel_metrics(channel_sums, len(val_loader))
 
     if mode == 'val':
-        running_loss /= len(val_loader)
-    '''
-    metrics = {
-        'rec_RMSE': rec_rmse,
-        'pred_RMSE': pred_rmse,
-        'pred_MAE': pred_mae,
-        'pred_MAPE': pred_mape,
-        'rNMSE_stepwise': pred_rnmse_stepwise,
-        'rNMSE': pred_rnmse,
-    }
-    '''
+        running_loss = running_loss / len(val_loader) if loss_fn is not None else 0.0
+        return (running_loss, metrics) if use_one_channel else (running_loss, metrics, metrics_d)
+    return metrics if use_one_channel else (metrics, metrics_d)
 
-    if not use_one_channel:
-        metrics_d = {
-            'rec_RMSE': rec_rmse_d,
-            'pred_RMSE': pred_mse_d,
-            'pred_MAE': pred_mae_d,
-            'pred_MAPE': pred_mape_d 
-        }
-
-    if mode == 'val':
-        if not use_one_channel:
-            return running_loss, metrics, metrics_d
-        else:
-            return running_loss, metrics
-    elif mode == 'test':
-        if not use_one_channel:
-            return metrics, metrics_d
-        else:
-            return metrics
-    # return running_loss
 
 def test_series(model, val_loader, data_normalization, masked_flag, config, device, signal_channels, mode='test', loss_fn=None, use_one_channel=False, use_tqdm=True):
+    """导出完整输出序列和图序列，用于可视化/诊断，不计算汇总 metric。
+
+    `test_series` 和 `test` 的区别:
+        `test` 返回最终评价指标，例如 RMSE、MAE、MAPE、rNMSE。
+        `test_series` 返回逐样本的原始结果，包括:
+            output/x: 原始数据尺度上的预测序列和真实序列
+            normed_output/normed_x: 归一化尺度上的预测序列和真实序列
+            undirected_graphs/directed_graphs: 模型每个 batch 输出的图
+            connect_list/nearest_nodes/nearest_dists: 模型内部保存的图辅助信息
+
+    所以这里的 `loss_fn`、`masked_flag`、`mode` 主要是为了复用前向 helper 和
+    保持旧接口兼容；返回值本身不包含 metric。
+    """
+    assert mode in ['val', 'test']
     model.eval()
-    connect_list = model.connect_list
-    nearest_nodes = model.nearsest_nodes
-    nearest_dists = model.nearest_dists
-    batch_count = 0
-    all_zero_batchs = 0
-    t_out = config['model']['t_out']
-    t_in = config['model']['t_in']
     output_list = []
     x_list = []
     normed_x_list = []
     normed_output_list = []
     undirected_graph_list = []
     directed_graph_list = []
+
     with torch.no_grad():
-        rec_mse = 0
-        pred_mse = 0
-        pred_mape = 0
-        pred_mae = 0
-        nearest_loss = 0
-        pred_mse_stepwise = torch.zeros((t_out,))
-        truth_sq_stepwise = torch.zeros((t_out,))
-        truth_sq = 0
-        if not use_one_channel:
-            rec_mse_d = np.zeros((signal_channels,))# .to(device)
-            pred_mse_d = np.zeros((signal_channels,))# .to(device)
-            pred_mape_d = np.zeros((signal_channels,))# .to(device)
-            pred_mae_d = np.zeros((signal_channels,))# .to(device)
-
-        if mode == 'val':
-            running_loss = 0
-
-        if use_tqdm:
-            val_loader_iter = tqdm(val_loader)
-        else:
-            val_loader_iter = val_loader
-
-        for y, x, t_list in val_loader_iter:
-            # if batch_count < 120:
-            #     batch_count += 1
-            #     continue
+        for y, x, t_list in _loader_iter(val_loader, use_tqdm):
             y, x, t_list = y.to(device), x.to(device), t_list.to(device)
-            # y = (y - train_mean) / train_std
-            # y = (y - train_min) / (train_max - train_min)
-            if data_normalization is not None:
-                normed_y = data_normalization.normalize_data(y)
-                normed_x = data_normalization.normalize_data(x, config['model']['use_one_channel'])
-                normed_output, undirected_graphs, directed_graphs = model(normed_y, t_list, output_graph=True)
-                print('graph shape', undirected_graphs.shape, directed_graphs.shape)
-                normed_x_list.append(normed_x.detach().cpu())
-                undirected_graph_list.append(undirected_graphs.detach().cpu())
-                directed_graph_list.append(directed_graphs.detach().cpu())
-                normed_output_list.append(normed_output.detach().cpu())
-                
-                if config['normed_loss']:
-                    if loss_fn is not None:
-                        if masked_flag:
-                            loss = loss_fn(normed_output[:, config['model']['t_in']:], normed_x[:, config['model']['t_in']:])
-                        else:
-                            loss = loss_fn(normed_output, normed_x)
-                        running_loss += loss.item()
-                    # recover data
-                    output = data_normalization.recover_data(normed_output, config['model']['use_one_channel'])
+            output, _, normed_output, normed_x, undirected_graphs, directed_graphs = _forward_eval_batch(
+                model,
+                y,
+                x,
+                t_list,
+                data_normalization,
+                masked_flag,
+                config,
+                loss_fn,
+                output_graph=True,
+                use_one_channel=use_one_channel,
+            )
 
-                else:
-                    output = data_normalization.recover_data(normed_output, config['model']['use_one_channel'])
-                    if loss_fn is not None:
-                        if masked_flag:
-                            loss = loss_fn(output[:,config['model']['t_in']:], x[:,config['model']['t_in']:])
-                        else:
-                            loss = loss_fn(output, x)
-                        running_loss += loss.item()
-            else:
-                output, undirected_graphs, directed_graphs = model(y, t_list, output_graph=True)
-                undirected_graph_list.append(undirected_graphs.detach().cpu())
-                directed_graph_list.append(directed_graphs.detach().cpu())
-                # print('graph shape', undirected_graphs.shape, directed_graphs.shape)
-                # load graphs
-                if loss_fn is not None:
-                    if masked_flag:
-                        loss = loss_fn(output[:,config['model']['t_in']:], x[:,config['model']['t_in']:])
-                    else:
-                        loss = loss_fn(output, x)
-                    running_loss += loss.item()
-            
-            # if args.mode == 'normalize':
-            #     output = nn.ReLU()(output)
-            # output = output * (train_max - train_min) + train_min
-            # output = output * train_std + train_mean
-            # if data_normalization is not None:
-            # metrics
-            '''
-            metrics_batch = compute_metrics(output.detach().cpu(), x.detach().cpu(), masked_flag, t_in)
-            rec_mse += metrics_batch['rec_MSE'] # ((x[:,:config['model']['t_in']] - output[:,:config['model']['t_in']]) ** 2).detach().cpu().mean().item()
-            pred_mse += metrics_batch['pred_MSE']
-            pred_mae += metrics_batch['pred_MAE']
-            if metrics_batch['pred_MAPE'] is None:
-                print('exist all zero batchs in ground-truth in pred_mape')
-                all_zero_batchs += 1
-            else:
-                pred_mape += metrics_batch['pred_MAPE']
-            pred_mse_stepwise += metrics_batch['pred_MSE_stepwise']
-            truth_sq_stepwise += metrics_batch['truth_sq_stepwise']
-            truth_sq += metrics_batch['truth_sq']
-            nearest_loss += metrics_batch['nearest_loss']
-            '''
             output_list.append(output.detach().cpu())
             x_list.append(x.detach().cpu())
-
-    # TODO: model edge weights
-    full_output = torch.cat(output_list, 0)
-    full_x = torch.cat(x_list, 0)
-    full_normed_output = torch.cat(normed_output_list, 0)
-    full_normed_x = torch.cat(normed_x_list, 0)
-    full_undirected_graphs = torch.cat(undirected_graph_list, 0)
-    full_directed_graphs = torch.cat(directed_graph_list, 0)
+            normed_output_list.append(normed_output.detach().cpu())
+            normed_x_list.append(normed_x.detach().cpu())
+            undirected_graph_list.append(undirected_graphs.detach().cpu())
+            directed_graph_list.append(directed_graphs.detach().cpu())
 
     return {
-        'output': full_output,
-        'x': full_x,
-        'normed_output': full_normed_output,
-        'normed_x': full_normed_x,
-        'connect_list': connect_list,
-        'nearest_nodes': nearest_nodes,
-        'nearest_dists': nearest_dists,
-        'undirected_graphs': full_undirected_graphs,
-        'directed_graphs': full_directed_graphs
+        'output': torch.cat(output_list, 0),
+        'x': torch.cat(x_list, 0),
+        'normed_output': torch.cat(normed_output_list, 0),
+        'normed_x': torch.cat(normed_x_list, 0),
+        'connect_list': getattr(model, 'connect_list', None),
+        'nearest_nodes': getattr(model, 'nearest_nodes', None),
+        'nearest_dists': getattr(model, 'nearest_dists', None),
+        'undirected_graphs': torch.cat(undirected_graph_list, 0),
+        'directed_graphs': torch.cat(directed_graph_list, 0),
     }
 
-            
-            
-    # return running_loss
 
 def compute_metrics(output, x, masked_flag, t_in):
     """
-    Compute the metrics for the model
-    output: model output, in (B, T, N, C)
-    x: ground truth, in (B, T, N, C)
-    masked_flag: whether to use the masked loss
+    计算全局重建和预测指标。
+
+    output: 模型输出，shape (B, T, N, C)
+    x: 真实目标，shape (B, T, N, C)
+    masked_flag: 保留旧接口；当前 metric 总是在 `t_in:` 预测区间上计算预测项。
+
+    返回:
+        rec_MSE: `:t_in` 重建区间的 MSE
+        pred_MSE/pred_MAE/pred_MAPE: `t_in:` 预测区间的误差
+        pred_MSE_stepwise: 每个预测步的 MSE，shape (T - t_in,)
+        truth_sq_stepwise/truth_sq: 真实值平方均值，用于计算 rNMSE
+        nearest_loss: 第一个预测步 `t_in` 的 MSE
     """
-    rec_mse_batch = ((x[:,:t_in] - output[:,:t_in]) ** 2).mean().item()
+    rec_mse = ((x[:, :t_in] - output[:, :t_in]) ** 2).mean().item()
+    x_pred = x[:, t_in:]
+    output_pred = output[:, t_in:]
+    pred_mse = ((x_pred - output_pred) ** 2).mean().item()
+    pred_mae = torch.abs(output_pred - x_pred).mean().item()
 
-    if masked_flag:
-        x, output = x[:,t_in:], output[:,t_in:]
-        pred_mse = ((x - output) ** 2).mean().item()
-        pred_mae = (torch.abs(output - x)).mean().item()
-        mask = (torch.abs(x) > 1e-8)
-        if mask.sum() > 0:
-            pred_mape = (torch.abs(output[mask] - x[mask]) / torch.abs(x[mask])).mean().item() * 100
-        else:
-            pred_mape = None
-            # print('exist all zero batchs in ground-truth in pred_mape')
-            # print(x)
-        
-        # rnmse metric
-        pred_mse_stepwise = ((x - output) ** 2).mean((0,2,3))
-        truth_sq_stepwise = (x ** 2).mean((0,2,3))
-        truth_sq = (x ** 2).mean()
-        nearest_loss = ((x[:, 0] - output[:, 0]) ** 2).mean().item()
-        # rnmse_stepwise = torch.sqrt(mse_stepwise / truth_stepwise)
-        # rnmse = torch.sqrt(mse_stepwise.mean() / truth_stepwise.mean())
-
-
+    mask = torch.abs(x_pred) > 1e-8
+    if mask.any():
+        pred_mape = (torch.abs(output_pred[mask] - x_pred[mask]) / torch.abs(x_pred[mask])).mean().item() * 100
     else:
-        x_pred = x[:,t_in:]
-        output_pred = output[:,t_in:]
-        mask = (torch.abs(x_pred) > 1e-8)
-        pred_mse = ((x_pred - output_pred) ** 2).mean().item()
-        pred_mae = (torch.abs(output_pred - x_pred)).mean().item()
-        if mask.sum() > 0:
-            pred_mape = (torch.abs(output_pred[mask] - x_pred[mask]) / torch.abs(x_pred[mask])).mean().item() * 100
-        else:
-            pred_mape = None
-            # print('exist all zero batchs in ground-truth in pred_mape')
-            # print(x_pred)
-        # rnmse metric
-        pred_mse_stepwise = ((x_pred - output_pred) ** 2).mean((0,2,3))
-        truth_sq_stepwise = (x_pred ** 2).mean((0,2,3))
-        truth_sq = (x_pred ** 2).mean()
-        nearest_loss = ((x[:, t_in] - output[:, t_in]) ** 2).mean().item()
-        # rnmse_stepwise = torch.sqrt(mse_stepwise / truth_stepwise)
-        # rnmse = torch.sqrt(mse_stepwise.mean() / truth_stepwise.mean())
-    
-    # dictionary for metrics
-    metrics = {
-        'rec_MSE': rec_mse_batch,
+        pred_mape = None
+
+    pred_mse_stepwise = ((x_pred - output_pred) ** 2).mean((0, 2, 3))
+    truth_sq_stepwise = (x_pred ** 2).mean((0, 2, 3))
+    truth_sq = (x_pred ** 2).mean()
+    nearest_loss = ((x[:, t_in] - output[:, t_in]) ** 2).mean().item()
+
+    return {
+        'rec_MSE': rec_mse,
         'pred_MSE': pred_mse,
         'pred_MAE': pred_mae,
         'pred_MAPE': pred_mape,
@@ -498,47 +424,42 @@ def compute_metrics(output, x, masked_flag, t_in):
         'nearest_loss': nearest_loss
     }
 
-    return metrics
 
-
-
-# check the gradients
-def check_nan_gradients(model:nn.Module):
-    # print all gradients
-    # flag = False
-    # nan_module = None # list of parameters with NaN gradients and inf gradients
+def check_nan_gradients(model: nn.Module):
+    """检查模型参数或梯度中是否存在 NaN/Inf，返回第一个异常参数名。"""
     for name, param in reversed(list(model.named_parameters())):
-        if param.grad is not None:
-            param_detached = param.detach().cpu()
-            grad_detached = param.grad.detach().cpu()
-            if torch.isnan(grad_detached).any() or torch.isnan(param_detached).any() or torch.isinf(grad_detached).any() or torch.isinf(param_detached).any():
-                return name
-                # break
+        param_detached = param.detach().cpu()
+        if torch.isnan(param_detached).any() or torch.isinf(param_detached).any():
+            return name
+
+        if param.grad is None:
+            continue
+        grad_detached = param.grad.detach().cpu()
+        if torch.isnan(grad_detached).any() or torch.isinf(grad_detached).any():
+            return name
     return
 
-def log_parameters_scalars(model:nn.Module, name_list:list):
-    # num_blocks = model.num_blocks
+
+def log_parameters_scalars(model: nn.Module, name_list: list):
+    """收集指定参数名片段对应参数的 min/max 和梯度范数，供日志或 TensorBoard 使用。"""
     param_dicts = {}
     grad_dict = {}
     for check_name in name_list:
         param_dicts[check_name] = {}
-        # grad_dicts[check_name] = {}
         for name, param in model.named_parameters():
             if check_name in name:
                 name_split = name.split('.')
                 block_id, param_name = name_split[1], name_split[-1]
                 param_dicts[check_name][f'{param_name}_{block_id}_min'] = param.detach().cpu().min().item()
                 param_dicts[check_name][f'{param_name}_{block_id}_max'] = param.detach().cpu().max().item()
-                grad_dict[f'{param_name}_{block_id}'] = param.grad.data.detach().cpu().norm(2).item()
-                # logger.info(f'\t {name}: ({param.min():.4f}, {param.max():.4f})\t grad (L2 norm): {param.grad.data.norm(2).item():.4f}')
+                if param.grad is not None:
+                    grad_dict[f'{param_name}_{block_id}'] = param.grad.data.detach().cpu().norm(2).item()
     return param_dicts, grad_dict
 
 # TensorBoard utilities (legacy; not required for core training).
 def dataframe_from_tensorboard(log_dir, selected_tag):
     """
-    处理 TensorBoard 日志数据
-    :param log_dir: TensorBoard 日志目录
-    :return: 返回处理后的数据
+    从 TensorBoard event 文件中读取指定 scalar tag，返回包含 step/value 的 DataFrame。
     """
     import pandas as pd
     from tensorboard.backend.event_processing import event_accumulator
@@ -564,9 +485,7 @@ def dataframe_from_tensorboard(log_dir, selected_tag):
 
 def plot_dataframe(df, title="Training Loss Curve"):
     """
-    绘制 DataFrame 数据
-    :param df: DataFrame 数据
-    :param title: 图表标题
+    绘制由 `dataframe_from_tensorboard` 得到的 step/value 曲线。
     """
 
     plt.figure(figsize=(10, 5))
@@ -579,8 +498,10 @@ def plot_dataframe(df, title="Training Loss Curve"):
 
 
 def log_tensorboard():
+    """TensorBoard 写日志的预留入口，目前没有实际实现。"""
     pass
 
 
 def generate_experiment_name(args: argparse.Namespace, config:dict):
+    """实验命名的预留入口，目前没有实际实现。"""
     pass

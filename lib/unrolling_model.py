@@ -66,16 +66,16 @@ class UnrollingModel(nn.Module):
 
         # define a graph connection pattern
         self.kNN = None
-        self.nearsest_nodes, self.nearest_dists = find_k_nearest_neighbors(graph_info['n_nodes'], graph_info['u_edges'], graph_info['u_dist'], k_hop, device=self.device)
+        self.nearest_nodes, self.nearest_dists = find_k_nearest_neighbors(graph_info['n_nodes'], graph_info['u_edges'], graph_info['u_dist'], k_hop, device=self.device)
         self.connect_list = connect_list(graph_info['n_nodes'], graph_info['u_edges'], self.device)
         self.use_extrapolation = use_extrapolation
         if self.use_extrapolation:
             self.use_old_extrapolation = use_old_extrapolation
             if self.use_old_extrapolation:
-                self.linear_extrapolation = GNNExtrapolation(graph_info['n_nodes'], t_in, T, self.nearsest_nodes, self.nearest_dists, n_heads, self.device, sigma_ratio=sigma_ratio)
+                self.linear_extrapolation = GNNExtrapolation(graph_info['n_nodes'], t_in, T, self.nearest_nodes, self.nearest_dists, n_heads, self.device, sigma_ratio=sigma_ratio)
             else:
-                self.linear_extrapolation = GraphSAGEExtrapolation(graph_info['n_nodes'], t_in, T, self.nearsest_nodes, signal_channels, n_heads, device, interval=interval, n_layers=extrapolation_agg_layers)
-                # self.linear_extrapolation = GALExtrapolation(graph_info['n_nodes'], t_in, T, self.nearsest_nodes, signal_channels, n_heads, device, n_layers=extrapolation_agg_layers)
+                self.linear_extrapolation = GraphSAGEExtrapolation(graph_info['n_nodes'], t_in, T, self.nearest_nodes, signal_channels, n_heads, device, interval=interval, n_layers=extrapolation_agg_layers)
+                # self.linear_extrapolation = GALExtrapolation(graph_info['n_nodes'], t_in, T, self.nearest_nodes, signal_channels, n_heads, device, n_layers=extrapolation_agg_layers)
         
         self.use_st_emb = use_st_emb
         if self.use_st_emb:
@@ -114,7 +114,7 @@ class UnrollingModel(nn.Module):
                     'feature_extractor':FeatureExtractor(
                         in_features=signal_emb_channels if i == 0 else signal_rec_emb_channels,
                         out_features=feature_channels,
-                        nearest_nodes=self.nearsest_nodes,
+                        nearest_nodes=self.nearest_nodes,
                         n_heads=n_heads,
                         device=device,
                         interval=interval,
@@ -126,7 +126,7 @@ class UnrollingModel(nn.Module):
                     #     n_out=feature_channels,
                     #     # n_nodes=graph_info['n_nodes'],
                     #     n_heads=n_heads,
-                    #     nearest_nodes=self.nearsest_nodes,
+                    #     nearest_nodes=self.nearest_nodes,
                     #     # nearest_dists=self.nearest_dists,
                     #     device=device,
                     #     n_layers=GNN_layers,
@@ -145,7 +145,7 @@ class UnrollingModel(nn.Module):
                         n_channels=signal_rec_channels,
                         interval=interval,
                         connect_list=self.connect_list,
-                        nearest_nodes=self.nearsest_nodes,
+                        nearest_nodes=self.nearest_nodes,
                         device=device,
                         ADMM_info=ADMM_info,
                         ablation=self.ablation
@@ -154,7 +154,7 @@ class UnrollingModel(nn.Module):
                         T=T,
                         n_nodes=graph_info['n_nodes'],
                         connect_list=self.connect_list,
-                        nearest_nodes=self.nearsest_nodes,
+                        nearest_nodes=self.nearest_nodes,
                         n_heads=n_heads,
                         interval=interval,
                         device=device,
@@ -207,9 +207,9 @@ class UnrollingModel(nn.Module):
                 admm_block.u_ew = u_ew
                 admm_block.d_ew = d_ew
 
-                # cauculate norms, x in (B, T, n_nodes, 1)
+                # calculate norms, x in (B, T, n_nodes, 1)
 
-                # pass on the module, caucluate norms
+                # pass on the module, calculate norms
                 p = self.skip_connection_weights[i]
 
                 x_norm_list.append(torch.norm(x, dim=0))

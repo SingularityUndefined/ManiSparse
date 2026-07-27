@@ -170,14 +170,13 @@ class UnrollingModel(nn.Module):
         self.glasso_tol = glasso_tol
         self.glasso_allow_backward = glasso_allow_backward
 
-        self.nearsest_nodes, self.nearest_dists = find_k_nearest_neighbors(
+        self.nearest_nodes, self.nearest_dists = find_k_nearest_neighbors(
             graph_info["n_nodes"],
             graph_info["u_edges"],
             graph_info["u_dist"],
             k_hop,
             device=self.device,
         )
-        self.nearest_nodes = self.nearsest_nodes
         self.connect_list = connect_list(graph_info["n_nodes"], graph_info["u_edges"], self.device)
 
         if self.use_extrapolation:
@@ -187,7 +186,7 @@ class UnrollingModel(nn.Module):
                     graph_info["n_nodes"],
                     t_in,
                     T,
-                    self.nearsest_nodes,
+                    self.nearest_nodes,
                     self.nearest_dists,
                     n_heads,
                     self.device,
@@ -198,7 +197,7 @@ class UnrollingModel(nn.Module):
                     graph_info["n_nodes"],
                     t_in,
                     T,
-                    self.nearsest_nodes,
+                    self.nearest_nodes,
                     signal_channels,
                     n_heads,
                     device,
@@ -251,7 +250,7 @@ class UnrollingModel(nn.Module):
                         "feature_extractor": FeatureExtractor(
                             in_features=block_input_channels,
                             out_features=feature_channels,
-                            nearest_nodes=self.nearsest_nodes,
+                            nearest_nodes=self.nearest_nodes,
                             n_heads=n_heads,
                             device=device,
                             interval=interval,
@@ -264,7 +263,7 @@ class UnrollingModel(nn.Module):
                             n_channels=signal_rec_channels,
                             interval=interval,
                             connect_list=self.connect_list,
-                            nearest_nodes=self.nearsest_nodes,
+                            nearest_nodes=self.nearest_nodes,
                             device=device,
                             ADMM_info=ADMM_info,
                             ablation=self.ablation,
@@ -273,7 +272,7 @@ class UnrollingModel(nn.Module):
                             T=T,
                             n_nodes=graph_info["n_nodes"],
                             connect_list=self.connect_list,
-                            nearest_nodes=self.nearsest_nodes,
+                            nearest_nodes=self.nearest_nodes,
                             n_heads=n_heads,
                             interval=interval,
                             device=device,
