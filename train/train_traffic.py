@@ -114,6 +114,66 @@ def _raise_training_numerical_error(reason, epoch, num_epochs, iteration_count, 
     raise ValueError(message)
 
 
+def _set_model_numerical_debug(model, enabled, context=""):
+    """Enable optional tensor/gradient hooks on modules that support them."""
+    for module_name, module in model.named_modules():
+        if hasattr(module, "set_debug_numerics"):
+            module_context = f"{context}.{module_name}" if context else module_name
+            module.set_debug_numerics(enabled, module_context)
+
+
+def _collect_model_numerical_debug_records(model, max_lines=80):
+    """Collect recent numerical debug records from instrumented modules."""
+    records = []
+    for module_name, module in model.named_modules():
+        module_records = getattr(module, "debug_records", None)
+        if module_records:
+            records.append(f"Numerical debug records from {module_name}:")
+            records.extend(module_records[-max_lines:])
+    if not records:
+        return ["Numerical debug rerun produced no module-level records."]
+    return records[-max_lines:]
+
+
+def _diagnose_bad_backward(model, y, x, t_list, data_normalization, config, loss_fn, masked_flag, args, optimizer, location):
+    """Rerun the failing batch with anomaly detection and graph-learning hooks."""
+    optimizer.zero_grad(set_to_none=True)
+    _set_model_numerical_debug(model, True, f"diagnostic.{location}")
+    lines = [f"Diagnostic rerun for {location}:"]
+    try:
+        with torch.autograd.detect_anomaly(check_nan=True):
+            diag_loss, diag_output = _train_forward(model, y, x, t_list, data_normalization, config, loss_fn, masked_flag, args)
+            lines.append(_tensor_health("diagnostic_loss", diag_loss))
+            lines.append(_tensor_health("diagnostic_output_recovered", diag_output))
+            diag_loss.backward()
+            diag_bad = check_nan_gradients(model)
+            if diag_bad is None:
+                lines.append("Diagnostic backward completed without non-finite parameter gradients.")
+            else:
+                lines.append(f"Diagnostic backward ended with bad {diag_bad['kind']}: {diag_bad['name']}")
+    except Exception as diagnostic_error:
+        lines.append(f"Diagnostic rerun failed at first detected bad operation: {diagnostic_error}")
+    finally:
+        lines.extend(_collect_model_numerical_debug_records(model))
+        _set_model_numerical_debug(model, False)
+        optimizer.zero_grad(set_to_none=True)
+    return lines
+
+
+def _optimizer_state_health(optimizer, max_lines=40):
+    """Summarize optimizer state when parameters become non-finite after step."""
+    lines = []
+    for group_idx, group in enumerate(optimizer.param_groups):
+        for param_idx, param in enumerate(group["params"]):
+            state = optimizer.state.get(param, {})
+            for state_name, state_value in state.items():
+                if torch.is_tensor(state_value):
+                    lines.append(_tensor_health(f"optimizer_state[group={group_idx}, param={param_idx}, {state_name}]", state_value))
+            if len(lines) >= max_lines:
+                return lines
+    return lines or ["Optimizer has no tensor state to inspect."]
+
+
 def _train_forward(model, y, x, t_list, data_normalization, config, loss_fn, masked_flag, args):
     """Normalize one training batch, run the model, recover output, and compute loss."""
     t_in = config["model"]["t_in"]
@@ -292,7 +352,7 @@ def train_one_epoch(
                     f"use_one_channel={config['model']['use_one_channel']}",
                 ],
             )
-        if iteration_count % 10 == 0:
+        if iteration_count % 20 == 0:
             theta_stats = collect_theta_nnz_ratios(model)
             tqdm.write(format_theta_nnz_batch(theta_stats, epoch, iteration_count, total_batches))
 
@@ -319,6 +379,19 @@ def train_one_epoch(
         loss.backward()
         nan_info = check_nan_gradients(model)
         if nan_info is not None:
+            diagnostic_lines = _diagnose_bad_backward(
+                model,
+                y,
+                x,
+                t_list,
+                data_normalization,
+                config,
+                loss_fn,
+                masked_flag,
+                args,
+                optimizer,
+                _training_location(epoch, num_epochs, iteration_count, train_loader),
+            )
             _raise_training_numerical_error(
                 f"{nan_info['kind']} has NaN or Inf after backward",
                 epoch,
@@ -336,7 +409,8 @@ def train_one_epoch(
                     f"first_bad_{nan_info['kind']}: {nan_info['name']}",
                     f"mode={args.mode}, normed_loss={config['normed_loss']}, "
                     f"use_one_channel={config['model']['use_one_channel']}",
-                ],
+                ]
+                + diagnostic_lines,
             )
 
         optimizer.step()
@@ -359,7 +433,9 @@ def train_one_epoch(
                     f"first_bad_{nan_info['kind']}: {nan_info['name']}",
                     f"mode={args.mode}, normed_loss={config['normed_loss']}, "
                     f"use_one_channel={config['model']['use_one_channel']}",
-                ],
+                    "Bad values appeared after optimizer.step(); optimizer state follows.",
+                ]
+                + _optimizer_state_health(optimizer),
             )
         if args.loggrad != -1:
             log_gradients(epoch, num_epochs, iteration_count, train_loader, model, grad_logger, args)

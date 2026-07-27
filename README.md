@@ -52,16 +52,38 @@ length as `(split_steps - T) // data_stride`.
 
 ## Model Branches and Ablations
 
+### UnrollingModel overall flow
+
+`clean_lib.unrolling_model.UnrollingModel` stacks `num_blocks` learned graph-ADMM blocks. The input batch is an observed prefix `y` with shape `(B, t_in, N, C_signal)` and a time-index tensor `t_list` with shape `(B, T)`, where `T = t_in + t_out`. The model first builds a full-horizon initial guess `output: (B, T, N, C_signal)` using `GNNExtrapolation` when `model.use_extrapolation=True`, otherwise `LR_guess`.
+
+If spatial-temporal embedding is enabled, `SpatialTemporalEmbedding(t_list)` is computed once before the block loop and reused in every block because it does not depend on the current signal estimate. Each block then refines the current full-horizon signal:
+
+| Loop step | Data flow | Main shapes / notes |
+|---|---|---|
+| 1. Build graph-learning input | `output_emb = concat(output, shared_output_emb)` when ST embedding is enabled; otherwise `output_emb = output`. | `output_emb` keeps batch/time/node axes `(B, T, N, *)`. |
+| 2. Extract features | `features = FeatureExtractor(output_emb)`. | `features: (B, T, N, H, F)`, where `H=num_heads` and `F=feature_channels`. |
+| 3. Learn graph weights | `u_ew, d_ew = GraphLearningModule(features)`. | `u_ew: (B, T, N, K, H)` for spatial neighbors; `d_ew: (B, T - 1, interval, N, H)` for temporal directed edges. These are assigned to the current `ADMMBlock`. |
+| 4. Estimate Theta | For block `0` or `ablation="Theta"`, set `Theta=None`. Otherwise compute centered node covariance from `output[..., 0:1]`, or from the previous deflated `multi_x[..., 0:1]` when available, then call `glasso_estimation` and `normalize_theta`. | Plain covariance gives `Theta: (N, N)`; deflated covariance gives batched `Theta: (B, N, N)`. |
+| 5. ADMM update | Run `ADMMBlock` on signal channels only. With `use_one_channel=True`, the ADMM input is `output[..., 0:1]`; otherwise it is `output`. | Returns `output_new: (B, T, N, C_admm)`. If `predict_only=True`, the observed prefix is copied back before ADMM. |
+| 6. Optional deflation | Deflation runs only when `model.use_deflation=True`, this is not the final block, and `ablation!="Theta"`. | ADMM returns `(output_new, multi_x)`. `multi_x` is stored in `last_deflation_multi_x` and can feed the next block's Theta estimation. The final block skips deflation and returns only `output_new`. |
+| 7. Skip blend | `output = p_i * output_new + (1 - p_i) * output_old`, where `p_i = skip_connection_weights[i]`. | `output_old` is the previous block input; in the first one-channel block it uses `output[..., 0:1]` so channel shapes match. |
+
+When `output_graph=True`, the model also returns the stacked learned graph weights:
+`undirected_graphs: (B, num_blocks, T, N, K, H)` and
+`directed_graphs: (B, num_blocks, T - 1, interval, N, H)`.
+
+`model.use_stable_graph_learning` controls the graph-learning numerical path and is part of the model design for training, validation, and testing. The default `False` keeps the original formulas: invalid directed temporal intervals are masked after graph weights are computed, `exp` is unclamped, and graph normalization uses the original `torch.where(value > 0, 1 / value, 0)` form. Setting it to `True` enables the numerical-stability path: invalid directed temporal intervals are masked before the `multiQ` projection, Gaussian-kernel exponentials are clamped to avoid extreme underflow/overflow, and graph normalization avoids constructing `1 / 0` inside autograd.
+
 Each unrolled block follows the same high-level order:
 
 | Stage | Main tensors / parameters | Notes |
 |---|---|---|
 | Feature extraction | `FeatureExtractor` | Builds features with shape `(B, T, N, H, F)` from the current sequence and optional ST embeddings. |
 | Graph learning | `GraphLearningModule`, `multiM`, `multiQ` | Returns spatial weights `u_ew: (B, T, N, K, H)` and temporal weights `d_ew: (B, T - 1, interval, N, H)`. |
-| Theta estimation | `node_covariance`, `glasso_estimation`, `normalize_theta` | Estimates dense node matrix `Theta` from the current output, then normalizes it as `Theta_ij / sqrt(Theta_ii * Theta_jj)`. Skipped entirely for `ablation="Theta"`. |
+| Theta estimation | `node_covariance`, `glasso_estimation`, `normalize_theta` | Estimates dense node matrix `Theta` from the current output, then normalizes it as `Theta_ij / sqrt(Theta_ii * Theta_jj)`. Skipped for the first block and skipped entirely for `ablation="Theta"`. |
 | ADMM update | `ADMMBlock` | Updates the signal using the branches listed below. |
 | Skip connection | `skip_connection_weights[i]` | Blends each block output with the previous block output. |
-| Deflation | `DeflationCGSolver` | Runs only when `model.use_deflation=True` and `ablation!="Theta"`. The first deflated mode is the normal ADMM output. |
+| Deflation | `DeflationCGSolver` | Runs only on intermediate blocks when `model.use_deflation=True` and `ablation!="Theta"`. The first deflated mode is the normal ADMM output. The final block skips deflation and returns the normal ADMM output. |
 
 Current valid ablation names are `None`, `DGLR`, `DGTV`, `UT`, `simple`, and `Theta`.
 
@@ -87,9 +109,9 @@ Parameter and solver existence by ablation:
 
 For `Theta`, `lambda_theta` existence is currently equivalent to `ablation!="Theta"`, but the code uses the explicit ablation state rather than `hasattr(lambda_theta)` for branch decisions. For `UT`, `mu_d1` and `rho` are still created, but the forward path does not use the directed temporal L1 update. `PGD_iters` is currently loaded from config but is not used by the cleaned ADMM forward path.
 
-During training, every 10 batches prints the current-batch per-block Theta sparsity as `nnz / numel` through `tqdm.write`, so the progress bar is preserved. Because `Theta` is re-estimated for each batch rather than stored as a persistent model parameter, this value describes the most recent forward pass.
+During training, every 20 batches prints the current-batch per-block Theta sparsity as `nnz / numel` through `tqdm.write`, so the progress bar is preserved. The same line also reports each block's `lambda_theta`; scalar values are printed directly, while vector/list values are summarized as min / median / max. Floating-point values use scientific notation with 3 significant digits. Because `Theta` is re-estimated for each batch rather than stored as a persistent model parameter, the sparsity value describes the most recent forward pass.
 Before `Theta` enters ADMM, negative diagonal entries are clamped to zero and entries with zero diagonal normalization denominator are set to zero to avoid NaN/Inf values.
-`model.glasso_method` and `model.glasso_rho` are configured in `train/config.yaml`; `glasso_rho` is passed to the `glasso_pytorch` ADMM solver and is ignored by `quic` and `sklearn`.
+`model.glasso_method`, `model.glasso_alpha`, and `model.glasso_rho` are configured in `train/config.yaml` and can be temporarily overridden from the command line with `--glasso-method`, `--glasso-alpha`, and `--glasso-rho`. `glasso_alpha` is the Graphical Lasso regularization strength for all solver backends; `glasso_rho` is passed to the `glasso_pytorch` ADMM solver and is ignored by `quic` and `sklearn`.
 
 ## Training and Testing
 

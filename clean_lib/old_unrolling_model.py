@@ -218,6 +218,7 @@ class UnrollingModel(nn.Module):
         predict_only=False,
         le_emb=False,
         glasso_method="admm",
+        glasso_alpha=0.2,
         glasso_max_iter=20,
         glasso_tol=1e-4,
         glasso_allow_backward=False,
@@ -239,6 +240,7 @@ class UnrollingModel(nn.Module):
         self.use_extrapolation = use_extrapolation
         self.use_st_emb = use_st_emb
         self.glasso_method = glasso_method
+        self.glasso_alpha = glasso_alpha
         self.glasso_max_iter = min(glasso_max_iter, 20)
         self.glasso_tol = glasso_tol
         self.glasso_allow_backward = glasso_allow_backward
@@ -468,6 +470,7 @@ class UnrollingModel(nn.Module):
             # cov_matrix = cov_matrix.detach().cpu().numpy()
             admm_block.Theta = glasso_estimation(
                 cov_matrix,
+                alpha=self.glasso_alpha,
                 method=self.glasso_method,
                 max_iter=self.glasso_max_iter,
                 tol=self.glasso_tol,

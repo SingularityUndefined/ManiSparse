@@ -112,6 +112,12 @@ def parse_args(argv=None):
     _add_bool_override(parser, "sharedM", "sharedM", "temporary override for model.sharedM")
     _add_bool_override(parser, "sharedQ", "sharedQ", "temporary override for model.sharedQ")
     _add_bool_override(parser, "diff-interval", "diff_interval", "temporary override for model.diff_interval")
+    _add_bool_override(
+        parser,
+        "stable-graph-learning",
+        "use_stable_graph_learning",
+        "temporary override for model.use_stable_graph_learning",
+    )
 
     parser.add_argument("--epochs", help="running epochs", default=70, type=int)
     parser.add_argument("--start_epochs", help="start epochs", default=0, type=int)
@@ -135,6 +141,7 @@ def parse_args(argv=None):
     )
     parser.add_argument("--deflation-tol", help="temporary override for model.deflation_tol", default=None, type=float)
     parser.add_argument("--glasso-method", help="temporary override for model.glasso_method", default=None, type=str)
+    parser.add_argument("--glasso-alpha", help="temporary override for model.glasso_alpha", default=None, type=float)
     parser.add_argument("--glasso-rho", help="temporary override for model.glasso_rho", default=None, type=float)
     parser.add_argument("--stride", help="temporary override for data_stride", default=None, type=int)
     parser.add_argument("--lr", help="temporary override for learning_rate", default=None, type=float)
@@ -154,6 +161,7 @@ def apply_args_to_config(config, args):
         "sharedM": "sharedM",
         "sharedQ": "sharedQ",
         "diff_interval": "diff_interval",
+        "use_stable_graph_learning": "use_stable_graph_learning",
         "blocks": "num_blocks",
         "layers": "num_layers",
         "CGiters": "CG_iters",
@@ -163,6 +171,7 @@ def apply_args_to_config(config, args):
         "deflation_tol": "deflation_tol",
         "deflation": "use_deflation",
         "glasso_method": "glasso_method",
+        "glasso_alpha": "glasso_alpha",
         "glasso_rho": "glasso_rho",
     }
     for arg_name, config_key in arg_to_config_key.items():
@@ -171,10 +180,12 @@ def apply_args_to_config(config, args):
             model_config[config_key] = value
 
     model_config.setdefault("use_deflation", False)
+    model_config.setdefault("use_stable_graph_learning", False)
     model_config.setdefault("deflation_samples", 5)
     model_config.setdefault("deflation_CG_iters", model_config["CG_iters"])
     model_config.setdefault("deflation_tol", 1e-6)
     model_config.setdefault("glasso_method", "admm")
+    model_config.setdefault("glasso_alpha", 0.2)
     model_config.setdefault("glasso_rho", 1.0)
 
     if args.stride is not None:
@@ -371,11 +382,13 @@ def create_model(config, args, train_set, device):
         sharedM=config["model"]["sharedM"],
         sharedQ=config["model"]["sharedQ"],
         diff_interval=config["model"]["diff_interval"],
+        use_stable_graph_learning=config["model"]["use_stable_graph_learning"],
         predict_only=args.pred_only,
         le_emb=args.le_emb,
         use_deflation=config["model"].get("use_deflation", False),
         deflation_samples=config["model"]["deflation_samples"],
         glasso_method=config["model"]["glasso_method"],
+        glasso_alpha=config["model"]["glasso_alpha"],
         glasso_rho=config["model"]["glasso_rho"],
     ).to(device)
     return model, admm_info
@@ -413,7 +426,9 @@ def collect_theta_nnz_ratios(model):
     """
     stats = []
     for block_idx, block in enumerate(model.model_blocks):
-        theta = getattr(block["ADMM_block"], "Theta", None)
+        admm_block = block["ADMM_block"]
+        theta = getattr(admm_block, "Theta", None)
+        lambda_theta = _summarize_lambda_theta(getattr(admm_block, "lambda_theta", None))
         if theta is None:
             stats.append(
                 {
@@ -422,11 +437,12 @@ def collect_theta_nnz_ratios(model):
                     "nnz": 0,
                     "numel": 0,
                     "shape": None,
+                    "lambda_theta": lambda_theta,
                 }
             )
             continue
 
-        theta = torch.as_tensor(theta)
+        theta = torch.as_tensor(theta).detach()
         nnz = torch.count_nonzero(theta).item()
         numel = theta.numel()
         stats.append(
@@ -436,9 +452,52 @@ def collect_theta_nnz_ratios(model):
                 "nnz": nnz,
                 "numel": numel,
                 "shape": tuple(theta.shape),
+                "lambda_theta": lambda_theta,
             }
         )
     return stats
+
+
+def _summarize_lambda_theta(lambda_theta):
+    """Return scalar or vector summary for the ADMM Theta weight."""
+    if lambda_theta is None:
+        return {"kind": "missing"}
+
+    values = torch.as_tensor(lambda_theta).detach().to(torch.float32).reshape(-1)
+    if values.numel() == 0:
+        return {"kind": "empty"}
+    if values.numel() == 1:
+        return {"kind": "scalar", "value": values.item()}
+
+    finite_values = values[torch.isfinite(values)]
+    if finite_values.numel() == 0:
+        return {"kind": "nonfinite", "numel": values.numel()}
+
+    return {
+        "kind": "vector",
+        "min": finite_values.min().item(),
+        "median": finite_values.median().item(),
+        "max": finite_values.max().item(),
+        "numel": values.numel(),
+    }
+
+
+def _format_lambda_theta(lambda_stats):
+    """Format a `lambda_theta` summary for one-line tqdm output."""
+    kind = lambda_stats["kind"]
+    if kind == "missing":
+        return "missing"
+    if kind == "empty":
+        return "empty"
+    if kind == "scalar":
+        return f"{lambda_stats['value']:.3e}"
+    if kind == "nonfinite":
+        return f"nonfinite(numel={lambda_stats['numel']})"
+    return (
+        f"min={lambda_stats['min']:.3e}, "
+        f"median={lambda_stats['median']:.3e}, "
+        f"max={lambda_stats['max']:.3e}"
+    )
 
 
 def format_theta_nnz_batch(theta_stats, epoch, iteration_count, total_batches):
@@ -450,12 +509,14 @@ def format_theta_nnz_batch(theta_stats, epoch, iteration_count, total_batches):
     parts = []
     for stat in theta_stats:
         block_name = f"block_{stat['block_idx']}"
+        lambda_text = _format_lambda_theta(stat["lambda_theta"])
         if stat["ratio"] is None:
-            parts.append(f"{block_name}=skipped")
+            parts.append(f"{block_name}=skipped, lambda_theta={lambda_text}")
             continue
         parts.append(
-            f"{block_name}={stat['ratio']:.6f} "
-            f"({stat['nnz']}/{stat['numel']}, shape={stat['shape']})"
+            f"{block_name}={stat['ratio']:.3e} "
+            f"({stat['nnz']}/{stat['numel']}, shape={stat['shape']}), "
+            f"lambda_theta={lambda_text}"
         )
     return f"{prefix}: " + "; ".join(parts)
 
@@ -479,6 +540,7 @@ def _log_cli_arguments(logger, args):
         "sharedM",
         "sharedQ",
         "diff_interval",
+        "use_stable_graph_learning",
         "blocks",
         "layers",
         "CGiters",
@@ -488,6 +550,7 @@ def _log_cli_arguments(logger, args):
         "deflation_CGiters",
         "deflation_tol",
         "glasso_method",
+        "glasso_alpha",
         "glasso_rho",
         "stride",
         "lr",
@@ -503,21 +566,23 @@ def _log_effective_model_flags(logger, config, model):
     """Log key effective flags, including what reached GraphLearningModule."""
     model_config = config["model"]
     logger.info(
-        "Effective graph flags from config: sharedM=%s, sharedQ=%s, diff_interval=%s",
+        "Effective graph flags from config: sharedM=%s, sharedQ=%s, diff_interval=%s, use_stable_graph_learning=%s",
         model_config["sharedM"],
         model_config["sharedQ"],
         model_config["diff_interval"],
+        model_config["use_stable_graph_learning"],
     )
     if len(model.model_blocks) == 0:
         return
 
     graph_learn = model.model_blocks[0]["graph_learning_module"]
     logger.info(
-        "GraphLearningModule flags in block_0: sharedM=%s, sharedQ=%s, diff_interval=%s, directed_time=%s",
+        "GraphLearningModule flags in block_0: sharedM=%s, sharedQ=%s, diff_interval=%s, directed_time=%s, use_stable_graph_learning=%s",
         graph_learn.sharedM,
         graph_learn.sharedQ,
         graph_learn.diff_interval,
         graph_learn.directed_time,
+        graph_learn.use_stable_graph_learning,
     )
 
 

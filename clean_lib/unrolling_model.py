@@ -265,9 +265,11 @@ class UnrollingModel(nn.Module):
         sharedM=False,
         sharedQ=True,
         diff_interval=True,
+        use_stable_graph_learning=False,
         predict_only=False,
         le_emb=False,
         glasso_method="admm",
+        glasso_alpha=0.2,
         glasso_rho=1.0,
         glasso_max_iter=20,
         glasso_tol=1e-4,
@@ -291,7 +293,9 @@ class UnrollingModel(nn.Module):
         self.predict_only = predict_only
         self.use_extrapolation = use_extrapolation
         self.use_st_emb = use_st_emb
+        self.use_stable_graph_learning = use_stable_graph_learning
         self.glasso_method = glasso_method
+        self.glasso_alpha = glasso_alpha
         self.glasso_rho = glasso_rho
         self.glasso_max_iter = min(glasso_max_iter, 20)
         self.glasso_tol = glasso_tol
@@ -299,6 +303,9 @@ class UnrollingModel(nn.Module):
         self.use_deflation = use_deflation
         self.deflation_samples = deflation_samples
         self.last_deflation_multi_x = None
+        self.debug_numerics = False
+        self.debug_context = ""
+        self.debug_records = []
 
         # Graph metadata:
         #   u_edges: physical/direct graph edges, shape (E, 2)
@@ -439,6 +446,7 @@ class UnrollingModel(nn.Module):
                             sharedQ=sharedQ,
                             diff_interval=diff_interval,
                             directed_time=directed_time_graph,
+                            use_stable_graph_learning=use_stable_graph_learning,
                         ),
                     }
                 )
@@ -446,6 +454,56 @@ class UnrollingModel(nn.Module):
 
         self.y_norm_shape = [self.t_in, graph_info["n_nodes"], signal_channels]
         self.norm_shape = [self.T, graph_info["n_nodes"], signal_channels]
+
+    def set_debug_numerics(self, enabled, context=""):
+        """Enable detailed tensor/gradient diagnostics for one training rerun."""
+        self.debug_numerics = enabled
+        self.debug_context = context
+        self.debug_records = []
+
+    @staticmethod
+    def _debug_tensor_summary(name, tensor):
+        """Summarize tensor health without keeping autograd history."""
+        detached = tensor.detach()
+        total = detached.numel()
+        if total == 0:
+            return f"{name}: shape={tuple(detached.shape)}, numel=0"
+
+        finite_mask = torch.isfinite(detached)
+        finite_count = finite_mask.sum().item()
+        nan_count = torch.isnan(detached).sum().item()
+        inf_count = torch.isinf(detached).sum().item()
+        if finite_count == 0:
+            return (
+                f"{name}: shape={tuple(detached.shape)}, finite=0/{total}, "
+                f"nan={nan_count}, inf={inf_count}"
+            )
+
+        finite_values = detached[finite_mask]
+        return (
+            f"{name}: shape={tuple(detached.shape)}, finite={finite_count}/{total}, "
+            f"nan={nan_count}, inf={inf_count}, min={finite_values.min().item():.3e}, "
+            f"max={finite_values.max().item():.3e}, mean={finite_values.mean().item():.3e}"
+        )
+
+    def _debug_tensor(self, name, tensor):
+        """Record forward tensor health and attach a backward grad hook."""
+        if not self.debug_numerics:
+            return tensor
+
+        label = f"{self.debug_context}.{name}" if self.debug_context else name
+        self.debug_records.append("forward " + self._debug_tensor_summary(label, tensor))
+
+        if tensor.requires_grad:
+            def _grad_hook(grad, grad_label=label):
+                summary = "backward " + self._debug_tensor_summary(f"grad({grad_label})", grad)
+                self.debug_records.append(summary)
+                if not torch.isfinite(grad).all():
+                    raise RuntimeError(f"Non-finite gradient first observed at {grad_label}\n{summary}")
+                return grad
+
+            tensor.register_hook(_grad_hook)
+        return tensor
 
     def regularized_terms(self, x, t=None):
         """Compute diagnostic regularization magnitudes on a full sequence.
@@ -526,10 +584,11 @@ class UnrollingModel(nn.Module):
                 shape (B, T).
             output_graph: when True, also return learned graph weights from
                 each block.
-            If `self.use_deflation` is True, each ADMM block also computes
-                multi-signal deflation modes. They are stored in
-                `self.last_deflation_multi_x` and are not used in the current
-                forward logic or returned by this method.
+            If `self.use_deflation` is True, intermediate ADMM blocks also
+                compute multi-signal deflation modes. They are stored in
+                `self.last_deflation_multi_x` and are not returned by this
+                method. The final block skips deflation and returns only the
+                normal ADMM-updated signal.
 
         Returns:
             output: (B, T, N, C_signal) unless use_one_channel=True, in which
@@ -553,6 +612,7 @@ class UnrollingModel(nn.Module):
             output = self.linear_extrapolation(y)
         else:
             output = LR_guess(y, self.T, self.device)
+        output = self._debug_tensor("initial_output", output)
 
         assert torch.isfinite(output).all(), "initial full-horizon guess contains NaN or Inf"
         if self.use_st_emb:
@@ -561,10 +621,13 @@ class UnrollingModel(nn.Module):
             shared_output_emb = self.st_emb(t_list)
 
         for i, block in enumerate(self.model_blocks):
+            is_first_block = i == 0
+            is_last_block = i == self.num_blocks - 1
             # output_emb is what graph learning sees. It may include raw signal
             # channels plus spatial/temporal embedding channels.
             output_emb = torch.cat((output, shared_output_emb), -1) if self.use_st_emb else output
-            output_old = output[..., 0:1] if self.use_one_channel and i == 0 else output
+            output_emb = self._debug_tensor(f"block_{i}.output_emb", output_emb)
+            output_old = output[..., 0:1] if self.use_one_channel and is_first_block else output
 
             feature_extractor = block["feature_extractor"]
             graph_learn = block["graph_learning_module"]
@@ -573,6 +636,7 @@ class UnrollingModel(nn.Module):
             try:
                 # features: (B, T, N, H, feature_channels)
                 features = feature_extractor(output_emb)
+                features = self._debug_tensor(f"block_{i}.features", features)
             except ValueError as exc:
                 raise ValueError(
                     f"FeatureExtractor failed in block {i}: {exc}. "
@@ -583,6 +647,8 @@ class UnrollingModel(nn.Module):
                 # u_ew: (B, T, N, K, H)
                 # d_ew: (B, T - 1, interval, N, H)
                 u_ew, d_ew = graph_learn(features)
+                u_ew = self._debug_tensor(f"block_{i}.u_ew", u_ew)
+                d_ew = self._debug_tensor(f"block_{i}.d_ew", d_ew)
             except AssertionError as exc:
                 raise ValueError(
                     f"GraphLearningModule failed in block {i}: {exc}. "
@@ -603,28 +669,36 @@ class UnrollingModel(nn.Module):
             #   glasso_estimation returns normalized Theta with shape (N, N)
             #   or (B, N, N), consumed by ADMMBlock.apply_op_Theta over the
             #   node dimension.
-            if self.ablation == "Theta" or i == 0:
-                admm_block.Theta = None # No Theta estimation in the first block or when ablation is "Theta".
+            if self.ablation == "Theta" or is_first_block:
+                # The first block has no previous ADMM-refined signal for Theta
+                # estimation. Theta ablation also disables this branch globally.
+                admm_block.Theta = None
             elif multi_x is None or len(self.last_deflation_multi_x) == 0:
                 cov_matrix = node_covariance(output[..., 0:1], unbiased=True)
+                cov_matrix = self._debug_tensor(f"block_{i}.theta_cov", cov_matrix)
                 admm_block.Theta = glasso_estimation(
                     cov_matrix,
+                    alpha=self.glasso_alpha,
                     method=self.glasso_method,
                     rho=self.glasso_rho,
                     max_iter=self.glasso_max_iter,
                     tol=self.glasso_tol,
                     allow_backward=self.glasso_allow_backward,
                 )
+                admm_block.Theta = self._debug_tensor(f"block_{i}.Theta", admm_block.Theta)
             else:
                 cov_matrix = node_covariance(multi_x[..., 0:1], unbiased=True)
+                cov_matrix = self._debug_tensor(f"block_{i}.theta_cov_from_multi_x", cov_matrix)
                 admm_block.Theta = glasso_estimation(
                     cov_matrix,
+                    alpha=self.glasso_alpha,
                     method=self.glasso_method,
                     rho=self.glasso_rho,
                     max_iter=self.glasso_max_iter,
                     tol=self.glasso_tol,
                     allow_backward=self.glasso_allow_backward,
                 )
+                admm_block.Theta = self._debug_tensor(f"block_{i}.Theta", admm_block.Theta)
 
             try:
                 if self.predict_only:
@@ -632,26 +706,31 @@ class UnrollingModel(nn.Module):
                     output[:, : self.t_in] = y[..., 0:1] if self.use_one_channel else y
 
                 # ADMM receives signal channels only, not ST embedding channels.
-                run_deflation = self.use_deflation and admm_block.ablation != "Theta"
+                run_deflation = self.use_deflation and not is_last_block and admm_block.ablation != "Theta"
                 if self.use_one_channel:
+                    admm_input = self._debug_tensor(f"block_{i}.admm_input", output[..., 0:1])
                     admm_result = admm_block(
-                        output[..., 0:1],
+                        admm_input,
                         self.t_in,
                         deflation=run_deflation,
                         deflation_samples=self.deflation_samples,
                     )
                 else:
+                    admm_input = self._debug_tensor(f"block_{i}.admm_input", output)
                     admm_result = admm_block(
-                        output,
+                        admm_input,
                         self.t_in,
                         deflation=run_deflation,
                         deflation_samples=self.deflation_samples,
                     )
                 if run_deflation:
                     output_new, multi_x = admm_result
+                    output_new = self._debug_tensor(f"block_{i}.admm_output", output_new)
+                    multi_x = self._debug_tensor(f"block_{i}.multi_x", multi_x)
                     self.last_deflation_multi_x.append(multi_x)
                 else:
                     output_new = admm_result
+                    output_new = self._debug_tensor(f"block_{i}.admm_output", output_new)
             except AssertionError as exc:
                 raise ValueError(
                     f"ADMMBlock assertion failed in block {i}: {exc}. "
@@ -665,6 +744,7 @@ class UnrollingModel(nn.Module):
             # Learned residual/skip blend between the ADMM correction and the
             # previous block output.
             output = p * output_new + (1 - p) * output_old
+            output = self._debug_tensor(f"block_{i}.skip_output", output)
 
         if self.use_norm:
             output = layer_recovery_on_data(output, self.norm_shape, mean, std)

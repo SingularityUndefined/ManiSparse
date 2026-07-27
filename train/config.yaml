@@ -22,20 +22,22 @@ model:
   deflation_CG_iters: 3
   deflation_tol: 1.0e-6
   glasso_method: admm
+  glasso_alpha: 0.2
   glasso_rho: 2.0
   num_heads: 4
   feature_channels: 6
   use_extrapolation: True
   use_one_channel: True
+  use_stable_graph_learning: False
   sharedM: False
   sharedQ: True
   diff_interval: True
 
 ADMM_params:
-  mu_u: 3
+  mu_u: 2
   mu_d1: 3
   mu_d2: 3
-  lambda_theta: 3
+  lambda_theta: 1
 
 st_emb_info:
   spatial_dim: 5
