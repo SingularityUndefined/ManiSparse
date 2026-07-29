@@ -38,6 +38,10 @@ def collect_admm_path(
     rho: float,
     checkpoints: List[int],
     fixed_tol: float,
+    eps: float,
+    eigh_shift: float,
+    eigh_shift_retries: int,
+    eigh_cpu_fallback: bool,
 ) -> Dict[str, List[float]]:
     nnz_values = []
     gap_values = []
@@ -51,6 +55,10 @@ def collect_admm_path(
             max_iter=n_iter,
             tol=fixed_tol,
             rtol=fixed_tol,
+            eps=eps,
+            eigh_shift=eigh_shift,
+            eigh_shift_retries=eigh_shift_retries,
+            eigh_cpu_fallback=eigh_cpu_fallback,
             return_info=True,
         )
         precision = result.precision.detach().cpu().numpy()
@@ -97,6 +105,10 @@ def time_to_tol(
     tol: float,
     max_iter: int,
     device: str,
+    eps: float,
+    eigh_shift: float,
+    eigh_shift_retries: int,
+    eigh_cpu_fallback: bool,
 ) -> List[Dict[str, object]]:
     rows: List[Dict[str, object]] = []
 
@@ -137,6 +149,10 @@ def time_to_tol(
             max_iter=max_iter,
             tol=tol,
             rtol=tol,
+            eps=eps,
+            eigh_shift=eigh_shift,
+            eigh_shift_retries=eigh_shift_retries,
+            eigh_cpu_fallback=eigh_cpu_fallback,
             return_info=True,
         )
         if device == "cuda":
@@ -178,11 +194,16 @@ def main() -> None:
     parser.add_argument("--diagonal-shift", type=float, default=0.1)
     parser.add_argument("--dtype", type=str, default="float64", choices=["float32", "float64"])
     parser.add_argument("--device", type=str, default="cpu", choices=["cpu", "cuda"])
+    parser.add_argument("--eps", type=float, default=0.0, help="covariance jitter; changes the GLASSO problem")
+    parser.add_argument("--eigh-shift", type=float, default=1e-6, help="eigensolver-only shift; recovered after eigh")
+    parser.add_argument("--eigh-shift-retries", type=int, default=4)
+    parser.add_argument("--no-eigh-cpu-fallback", dest="eigh_cpu_fallback", action="store_false")
     parser.add_argument(
         "--output",
         type=Path,
         default=Path("glasso_pytorch/figures/admm_rho_path.png"),
     )
+    parser.set_defaults(eigh_cpu_fallback=True)
     args = parser.parse_args()
 
     if args.device == "cuda" and not torch.cuda.is_available():
@@ -215,6 +236,10 @@ def main() -> None:
             rho=rho,
             checkpoints=checkpoints,
             fixed_tol=args.fixed_tol,
+            eps=args.eps,
+            eigh_shift=args.eigh_shift,
+            eigh_shift_retries=args.eigh_shift_retries,
+            eigh_cpu_fallback=args.eigh_cpu_fallback,
         )
         for rho in rhos
     }
@@ -246,6 +271,10 @@ def main() -> None:
         tol=args.tol,
         max_iter=args.convergence_max_iter,
         device=args.device,
+        eps=args.eps,
+        eigh_shift=args.eigh_shift,
+        eigh_shift_retries=args.eigh_shift_retries,
+        eigh_cpu_fallback=args.eigh_cpu_fallback,
     )
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
@@ -325,7 +354,8 @@ def main() -> None:
     fig.suptitle(
         (
             f"Solver path diagnostic: n_samples={args.n_samples}, "
-            f"p={args.n_features}, alpha={args.alpha}, seed={args.seed}"
+            f"p={args.n_features}, alpha={args.alpha}, seed={args.seed}, "
+            f"eigh_shift={args.eigh_shift:g}"
         ),
         fontsize=12,
     )
@@ -333,6 +363,12 @@ def main() -> None:
     plt.close(fig)
 
     print(f"saved: {args.output}")
+    print(
+        "glasso settings: "
+        f"eps={args.eps:g}, eigh_shift={args.eigh_shift:g}, "
+        f"eigh_shift_retries={args.eigh_shift_retries}, "
+        f"eigh_cpu_fallback={args.eigh_cpu_fallback}"
+    )
     print(f"true_offdiag_nnz: {true_nnz}")
     for name, path in baseline_paths.items():
         print(

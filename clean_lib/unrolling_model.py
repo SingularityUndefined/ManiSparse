@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import warnings
 from torch.nn.parameter import Parameter
 
 from clean_lib.admm_block import ADMMBlock
@@ -20,6 +21,10 @@ def _single_glasso_estimation(
     alpha,
     method,
     rho,
+    eps,
+    eigh_shift,
+    eigh_shift_retries,
+    fallback,
     max_iter,
     tol,
     allow_backward,
@@ -28,33 +33,59 @@ def _single_glasso_estimation(
 ):
     """Estimate one dense precision matrix from one covariance matrix."""
     solver_cov = cov_matrix if allow_backward else cov_matrix.detach()
+    solver_cov = 0.5 * (solver_cov + solver_cov.transpose(-1, -2))
+    if not torch.isfinite(solver_cov).all():
+        raise ValueError(f"glasso covariance contains NaN or Inf: shape={tuple(solver_cov.shape)}")
 
     if method == "admm":
         try:
             from glasso_pytorch import graphical_lasso
 
-            if allow_backward:
-                result = graphical_lasso(
-                    solver_cov,
-                    alpha=alpha,
-                    rho=rho,
-                    max_iter=max_iter,
-                    tol=tol,
-                    rtol=tol,
-                    return_info=True,
-                )
-            else:
-                with torch.no_grad():
+            solver_cov_torch = solver_cov if allow_backward else solver_cov.to(torch.float64)
+            last_error = None
+            try:
+                if allow_backward:
                     result = graphical_lasso(
-                        solver_cov,
+                        solver_cov_torch,
                         alpha=alpha,
                         rho=rho,
                         max_iter=max_iter,
                         tol=tol,
                         rtol=tol,
+                        eps=eps,
+                        eigh_shift=eigh_shift,
+                        eigh_shift_retries=eigh_shift_retries,
                         return_info=True,
                     )
-            return result.precision.to(device=device, dtype=dtype)
+                else:
+                    with torch.no_grad():
+                        result = graphical_lasso(
+                            solver_cov_torch,
+                            alpha=alpha,
+                            rho=rho,
+                            max_iter=max_iter,
+                            tol=tol,
+                            rtol=tol,
+                            eps=eps,
+                            eigh_shift=eigh_shift,
+                            eigh_shift_retries=eigh_shift_retries,
+                            return_info=True,
+                        )
+                return result.precision.to(device=device, dtype=dtype)
+            except RuntimeError as error:
+                last_error = error
+
+            if not fallback:
+                raise RuntimeError(
+                    "glasso_pytorch ADMM failed after spectrum-preserving "
+                    f"eigh shift retries up to {eigh_shift * (10.0**eigh_shift_retries):.3e}"
+                ) from last_error
+            warnings.warn(
+                "glasso_pytorch ADMM failed; falling back to sklearn/quic/ridge precision. "
+                f"Last error: {last_error}",
+                RuntimeWarning,
+            )
+            method = "sklearn"
         except ImportError:
             method = "sklearn"
 
@@ -70,15 +101,45 @@ def _single_glasso_estimation(
             return torch.tensor(precision, dtype=dtype, device=device)
         except ImportError:
             method = "sklearn"
+        except Exception as error:
+            if not fallback:
+                raise
+            warnings.warn(f"QUIC graphical lasso failed; falling back to sklearn/ridge precision. Error: {error}", RuntimeWarning)
+            method = "sklearn"
 
     if method == "sklearn":
-        from sklearn.covariance import GraphicalLasso
+        try:
+            from sklearn.covariance import GraphicalLasso
 
-        model = GraphicalLasso(alpha=alpha, max_iter=max_iter, tol=tol)
-        model.fit(solver_cov.detach().cpu().numpy())
-        return torch.tensor(model.precision_, dtype=dtype, device=device)
+            model = GraphicalLasso(alpha=alpha, max_iter=max_iter, tol=tol)
+            model.fit(solver_cov.detach().cpu().numpy())
+            return torch.tensor(model.precision_, dtype=dtype, device=device)
+        except Exception as error:
+            if not fallback:
+                raise
+            warnings.warn(f"sklearn GraphicalLasso failed; using ridge/pinv precision fallback. Error: {error}", RuntimeWarning)
+            return _ridge_precision_fallback(solver_cov, alpha, device, dtype)
 
     raise ValueError(f"Unknown graphical lasso method: {method}")
+
+
+def _add_diagonal_shift(cov_matrix, shift):
+    """Add a diagonal shift for the last-resort ridge inverse fallback."""
+    eye = torch.eye(cov_matrix.size(-1), device=cov_matrix.device, dtype=cov_matrix.dtype)
+    return cov_matrix + shift * eye
+
+
+def _ridge_precision_fallback(cov_matrix, alpha, device, dtype):
+    """Last-resort finite precision estimate when graphical lasso solvers fail."""
+    solver_cov = cov_matrix.detach().to(torch.float64)
+    ridge = max(float(alpha), torch.finfo(solver_cov.dtype).eps)
+    regularized_cov = _add_diagonal_shift(solver_cov, ridge)
+    try:
+        precision = torch.linalg.inv(regularized_cov)
+    except RuntimeError:
+        precision = torch.linalg.pinv(regularized_cov)
+    precision = 0.5 * (precision + precision.transpose(-1, -2))
+    return precision.to(device=device, dtype=dtype)
 
 
 def glasso_estimation(
@@ -86,6 +147,10 @@ def glasso_estimation(
     alpha=0.2,
     method="admm",
     rho=1.0,
+    eps=0.0,
+    eigh_shift=1e-6,
+    eigh_shift_retries=4,
+    fallback=True,
     max_iter=20,
     tol=1e-4,
     allow_backward=False,
@@ -98,6 +163,14 @@ def glasso_estimation(
         alpha: Regularization parameter for Graphical Lasso.
         method: One of "admm", "quic", or "sklearn".
         rho: ADMM penalty parameter used only when method is "admm".
+        eps: Optional covariance diagonal jitter. This perturbs the GLASSO
+            problem and defaults to 0.
+        eigh_shift: Initial eigensolver-only spectral shift for the ADMM Theta
+            update. The shift is subtracted from recovered eigenvalues, so this
+            does not perturb the GLASSO objective in exact arithmetic.
+        eigh_shift_retries: Number of extra 10x shift retries.
+        fallback: If True, fall back to sklearn/quic/ridge precision when the
+            selected solver fails.
         max_iter: Maximum solver iterations. Capped at 20 for this model.
         tol: Solver tolerance.
         allow_backward: If False, Theta estimation is detached from autograd.
@@ -118,6 +191,10 @@ def glasso_estimation(
                 alpha,
                 method,
                 rho,
+                eps,
+                eigh_shift,
+                eigh_shift_retries,
+                fallback,
                 max_iter,
                 tol,
                 allow_backward,
@@ -132,6 +209,10 @@ def glasso_estimation(
                 alpha,
                 method,
                 rho,
+                eps,
+                eigh_shift,
+                eigh_shift_retries,
+                fallback,
                 max_iter,
                 tol,
                 allow_backward,
@@ -271,6 +352,10 @@ class UnrollingModel(nn.Module):
         glasso_method="admm",
         glasso_alpha=0.2,
         glasso_rho=1.0,
+        glasso_eps=0.0,
+        glasso_eigh_shift=1e-6,
+        glasso_eigh_shift_retries=4,
+        glasso_fallback=True,
         glasso_max_iter=20,
         glasso_tol=1e-4,
         glasso_allow_backward=False,
@@ -297,6 +382,10 @@ class UnrollingModel(nn.Module):
         self.glasso_method = glasso_method
         self.glasso_alpha = glasso_alpha
         self.glasso_rho = glasso_rho
+        self.glasso_eps = glasso_eps
+        self.glasso_eigh_shift = glasso_eigh_shift
+        self.glasso_eigh_shift_retries = glasso_eigh_shift_retries
+        self.glasso_fallback = glasso_fallback
         self.glasso_max_iter = min(glasso_max_iter, 20)
         self.glasso_tol = glasso_tol
         self.glasso_allow_backward = glasso_allow_backward
@@ -681,6 +770,10 @@ class UnrollingModel(nn.Module):
                     alpha=self.glasso_alpha,
                     method=self.glasso_method,
                     rho=self.glasso_rho,
+                    eps=self.glasso_eps,
+                    eigh_shift=self.glasso_eigh_shift,
+                    eigh_shift_retries=self.glasso_eigh_shift_retries,
+                    fallback=self.glasso_fallback,
                     max_iter=self.glasso_max_iter,
                     tol=self.glasso_tol,
                     allow_backward=self.glasso_allow_backward,
@@ -694,6 +787,10 @@ class UnrollingModel(nn.Module):
                     alpha=self.glasso_alpha,
                     method=self.glasso_method,
                     rho=self.glasso_rho,
+                    eps=self.glasso_eps,
+                    eigh_shift=self.glasso_eigh_shift,
+                    eigh_shift_retries=self.glasso_eigh_shift_retries,
+                    fallback=self.glasso_fallback,
                     max_iter=self.glasso_max_iter,
                     tol=self.glasso_tol,
                     allow_backward=self.glasso_allow_backward,

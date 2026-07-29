@@ -47,6 +47,70 @@ def _regularization_tensor(alpha: TensorLike, ref: torch.Tensor) -> torch.Tensor
     return alpha
 
 
+def _matrix_eye_like(matrix: torch.Tensor) -> torch.Tensor:
+    """Return an identity matrix broadcastable to a batch of square matrices."""
+    n_features = matrix.shape[-1]
+    eye = torch.eye(n_features, dtype=matrix.dtype, device=matrix.device)
+    return eye.expand(matrix.shape)
+
+
+def _eigh_with_shift_recovery(
+    matrix: torch.Tensor,
+    *,
+    initial_shift: float,
+    shift_retries: int,
+    cpu_fallback: bool,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Run symmetric eigendecomposition with spectrum-preserving fallbacks.
+
+    The shift fallback uses eigh(A + delta I), then subtracts delta from the
+    returned eigenvalues. It preserves the original eigensystem in exact
+    arithmetic and does not change the ADMM graphical-lasso objective.
+    """
+    try:
+        return torch.linalg.eigh(matrix)
+    except RuntimeError as direct_error:
+        last_error = direct_error
+
+    # CPU fallback necessarily copies the matrix and is therefore only used
+    # when gradients are not being tracked through the eigensolve.
+    can_cpu_fallback = cpu_fallback and not matrix.requires_grad
+
+    if can_cpu_fallback and (matrix.device.type != "cpu" or matrix.dtype != torch.float64):
+        try:
+            cpu_matrix = matrix.detach().to(device="cpu", dtype=torch.float64)
+            eigvals, eigvecs = torch.linalg.eigh(cpu_matrix)
+            return eigvals.to(device=matrix.device, dtype=matrix.dtype), eigvecs.to(device=matrix.device, dtype=matrix.dtype)
+        except RuntimeError as error:
+            last_error = error
+
+    if initial_shift > 0:
+        eye = _matrix_eye_like(matrix)
+        for retry_idx in range(shift_retries + 1):
+            shift = initial_shift * (10.0**retry_idx)
+            shifted = matrix + shift * eye
+            try:
+                eigvals, eigvecs = torch.linalg.eigh(shifted)
+                return eigvals - shift, eigvecs
+            except RuntimeError as error:
+                last_error = error
+
+            if can_cpu_fallback and (shifted.device.type != "cpu" or shifted.dtype != torch.float64):
+                try:
+                    cpu_shifted = shifted.detach().to(device="cpu", dtype=torch.float64)
+                    eigvals, eigvecs = torch.linalg.eigh(cpu_shifted)
+                    eigvals = eigvals.to(device=matrix.device, dtype=matrix.dtype) - shift
+                    eigvecs = eigvecs.to(device=matrix.device, dtype=matrix.dtype)
+                    return eigvals, eigvecs
+                except RuntimeError as error:
+                    last_error = error
+
+    raise RuntimeError(
+        "torch.linalg.eigh failed for the original matrix and all "
+        "spectrum-preserving fallbacks"
+    ) from last_error
+
+
 def _dual_gap(
     emp_cov: torch.Tensor,
     precision: torch.Tensor,
@@ -106,7 +170,10 @@ def graphical_lasso(
     max_iter: int = 100,
     tol: float = 1e-4,
     rtol: float = 1e-4,
-    eps: float = 1e-7,
+    eps: float = 0.0,
+    eigh_shift: float = 1e-6,
+    eigh_shift_retries: int = 4,
+    eigh_cpu_fallback: bool = True,
     penalize_diagonal: bool = False,
     return_info: bool = False,
 ) -> Union[torch.Tensor, GraphicalLassoResult]:
@@ -129,7 +196,14 @@ def graphical_lasso(
         max_iter: Maximum ADMM iterations.
         tol: Absolute convergence tolerance.
         rtol: Relative convergence tolerance.
-        eps: Small diagonal jitter added to ``emp_cov`` for numerical stability.
+        eps: Small diagonal jitter added to ``emp_cov``. This changes the
+            graphical-lasso problem and should be used only when desired.
+        eigh_shift: Initial eigensolver-only spectral shift. If direct
+            ``eigh(A)`` fails, the solver tries ``eigh(A + delta I)`` and then
+            subtracts ``delta`` from the returned eigenvalues.
+        eigh_shift_retries: Number of additional 10x shift retries.
+        eigh_cpu_fallback: If True, retry eigendecomposition on CPU float64
+            before/while applying spectral shifts.
         penalize_diagonal: If True, also applies L1 penalty to the diagonal.
         return_info: If True, returns a ``GraphicalLassoResult`` with residuals
             and convergence metadata. Otherwise returns only the precision.
@@ -147,12 +221,17 @@ def graphical_lasso(
         raise ValueError("rho must be positive")
     if max_iter <= 0:
         raise ValueError("max_iter must be positive")
+    if eps < 0:
+        raise ValueError("eps must be non-negative")
+    if eigh_shift < 0:
+        raise ValueError("eigh_shift must be non-negative")
+    if eigh_shift_retries < 0:
+        raise ValueError("eigh_shift_retries must be non-negative")
 
     cov, squeezed = _as_batch_matrix(emp_cov)
     n_features = cov.shape[-1]
     alpha_t = _regularization_tensor(alpha, cov)
-    eye = torch.eye(n_features, dtype=cov.dtype, device=cov.device)
-    eye = eye.expand(cov.shape)
+    eye = _matrix_eye_like(cov)
 
     # Symmetrize the covariance to avoid tiny asymmetric numerical noise causing
     # complex behavior in the eigensolver. ADMM keeps all iterates symmetric.
@@ -179,7 +258,12 @@ def graphical_lasso(
         # (d + sqrt(d^2 + 4 rho)) / (2 rho).
         eig_input = rho * (z - u) - cov
         eig_input = 0.5 * (eig_input + eig_input.transpose(-1, -2))
-        eigvals, eigvecs = torch.linalg.eigh(eig_input)
+        eigvals, eigvecs = _eigh_with_shift_recovery(
+            eig_input,
+            initial_shift=eigh_shift,
+            shift_retries=eigh_shift_retries,
+            cpu_fallback=eigh_cpu_fallback,
+        )
         theta_eigvals = (eigvals + torch.sqrt(eigvals.square() + 4.0 * rho)) / (2.0 * rho)
         theta = (eigvecs * theta_eigvals.unsqueeze(-2)) @ eigvecs.transpose(-1, -2)
         theta = 0.5 * (theta + theta.transpose(-1, -2))
@@ -252,7 +336,10 @@ class GraphicalLassoModule(nn.Module):
         max_iter: int = 100,
         tol: float = 1e-4,
         rtol: float = 1e-4,
-        eps: float = 1e-7,
+        eps: float = 0.0,
+        eigh_shift: float = 1e-6,
+        eigh_shift_retries: int = 4,
+        eigh_cpu_fallback: bool = True,
         penalize_diagonal: bool = False,
         allow_backward: bool = False,
         input_mode: str = "covariance",
@@ -269,6 +356,9 @@ class GraphicalLassoModule(nn.Module):
         self.tol = tol
         self.rtol = rtol
         self.eps = eps
+        self.eigh_shift = eigh_shift
+        self.eigh_shift_retries = eigh_shift_retries
+        self.eigh_cpu_fallback = eigh_cpu_fallback
         self.penalize_diagonal = penalize_diagonal
         self.allow_backward = allow_backward
         self.input_mode = input_mode
@@ -279,6 +369,9 @@ class GraphicalLassoModule(nn.Module):
         return (
             f"alpha={self.alpha}, rho={self.rho}, max_iter={self.max_iter}, "
             f"tol={self.tol}, rtol={self.rtol}, eps={self.eps}, "
+            f"eigh_shift={self.eigh_shift}, "
+            f"eigh_shift_retries={self.eigh_shift_retries}, "
+            f"eigh_cpu_fallback={self.eigh_cpu_fallback}, "
             f"penalize_diagonal={self.penalize_diagonal}, "
             f"allow_backward={self.allow_backward}, input_mode={self.input_mode}, "
             f"center={self.center}, unbiased={self.unbiased}"
@@ -300,6 +393,9 @@ class GraphicalLassoModule(nn.Module):
                 tol=self.tol,
                 rtol=self.rtol,
                 eps=self.eps,
+                eigh_shift=self.eigh_shift,
+                eigh_shift_retries=self.eigh_shift_retries,
+                eigh_cpu_fallback=self.eigh_cpu_fallback,
                 penalize_diagonal=self.penalize_diagonal,
                 return_info=return_info,
             )
@@ -314,6 +410,9 @@ class GraphicalLassoModule(nn.Module):
                 tol=self.tol,
                 rtol=self.rtol,
                 eps=self.eps,
+                eigh_shift=self.eigh_shift,
+                eigh_shift_retries=self.eigh_shift_retries,
+                eigh_cpu_fallback=self.eigh_cpu_fallback,
                 penalize_diagonal=self.penalize_diagonal,
                 return_info=return_info,
             )
@@ -342,7 +441,10 @@ class GraphicalLasso:
         max_iter: int = 100,
         tol: float = 1e-4,
         rtol: float = 1e-4,
-        eps: float = 1e-7,
+        eps: float = 0.0,
+        eigh_shift: float = 1e-6,
+        eigh_shift_retries: int = 4,
+        eigh_cpu_fallback: bool = True,
         penalize_diagonal: bool = False,
     ) -> None:
         self.alpha = alpha
@@ -351,6 +453,9 @@ class GraphicalLasso:
         self.tol = tol
         self.rtol = rtol
         self.eps = eps
+        self.eigh_shift = eigh_shift
+        self.eigh_shift_retries = eigh_shift_retries
+        self.eigh_cpu_fallback = eigh_cpu_fallback
         self.penalize_diagonal = penalize_diagonal
 
         self.precision_: Optional[torch.Tensor] = None
@@ -370,6 +475,9 @@ class GraphicalLasso:
             tol=self.tol,
             rtol=self.rtol,
             eps=self.eps,
+            eigh_shift=self.eigh_shift,
+            eigh_shift_retries=self.eigh_shift_retries,
+            eigh_cpu_fallback=self.eigh_cpu_fallback,
             penalize_diagonal=self.penalize_diagonal,
             return_info=True,
         )

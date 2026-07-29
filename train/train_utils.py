@@ -143,6 +143,10 @@ def parse_args(argv=None):
     parser.add_argument("--glasso-method", help="temporary override for model.glasso_method", default=None, type=str)
     parser.add_argument("--glasso-alpha", help="temporary override for model.glasso_alpha", default=None, type=float)
     parser.add_argument("--glasso-rho", help="temporary override for model.glasso_rho", default=None, type=float)
+    parser.add_argument("--glasso-eps", help="temporary override for model.glasso_eps", default=None, type=float)
+    parser.add_argument("--glasso-eigh-shift", help="temporary override for model.glasso_eigh_shift", default=None, type=float)
+    parser.add_argument("--glasso-eigh-shift-retries", help="temporary override for model.glasso_eigh_shift_retries", default=None, type=int)
+    _add_bool_override(parser, "glasso-fallback", "glasso_fallback", "temporary override for model.glasso_fallback")
     parser.add_argument("--stride", help="temporary override for data_stride", default=None, type=int)
     parser.add_argument("--lr", help="temporary override for learning_rate", default=None, type=float)
     parser.add_argument("--predonly", dest="pred_only", action="store_true")
@@ -173,6 +177,10 @@ def apply_args_to_config(config, args):
         "glasso_method": "glasso_method",
         "glasso_alpha": "glasso_alpha",
         "glasso_rho": "glasso_rho",
+        "glasso_eps": "glasso_eps",
+        "glasso_eigh_shift": "glasso_eigh_shift",
+        "glasso_eigh_shift_retries": "glasso_eigh_shift_retries",
+        "glasso_fallback": "glasso_fallback",
     }
     for arg_name, config_key in arg_to_config_key.items():
         value = getattr(args, arg_name)
@@ -187,6 +195,10 @@ def apply_args_to_config(config, args):
     model_config.setdefault("glasso_method", "admm")
     model_config.setdefault("glasso_alpha", 0.2)
     model_config.setdefault("glasso_rho", 1.0)
+    model_config.setdefault("glasso_eps", 0.0)
+    model_config.setdefault("glasso_eigh_shift", 1e-6)
+    model_config.setdefault("glasso_eigh_shift_retries", 4)
+    model_config.setdefault("glasso_fallback", True)
 
     if args.stride is not None:
         config["data_stride"] = args.stride
@@ -390,6 +402,10 @@ def create_model(config, args, train_set, device):
         glasso_method=config["model"]["glasso_method"],
         glasso_alpha=config["model"]["glasso_alpha"],
         glasso_rho=config["model"]["glasso_rho"],
+        glasso_eps=config["model"]["glasso_eps"],
+        glasso_eigh_shift=config["model"]["glasso_eigh_shift"],
+        glasso_eigh_shift_retries=config["model"]["glasso_eigh_shift_retries"],
+        glasso_fallback=config["model"]["glasso_fallback"],
     ).to(device)
     return model, admm_info
 
@@ -552,6 +568,10 @@ def _log_cli_arguments(logger, args):
         "glasso_method",
         "glasso_alpha",
         "glasso_rho",
+        "glasso_eps",
+        "glasso_eigh_shift",
+        "glasso_eigh_shift_retries",
+        "glasso_fallback",
         "stride",
         "lr",
     }

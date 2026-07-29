@@ -256,6 +256,10 @@ def solve_admm(
     tol: float,
     max_iter: int,
     device: str,
+    eps: float,
+    eigh_shift: float,
+    eigh_shift_retries: int,
+    eigh_cpu_fallback: bool,
 ) -> Tuple[np.ndarray, int, float]:
     result = torch_graphical_lasso(
         emp_cov_torch,
@@ -263,6 +267,10 @@ def solve_admm(
         max_iter=max_iter,
         tol=tol,
         rtol=tol,
+        eps=eps,
+        eigh_shift=eigh_shift,
+        eigh_shift_retries=eigh_shift_retries,
+        eigh_cpu_fallback=eigh_cpu_fallback,
         return_info=True,
     )
     if device == "cuda":
@@ -287,13 +295,25 @@ def run_solver(
     tol: float,
     max_iter: int,
     device: str,
+    args: argparse.Namespace,
 ) -> Tuple[np.ndarray, int, float]:
     if name == "sklearn_cd":
         return solve_sklearn(emp_cov, alpha, tol, max_iter)
     if name == "quic":
         return solve_quic(emp_cov, alpha, tol, max_iter)
     if name == "torch_admm":
-        return solve_admm(emp_cov, emp_cov_torch, alpha, tol, max_iter, device)
+        return solve_admm(
+            emp_cov,
+            emp_cov_torch,
+            alpha,
+            tol,
+            max_iter,
+            device,
+            args.eps,
+            args.eigh_shift,
+            args.eigh_shift_retries,
+            args.eigh_cpu_fallback,
+        )
     raise ValueError(f"unknown solver: {name}")
 
 
@@ -317,6 +337,7 @@ def run_convergence_stats(
                 tol=args.tol,
                 max_iter=args.max_iter,
                 device=args.device,
+                args=args,
             )
             time_values.append(1000.0 * (time.perf_counter() - start))
             iter_values.append(float(n_iter))
@@ -366,6 +387,7 @@ def run_fixed_iteration_stats(
                 tol=args.fixed_tol,
                 max_iter=args.fixed_iter,
                 device=args.device,
+                args=args,
             )
             stats = precision_stats(precision)
             errors = true_precision_errors(precision, problem.true_precision)
@@ -406,6 +428,11 @@ def main() -> None:
     parser.add_argument("--diagonal-shift", type=float, default=0.1)
     parser.add_argument("--device", type=str, default="cpu", choices=["cpu", "cuda"])
     parser.add_argument("--dtype", type=str, default="float64", choices=["float32", "float64"])
+    parser.add_argument("--eps", type=float, default=0.0, help="covariance jitter; changes the GLASSO problem")
+    parser.add_argument("--eigh-shift", type=float, default=1e-6, help="eigensolver-only shift; recovered after eigh")
+    parser.add_argument("--eigh-shift-retries", type=int, default=4)
+    parser.add_argument("--no-eigh-cpu-fallback", dest="eigh_cpu_fallback", action="store_false")
+    parser.set_defaults(eigh_cpu_fallback=True)
     args = parser.parse_args()
 
     if args.device == "cuda" and not torch.cuda.is_available():
@@ -441,7 +468,10 @@ def main() -> None:
         f"max_iter={args.max_iter}, fixed_iter={args.fixed_iter}, "
         f"fixed_tol={args.fixed_tol}, edge_prob={args.edge_prob}, "
         f"repeat={args.repeat}, warmup={args.warmup}, "
-        f"dtype={args.dtype}, torch_device={args.device}"
+        f"dtype={args.dtype}, torch_device={args.device}, "
+        f"eps={args.eps}, eigh_shift={args.eigh_shift}, "
+        f"eigh_shift_retries={args.eigh_shift_retries}, "
+        f"eigh_cpu_fallback={args.eigh_cpu_fallback}"
     )
     if quic is None:
         print("QUIC skipped: inverse_covariance is not installed.")
@@ -462,6 +492,7 @@ def main() -> None:
                     tol=args.tol,
                     max_iter=args.max_iter,
                     device=args.device,
+                    args=args,
                 ),
                 args.repeat,
                 args.warmup,

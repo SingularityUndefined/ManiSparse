@@ -75,6 +75,26 @@ configured tolerances.
 The function supports covariance batches with shape `(..., p, p)` and preserves
 the input tensor dtype and device, so CUDA tensors run on GPU.
 
+### Eigensolver Shift Fallback
+
+The ADMM `Theta` update decomposes
+`A = rho * (Z - U) - S`. Some LAPACK / CUDA eigensolver calls can fail on
+ill-conditioned symmetric matrices with clustered or repeated eigenvalues. The
+default protection is now an eigensolver-only shift:
+
+```text
+eigh(A + delta I) -> (d_shifted, Q)
+d = d_shifted - delta
+```
+
+Adding `delta I` shifts all eigenvalues by the same amount and leaves the
+eigenspaces unchanged in exact arithmetic. After subtracting `delta`, the ADMM
+closed-form update uses the original eigenvalues of `A`, so this does not
+change the graphical-lasso objective. This is different from adding jitter to
+the covariance matrix `S`: covariance jitter changes `A` and therefore solves a
+slightly different GLASSO problem. For that reason, `eps` defaults to `0.0`;
+use it only when you intentionally want covariance regularization.
+
 `GraphicalLassoModule` is a parameter-free `torch.nn.Module` wrapper around the
 same solver. By default it accepts covariance matrices:
 
@@ -94,6 +114,8 @@ remain connected to the raw sample or covariance input.
 The current evaluation focuses on four questions:
 
 - ADMM convergence speed under different `rho`.
+- Whether eigensolver-only shift recovery preserves the ADMM `Theta` update
+  compared with covariance jitter.
 - CPU runtime needed to reach `tol=1e-4`.
 - Truncated-iteration recovery behavior, measured by `offdiag_nnz`,
   `rel_fro_to_true`, and `rel_spec_to_true`.
@@ -109,7 +131,7 @@ The available solvers are:
 Run from the repository root:
 
 ```bash
-python -m glasso_pytorch.benchmark_glasso --n-samples 100 --n-features 200 --alpha 0.5 --max-iter 100 --tol 1e-4
+python -m glasso_pytorch.benchmark_glasso --n-samples 100 --n-features 200 --alpha 0.5 --max-iter 100 --tol 1e-4 --eigh-shift 1e-6 --eigh-shift-retries 4
 ```
 
 ### Experimental Setup
@@ -242,14 +264,40 @@ stopping tolerance; `abs_dual_gap` is reported as an additional diagnostic.
 
 | method | rho | n_iter | time_ms | abs_dual_gap | offdiag_nnz | converged |
 | --- | ---: | ---: | ---: | ---: | ---: | --- |
-| sklearn_cd | - | 3 | 273.951 | 1.90585e-05 | 570 | reported |
-| quic | - | 10 | 31.899 | 1.74832e-05 | 570 | reported |
-| torch_admm | 0.25 | 237 | 1443.511 | 0.0166356 | 552 | True |
-| torch_admm | 0.5 | 119 | 813.500 | 0.0165418 | 552 | True |
-| torch_admm | 1.0 | 60 | 416.232 | 0.0160263 | 552 | True |
-| torch_admm | 2.0 | 30 | 246.297 | 0.0289314 | 554 | True |
-| torch_admm | 5.0 | 37 | 309.373 | 0.178603 | 570 | True |
-| torch_admm | 10.0 | 69 | 513.229 | 0.14487 | 570 | True |
+| sklearn_cd | - | 3 | 207.768 | 1.90585e-05 | 570 | reported |
+| quic | - | 10 | 35.374 | 1.74832e-05 | 570 | reported |
+| torch_admm | 0.25 | 237 | 1583.714 | 0.0166523 | 552 | True |
+| torch_admm | 0.5 | 119 | 840.542 | 0.0165585 | 552 | True |
+| torch_admm | 1.0 | 60 | 473.475 | 0.0160429 | 552 | True |
+| torch_admm | 2.0 | 30 | 272.701 | 0.0289481 | 554 | True |
+| torch_admm | 5.0 | 37 | 332.266 | 0.17862 | 570 | True |
+| torch_admm | 10.0 | 69 | 521.840 | 0.144887 | 570 | True |
+
+### Eigensolver Shift Benchmark
+
+This benchmark compares three ways to compute one ADMM `Theta` update from the
+same symmetric matrix `A`: direct `eigh(A)`, shift recovery
+`eigh(A + delta I)` followed by subtracting `delta`, and covariance-jitter-like
+behavior that changes `A`. The repeated-spectrum setup is intentionally chosen
+to exercise clustered eigenvalues.
+
+```bash
+python -m glasso_pytorch.benchmark_eigh_shift
+```
+
+![Eigensolver shift trick](figures/eigh_shift_trick.png)
+
+| shift | shift_rel_fro | cov_jitter_rel_fro | direct_time_ms | shift_time_ms | cov_jitter_time_ms |
+|---:|---:|---:|---:|---:|---:|
+| 1.0e-08 | 2.257061e-15 | 3.198133e-09 | 1.506 | 0.458 | 0.459 |
+| 1.0e-07 | 2.571968e-15 | 3.198133e-08 | 0.392 | 0.440 | 0.459 |
+| 1.0e-06 | 2.243726e-15 | 3.198133e-07 | 0.367 | 0.415 | 0.391 |
+| 1.0e-05 | 2.166056e-15 | 3.198129e-06 | 0.430 | 0.454 | 0.391 |
+| 1.0e-04 | 2.266115e-15 | 3.198095e-05 | 0.425 | 0.454 | 0.387 |
+| 1.0e-03 | 2.247350e-15 | 3.197747e-04 | 0.461 | 0.450 | 0.404 |
+
+The shift recovery error stays at float64 roundoff level in this test, while
+the covariance-jitter error scales with the size of the perturbation.
 
 ## CUDA Module Demo
 

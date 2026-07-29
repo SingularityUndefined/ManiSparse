@@ -21,6 +21,10 @@ def _single_glasso_estimation(
     method,
     max_iter,
     tol,
+    eps,
+    eigh_shift,
+    eigh_shift_retries,
+    fallback,
     allow_backward,
     device,
     dtype,
@@ -39,6 +43,9 @@ def _single_glasso_estimation(
                     max_iter=max_iter,
                     tol=tol,
                     rtol=tol,
+                    eps=eps,
+                    eigh_shift=eigh_shift,
+                    eigh_shift_retries=eigh_shift_retries,
                     return_info=True,
                 )
             else:
@@ -49,10 +56,17 @@ def _single_glasso_estimation(
                         max_iter=max_iter,
                         tol=tol,
                         rtol=tol,
+                        eps=eps,
+                        eigh_shift=eigh_shift,
+                        eigh_shift_retries=eigh_shift_retries,
                         return_info=True,
                     )
             return result.precision.to(device=device, dtype=dtype)
         except ImportError:
+            method = "sklearn"
+        except RuntimeError:
+            if not fallback:
+                raise
             method = "sklearn"
 
     if method == "quic":
@@ -84,6 +98,10 @@ def glasso_estimation(
     method="admm",
     max_iter=20,
     tol=1e-4,
+    eps=0.0,
+    eigh_shift=1e-6,
+    eigh_shift_retries=4,
+    fallback=True,
     allow_backward=False,
 ):
     """
@@ -95,6 +113,13 @@ def glasso_estimation(
         method: One of "admm", "quic", or "sklearn".
         max_iter: Maximum solver iterations. Capped at 20 for this model.
         tol: Solver tolerance.
+        eps: Optional covariance jitter. Defaults to 0 because this changes the
+            graphical-lasso problem.
+        eigh_shift: Eigensolver-only shift for ADMM GLASSO. Eigenvalues are
+            shifted back after decomposition, so the ADMM update is unchanged
+            in exact arithmetic.
+        eigh_shift_retries: Number of extra 10x eigensolver shift retries.
+        fallback: If True, fall back to sklearn when the ADMM backend fails.
         allow_backward: If False, Theta estimation is detached from autograd.
     Returns:
         Dense node precision matrix Theta, shape (N, N), or batched precision
@@ -113,6 +138,10 @@ def glasso_estimation(
             method,
             max_iter,
             tol,
+            eps,
+            eigh_shift,
+            eigh_shift_retries,
+            fallback,
             allow_backward,
             device,
             dtype,
@@ -125,6 +154,10 @@ def glasso_estimation(
                 method,
                 max_iter,
                 tol,
+                eps,
+                eigh_shift,
+                eigh_shift_retries,
+                fallback,
                 allow_backward,
                 device,
                 dtype,
@@ -221,6 +254,10 @@ class UnrollingModel(nn.Module):
         glasso_alpha=0.2,
         glasso_max_iter=20,
         glasso_tol=1e-4,
+        glasso_eps=0.0,
+        glasso_eigh_shift=1e-6,
+        glasso_eigh_shift_retries=4,
+        glasso_fallback=True,
         glasso_allow_backward=False,
     ):
         super().__init__()
@@ -243,6 +280,10 @@ class UnrollingModel(nn.Module):
         self.glasso_alpha = glasso_alpha
         self.glasso_max_iter = min(glasso_max_iter, 20)
         self.glasso_tol = glasso_tol
+        self.glasso_eps = glasso_eps
+        self.glasso_eigh_shift = glasso_eigh_shift
+        self.glasso_eigh_shift_retries = glasso_eigh_shift_retries
+        self.glasso_fallback = glasso_fallback
         self.glasso_allow_backward = glasso_allow_backward
 
         self.nearest_nodes, self.nearest_dists = find_k_nearest_neighbors(
@@ -474,6 +515,10 @@ class UnrollingModel(nn.Module):
                 method=self.glasso_method,
                 max_iter=self.glasso_max_iter,
                 tol=self.glasso_tol,
+                eps=self.glasso_eps,
+                eigh_shift=self.glasso_eigh_shift,
+                eigh_shift_retries=self.glasso_eigh_shift_retries,
+                fallback=self.glasso_fallback,
                 allow_backward=self.glasso_allow_backward,
             )
             ###########################################################################

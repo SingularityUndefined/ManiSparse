@@ -1,14 +1,17 @@
 # ManiSparse
 # Lightweight Transformer via Unrolling of Mixed Graph Algorithms for Traffic Forecast
+
+Chinese version: [README_CN.md](README_CN.md)
+
 ## Requirements
 
 Required packages for this implementation:
 
 ```
 torch>=2.4.1
-tqdm 
-numpy 
-matplotlib 
+tqdm
+numpy
+matplotlib
 networkx>=2.5
 pandas
 pyyaml
@@ -72,7 +75,32 @@ When `output_graph=True`, the model also returns the stacked learned graph weigh
 `undirected_graphs: (B, num_blocks, T, N, K, H)` and
 `directed_graphs: (B, num_blocks, T - 1, interval, N, H)`.
 
-`model.use_stable_graph_learning` controls the graph-learning numerical path and is part of the model design for training, validation, and testing. The default `False` keeps the original formulas: invalid directed temporal intervals are masked after graph weights are computed, `exp` is unclamped, and graph normalization uses the original `torch.where(value > 0, 1 / value, 0)` form. Setting it to `True` enables the numerical-stability path: invalid directed temporal intervals are masked before the `multiQ` projection, Gaussian-kernel exponentials are clamped to avoid extreme underflow/overflow, and graph normalization avoids constructing `1 / 0` inside autograd.
+`model.use_stable_graph_learning` controls the graph-learning numerical path and is part of the model design for training, validation, and testing. The current default in `train/config.yaml` is `True`, so the model uses the numerical-stability path by default. Setting it to `False` keeps the original formulas: invalid directed temporal intervals are masked after graph weights are computed, `exp` is unclamped, and graph normalization uses the original `torch.where(value > 0, 1 / value, 0)` form. Setting it to `True` enables the numerical-stability path: invalid directed temporal intervals are masked before the `multiQ` projection, Gaussian-kernel exponentials are clamped to avoid extreme underflow/overflow, and graph normalization avoids constructing `1 / 0` inside autograd.
+
+### Numerical Stability Changes
+
+The numerical-stability changes were introduced after training logs showed finite inputs, finite recovered outputs, and a finite loss, but non-finite gradients first appeared in `model_blocks.0.graph_learning_module.multiQ`. This pattern means the forward pass can look valid while the backward graph still creates NaN/Inf values. The affected path is the directed graph-learning chain:
+
+```text
+multiQ -> Q_df / Q_i -> exp(...) graph weights -> d_ew -> ADMMBlock -> output -> loss
+```
+
+The original graph-learning code is still available through `model.use_stable_graph_learning=False`. The current default `True` applies the following stability changes consistently during training, validation, and testing:
+
+| Location | Original behavior | Stable behavior | Reason |
+|---|---|---|---|
+| Graph normalization | `torch.where(value > 0, 1 / value, 0)` | `value.clamp_min(eps).reciprocal()` followed by masking invalid entries to zero. | `torch.where` can still build a `1 / 0` branch in autograd even when the forward output is masked, which can produce NaN gradients. |
+| Directed temporal mask | Invalid temporal intervals were masked after graph weights were computed. | Invalid temporal intervals are masked before the `multiQ` projection. | Prevents invalid negative-index temporal positions from entering `einsum`, squared distances, and `exp` before the final mask is applied. |
+| Gaussian-kernel `exp` | `torch.exp(exp_arg)` without bounds. | Clamp displacement-kernel lower exponent to about `-80` and inner-product upper exponent to about `80`. | Avoids extreme underflow/overflow and backward expressions such as `0 * inf`. |
+| Forward checks | The original path checked only NaN in `Q_df` / `Q_i`. | Stable path checks full finite status for `Q_df` / `Q_i`. | Inf values are also unsafe for the later graph normalization and ADMM update. |
+| Failure diagnosis | Bad-gradient checks only reported the first bad parameter gradient. | On bad backward, the failing batch is rerun with anomaly detection and tensor/gradient hooks in `UnrollingModel` and `GraphLearningModule`. | Helps locate whether the first non-finite value appears in features, graph weights, ADMM inputs/outputs, or the final parameter gradient. |
+
+This gate is not a testing-only switch. It is part of the model definition: the same value is used for training, validation, testing, and saved model behavior. CLI overrides are available for temporary experiments:
+
+```bash
+--stable-graph-learning
+--no-stable-graph-learning
+```
 
 Each unrolled block follows the same high-level order:
 
@@ -111,7 +139,7 @@ For `Theta`, `lambda_theta` existence is currently equivalent to `ablation!="The
 
 During training, every 20 batches prints the current-batch per-block Theta sparsity as `nnz / numel` through `tqdm.write`, so the progress bar is preserved. The same line also reports each block's `lambda_theta`; scalar values are printed directly, while vector/list values are summarized as min / median / max. Floating-point values use scientific notation with 3 significant digits. Because `Theta` is re-estimated for each batch rather than stored as a persistent model parameter, the sparsity value describes the most recent forward pass.
 Before `Theta` enters ADMM, negative diagonal entries are clamped to zero and entries with zero diagonal normalization denominator are set to zero to avoid NaN/Inf values.
-`model.glasso_method`, `model.glasso_alpha`, and `model.glasso_rho` are configured in `train/config.yaml` and can be temporarily overridden from the command line with `--glasso-method`, `--glasso-alpha`, and `--glasso-rho`. `glasso_alpha` is the Graphical Lasso regularization strength for all solver backends; `glasso_rho` is passed to the `glasso_pytorch` ADMM solver and is ignored by `quic` and `sklearn`.
+`model.glasso_method`, `model.glasso_alpha`, `model.glasso_rho`, `model.glasso_eps`, `model.glasso_eigh_shift`, `model.glasso_eigh_shift_retries`, and `model.glasso_fallback` are configured in `train/config.yaml` and can be temporarily overridden from the command line. `glasso_alpha` is the Graphical Lasso regularization strength for all solver backends; `glasso_rho` is passed to the `glasso_pytorch` ADMM solver and is ignored by `quic` and `sklearn`. `glasso_eps` is optional covariance diagonal jitter and defaults to `0.0` because it changes the GLASSO problem. The default numerical protection is instead eigensolver-only shift recovery: when `torch.linalg.eigh(A)` fails in the ADMM Theta update, the solver tries `eigh(A + delta I)` and subtracts `delta` from the returned eigenvalues. This keeps the original ADMM update unchanged in exact arithmetic. `glasso_fallback=True` falls back to sklearn/quic on the original covariance matrix only if the ADMM backend still fails after these spectrum-preserving retries; the ridge/pinv fallback is a final finite-output guard after all GLASSO solvers fail.
 
 ## Training and Testing
 

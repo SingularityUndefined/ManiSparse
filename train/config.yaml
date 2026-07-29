@@ -24,11 +24,15 @@ model:
   glasso_method: admm
   glasso_alpha: 0.2
   glasso_rho: 2.0
+  glasso_eps: 0.0
+  glasso_eigh_shift: 1.0e-6
+  glasso_eigh_shift_retries: 4
+  glasso_fallback: True
   num_heads: 4
   feature_channels: 6
   use_extrapolation: True
   use_one_channel: True
-  use_stable_graph_learning: False
+  use_stable_graph_learning: True
   sharedM: False
   sharedQ: True
   diff_interval: True
