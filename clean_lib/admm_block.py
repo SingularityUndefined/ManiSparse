@@ -4,13 +4,10 @@ import torch
 import torch.nn as nn
 from torch.nn.parameter import Parameter
 
-from clean_lib.backup_modules import LR_guess
-
 
 DEFAULT_ADMM_INFO = {
     "ADMM_iters": 50,
     "CG_iters": 3,
-    "PGD_iters": 3,
     "mu_u_init": 10,
     "mu_d1_init": 10,
     "mu_d2_init": 10,
@@ -207,7 +204,6 @@ class ADMMBlock(nn.Module):
 
         self.ADMM_iters = ADMM_info["ADMM_iters"]
         self.CG_iters = ADMM_info["CG_iters"]
-        self.PGD_iters = ADMM_info["PGD_iters"]
         self.deflation_samples = ADMM_info.get("deflation_samples", 2)
         self.deflation_CG_iters = ADMM_info.get("deflation_CG_iters", self.CG_iters)
         self.deflation_tol = ADMM_info.get("deflation_tol", 1e-6)
@@ -630,9 +626,11 @@ class ADMMBlock(nn.Module):
         """Run one ADMM block over a sequence.
 
         Args:
-            y: (B, t, N, C) if only observed steps are provided, or
-               (B, T, N, C) if the sequence has already been extrapolated.
-            mask: observed length t when y already has T time steps.
+            y: full-horizon sequence, shape (B, T, N, C). The caller is
+                responsible for extrapolating the observed prefix before this
+                block; UnrollingModel does that once before the ADMM loop.
+            mask: observed prefix length `t_in`. The data term H^T H x keeps
+                only this prefix and treats future steps as unobserved.
             deflation: when True, also run multi-signal deflation after the
                 original ADMM forward result is computed.
             deflation_samples: number of deflated modes. The first mode is
@@ -647,12 +645,16 @@ class ADMMBlock(nn.Module):
                 output, multi_x where multi_x is (B, K, T, N, C) and
                 multi_x[:, 0] is exactly output.
         """
-        if y.size(1) < self.T:
-            x = LR_guess(y, self.T, self.device)
-        else:
-            assert mask is not None, "mask should be t for sequential inputs"
-            x = y[:, 0 : self.T]
-            y = y[:, 0:mask]
+        if mask is None:
+            raise ValueError("ADMMBlock.forward requires mask=t_in for the observed prefix length")
+        if y.size(1) != self.T:
+            raise ValueError(f"ADMMBlock.forward expects full horizon T={self.T}, got y.shape={tuple(y.shape)}")
+        self._assert_finite(y, "input_y", -1)
+        self._assert_finite(self.u_ew, "u_ew", -1)
+        self._assert_finite(self.d_ew, "d_ew", -1)
+
+        x = y[:, 0 : self.T]
+        y = y[:, 0:mask]
         deflation_rhs = x.clone()
 
         # ADMM operates on H learned graph heads. The final head dimension is
@@ -752,15 +754,19 @@ class ADMMBlock(nn.Module):
         RHS_zu = gamma_u / 2 + self.rho_u[iteration] / 2 * x
         zu = self.zu_solver(self.LHS_zu, RHS_zu, zu, iteration)
         self._assert_finite(RHS_zu, "RHS_zu", iteration)
+        self._assert_finite(zu, "zu", iteration)
 
         if self.ablation != "DGLR":
             RHS_zd = gamma_d / 2 + self.rho_d[iteration] / 2 * x
             zd = self.zd_solver(self.LHS_zd, RHS_zd, zd, iteration)
             self._assert_finite(RHS_zd, "RHS_zd", iteration)
+            self._assert_finite(zd, "zd", iteration)
 
         gamma_u = gamma_u + self.rho_u[iteration] * (x - zu)
+        self._assert_finite(gamma_u, "gamma_u", iteration)
         if self.ablation != "DGLR":
             gamma_d = gamma_d + self.rho_d[iteration] * (x - zd)
+            self._assert_finite(gamma_d, "gamma_d", iteration)
 
         return x, zu, zd, gamma_u, gamma_d
 
@@ -793,6 +799,8 @@ class ADMMBlock(nn.Module):
 
     @staticmethod
     def _assert_finite(tensor, name, iteration):
+        if tensor is None:
+            raise AssertionError(f"{name} is None in ADMM iteration {iteration}")
         if torch.isfinite(tensor).all():
             return
         finite_count = torch.isfinite(tensor).sum().item()

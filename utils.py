@@ -3,17 +3,8 @@ import numpy as np
 import torch
 import torch.nn as nn
 import logging
-import matplotlib.pyplot as plt
 from tqdm import tqdm
 import math
-import argparse
-
-from dataset.dataset_utils import (
-    Normalization,
-    create_dataloader,
-    create_directed_dataloader,
-    create_weather_dataloader,
-)
 
 
 def seed_everything(seed=11):
@@ -31,6 +22,11 @@ def setup_logger(name, logfile, level=logging.INFO, to_console=False):
     """创建一个写入文件的 logger，可选同时输出到控制台。"""
     logger = logging.getLogger(name)
     logger.setLevel(level)
+    logger.propagate = False
+
+    for handler in list(logger.handlers):
+        logger.removeHandler(handler)
+        handler.close()
 
     formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
     file_handler = logging.FileHandler(logfile)
@@ -64,6 +60,8 @@ class WeightedMSELoss(nn.Module):
 
 def plot_loss_curve(train_loss, val_loss, save_path, val_freq=5, use_log=False):
     """保存训练/验证 loss 曲线，验证 loss 的横轴按 `val_freq` 对齐。"""
+    import matplotlib.pyplot as plt
+
     train_len, val_len = len(train_loss), len(val_loss)
     if train_len > 1:
         plt.figure()
@@ -80,7 +78,7 @@ def plot_loss_curve(train_loss, val_loss, save_path, val_freq=5, use_log=False):
 
 def _should_log_gradient(iteration_count, interval):
     """判断当前 iteration 是否到达指定日志间隔。"""
-    return (iteration_count + 1) % interval == 0
+    return iteration_count % interval == 0
 
 
 def _is_logged_parameter(model, name):
@@ -115,13 +113,6 @@ def log_gradients(epoch, num_epochs, iteration_count, train_loader, model, grad_
             grad_logger.info(summary)
         if should_print_debug:
             print(summary)
-
-
-def print_gradients(model):
-    """直接打印关键参数的数值范围和梯度，用于临时 debug。"""
-    for name, param in model.named_parameters():
-        if _is_logged_parameter(model, name):
-            print(_gradient_summary(name, param))
 
 
 def change_model_location(model, model_path, device):
@@ -426,17 +417,40 @@ def compute_metrics(output, x, masked_flag, t_in):
 
 
 def check_nan_gradients(model: nn.Module):
-    """检查模型参数或梯度中是否存在 NaN/Inf，返回第一个异常位置。"""
+    """检查模型参数或梯度中是否存在 NaN/Inf，返回第一个异常位置和张量统计。"""
+    def _bad_tensor_info(name, kind, tensor):
+        detached = tensor.detach().cpu()
+        finite_mask = torch.isfinite(detached)
+        finite_count = finite_mask.sum().item()
+        total = detached.numel()
+        info = {
+            "name": name,
+            "kind": kind,
+            "shape": tuple(detached.shape),
+            "finite": finite_count,
+            "numel": total,
+            "nan": torch.isnan(detached).sum().item(),
+            "inf": torch.isinf(detached).sum().item(),
+        }
+        if finite_count > 0:
+            finite_values = detached[finite_mask]
+            info.update(
+                {
+                    "min": finite_values.min().item(),
+                    "max": finite_values.max().item(),
+                    "mean": finite_values.mean().item(),
+                }
+            )
+        return info
+
     for name, param in reversed(list(model.named_parameters())):
-        param_detached = param.detach().cpu()
-        if torch.isnan(param_detached).any() or torch.isinf(param_detached).any():
-            return {"name": name, "kind": "parameter"}
+        if not torch.isfinite(param.detach()).all():
+            return _bad_tensor_info(name, "parameter", param)
 
         if param.grad is None:
             continue
-        grad_detached = param.grad.detach().cpu()
-        if torch.isnan(grad_detached).any() or torch.isinf(grad_detached).any():
-            return {"name": name, "kind": "gradient"}
+        if not torch.isfinite(param.grad.detach()).all():
+            return _bad_tensor_info(name, "gradient", param.grad)
     return None
 
 
@@ -487,6 +501,7 @@ def plot_dataframe(df, title="Training Loss Curve"):
     """
     绘制由 `dataframe_from_tensorboard` 得到的 step/value 曲线。
     """
+    import matplotlib.pyplot as plt
 
     plt.figure(figsize=(10, 5))
     plt.plot(df["step"], df["value"])
@@ -495,13 +510,3 @@ def plot_dataframe(df, title="Training Loss Curve"):
     plt.title(title)
     plt.grid(True)
     plt.show()
-
-
-def log_tensorboard():
-    """TensorBoard 写日志的预留入口，目前没有实际实现。"""
-    pass
-
-
-def generate_experiment_name(args: argparse.Namespace, config:dict):
-    """实验命名的预留入口，目前没有实际实现。"""
-    pass

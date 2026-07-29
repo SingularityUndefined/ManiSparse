@@ -356,7 +356,6 @@ def build_admm_info(config):
     return {
         "ADMM_iters": model_config["num_layers"],
         "CG_iters": model_config["CG_iters"],
-        "PGD_iters": model_config["PGD_iters"],
         "mu_u_init": config["ADMM_params"]["mu_u"],
         "mu_d1_init": config["ADMM_params"]["mu_d1"],
         "mu_d2_init": config["ADMM_params"]["mu_d2"],

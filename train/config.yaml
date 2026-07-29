@@ -16,7 +16,6 @@ model:
   num_blocks: 5
   num_layers: 25
   CG_iters: 3
-  PGD_iters: 3
   use_deflation: False
   deflation_samples: 5
   deflation_CG_iters: 3
