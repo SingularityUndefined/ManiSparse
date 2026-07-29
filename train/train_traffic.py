@@ -100,6 +100,92 @@ def _training_location(epoch, num_epochs, iteration_count, train_loader):
     return f"epoch {epoch + 1}/{num_epochs}, iter {iteration_count}/{len(train_loader)}"
 
 
+def _short_log_text(value, limit=180):
+    """Compact long exception text for one-line training logs."""
+    text = str(value).replace("\n", " ").strip()
+    return text if len(text) <= limit else text[: limit - 3] + "..."
+
+
+def _format_glasso_fallback_event(event):
+    """Format one GLASSO fallback/eigensolver event for the training log."""
+    parts = [
+        f"stage={event.get('stage', '-')}",
+        f"block={event.get('block', '-')}",
+        f"source={event.get('theta_source', '-')}",
+        f"cov_shape={event.get('cov_shape', '-')}",
+    ]
+    if "cov_batch_index" in event:
+        parts.append(f"cov_batch_index={event['cov_batch_index']}")
+    if "solver" in event:
+        parts.append(f"solver={event['solver']}")
+    if "backend" in event:
+        parts.append(f"backend={event['backend']}")
+    if "admm_iter" in event:
+        parts.append(f"admm_iter={event['admm_iter']}")
+    if "shift" in event:
+        parts.append(f"shift={float(event['shift']):.3e}")
+    if "retry" in event:
+        parts.append(f"retry={event['retry']}")
+    if "from" in event or "to" in event:
+        parts.append(f"path={event.get('from', '-')}->{event.get('to', '-')}")
+    if "matrix_shape" in event:
+        parts.append(f"matrix_shape={event['matrix_shape']}")
+    if "dtype" in event:
+        parts.append(f"dtype={event['dtype']}")
+    if "device" in event:
+        parts.append(f"device={event['device']}")
+    if "reason" in event:
+        parts.append(f"reason={_short_log_text(event['reason'])}")
+    return ", ".join(parts)
+
+
+def _format_bad_tensor_info(info):
+    """Format the bad parameter/gradient record returned by check_nan_gradients."""
+    if info is None:
+        return "none"
+    parts = [
+        f"{info.get('kind', '-')}: {info.get('name', '-')}",
+        f"shape={info.get('shape', '-')}",
+        f"finite={info.get('finite', '-')}/{info.get('numel', '-')}",
+        f"nan={info.get('nan', '-')}",
+        f"inf={info.get('inf', '-')}",
+    ]
+    if "min" in info:
+        parts.extend(
+            [
+                f"min={info['min']:.6g}",
+                f"max={info['max']:.6g}",
+                f"mean={info['mean']:.6g}",
+            ]
+        )
+    return ", ".join(parts)
+
+
+def _format_glasso_fallback_events(model, max_events=40):
+    """Return readable lines for GLASSO events from the latest model forward."""
+    events = getattr(model, "last_glasso_events", None) or []
+    if not events:
+        return []
+    lines = [f"GLASSO fallback/eigensolver events in latest forward: count={len(events)}"]
+    for event in events[:max_events]:
+        lines.append(_format_glasso_fallback_event(event))
+    if len(events) > max_events:
+        lines.append(f"... {len(events) - max_events} more GLASSO fallback events omitted")
+    return lines
+
+
+def _log_glasso_fallback_events(model, logger, epoch, num_epochs, iteration_count, train_loader):
+    """Write latest-forward GLASSO fallback events to the training logger."""
+    lines = _format_glasso_fallback_events(model)
+    if not lines:
+        return
+    logger.warning(
+        "%s\n%s",
+        f"GLASSO fallback observed at {_training_location(epoch, num_epochs, iteration_count, train_loader)}",
+        "\n".join(lines),
+    )
+
+
 def _raise_training_numerical_error(reason, epoch, num_epochs, iteration_count, train_loader, tensors, logger, extra_lines=None):
     """Log and raise a readable numerical failure message."""
     lines = [
@@ -150,7 +236,7 @@ def _diagnose_bad_backward(model, y, x, t_list, data_normalization, config, loss
             if diag_bad is None:
                 lines.append("Diagnostic backward completed without non-finite parameter gradients.")
             else:
-                lines.append(f"Diagnostic backward ended with bad {diag_bad['kind']}: {diag_bad['name']}")
+                lines.append(f"Diagnostic backward ended with bad tensor: {_format_bad_tensor_info(diag_bad)}")
     except Exception as diagnostic_error:
         lines.append(f"Diagnostic rerun failed at first detected bad operation: {diagnostic_error}")
     finally:
@@ -350,8 +436,10 @@ def train_one_epoch(
                     f"forward_error: {error}",
                     f"mode={args.mode}, normed_loss={config['normed_loss']}, "
                     f"use_one_channel={config['model']['use_one_channel']}",
-                ],
+                ]
+                + _format_glasso_fallback_events(model),
             )
+        _log_glasso_fallback_events(model, logger, epoch, num_epochs, iteration_count, train_loader)
         if iteration_count % 20 == 0:
             theta_stats = collect_theta_nnz_ratios(model)
             tqdm.write(format_theta_nnz_batch(theta_stats, epoch, iteration_count, total_batches))
@@ -406,10 +494,11 @@ def train_one_epoch(
                 ],
                 logger,
                 extra_lines=[
-                    f"first_bad_{nan_info['kind']}: {nan_info['name']}",
+                    f"first_bad_tensor: {_format_bad_tensor_info(nan_info)}",
                     f"mode={args.mode}, normed_loss={config['normed_loss']}, "
                     f"use_one_channel={config['model']['use_one_channel']}",
                 ]
+                + _format_glasso_fallback_events(model)
                 + diagnostic_lines,
             )
 
@@ -430,11 +519,12 @@ def train_one_epoch(
                 ],
                 logger,
                 extra_lines=[
-                    f"first_bad_{nan_info['kind']}: {nan_info['name']}",
+                    f"first_bad_tensor: {_format_bad_tensor_info(nan_info)}",
                     f"mode={args.mode}, normed_loss={config['normed_loss']}, "
                     f"use_one_channel={config['model']['use_one_channel']}",
                     "Bad values appeared after optimizer.step(); optimizer state follows.",
                 ]
+                + _format_glasso_fallback_events(model)
                 + _optimizer_state_health(optimizer),
             )
         if args.loggrad != -1:
@@ -471,8 +561,23 @@ def train_one_epoch(
 
 def evaluate(model, loader, data_normalization, masked_flag, config, device, signal_channels, loss_fn):
     """Run validation/test evaluation and normalize return values across channel modes."""
-    if config["model"]["use_one_channel"]:
-        val_loss, metrics = test(
+    try:
+        if config["model"]["use_one_channel"]:
+            val_loss, metrics = test(
+                model,
+                loader,
+                data_normalization,
+                masked_flag,
+                config,
+                device,
+                signal_channels,
+                mode="val",
+                loss_fn=loss_fn,
+                use_one_channel=True,
+            )
+            return val_loss, metrics, None
+
+        val_loss, metrics, metrics_d = test(
             model,
             loader,
             data_normalization,
@@ -482,23 +587,12 @@ def evaluate(model, loader, data_normalization, masked_flag, config, device, sig
             signal_channels,
             mode="val",
             loss_fn=loss_fn,
-            use_one_channel=True,
+            use_one_channel=False,
         )
-        return val_loss, metrics, None
-
-    val_loss, metrics, metrics_d = test(
-        model,
-        loader,
-        data_normalization,
-        masked_flag,
-        config,
-        device,
-        signal_channels,
-        mode="val",
-        loss_fn=loss_fn,
-        use_one_channel=False,
-    )
-    return val_loss, metrics, metrics_d
+        return val_loss, metrics, metrics_d
+    except Exception as error:
+        context = "\n".join(_format_glasso_fallback_events(model))
+        raise RuntimeError(f"evaluation failed: {error}\n{context}") from error
 
 
 def log_eval_metrics(logger, prefix, epoch_text, loss, metrics, metrics_d, signal_channels):

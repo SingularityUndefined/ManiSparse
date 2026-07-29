@@ -32,6 +32,7 @@ def _single_glasso_estimation(
     dtype,
 ):
     """Estimate one dense precision matrix from one covariance matrix."""
+    events = []
     solver_cov = cov_matrix if allow_backward else cov_matrix.detach()
     solver_cov = 0.5 * (solver_cov + solver_cov.transpose(-1, -2))
     if not torch.isfinite(solver_cov).all():
@@ -71,7 +72,15 @@ def _single_glasso_estimation(
                             eigh_shift_retries=eigh_shift_retries,
                             return_info=True,
                         )
-                return result.precision.to(device=device, dtype=dtype)
+                for event in getattr(result, "eigh_events", []):
+                    events.append(
+                        {
+                            "stage": "admm_eigh_fallback",
+                            "solver": "torch_admm",
+                            **event,
+                        }
+                    )
+                return result.precision.to(device=device, dtype=dtype), events
             except RuntimeError as error:
                 last_error = error
 
@@ -85,8 +94,24 @@ def _single_glasso_estimation(
                 f"Last error: {last_error}",
                 RuntimeWarning,
             )
+            events.append(
+                {
+                    "stage": "solver_fallback",
+                    "from": "torch_admm",
+                    "to": "sklearn",
+                    "reason": str(last_error),
+                }
+            )
             method = "sklearn"
         except ImportError:
+            events.append(
+                {
+                    "stage": "solver_fallback",
+                    "from": "torch_admm",
+                    "to": "sklearn",
+                    "reason": "glasso_pytorch import failed",
+                }
+            )
             method = "sklearn"
 
     if method == "quic":
@@ -98,13 +123,29 @@ def _single_glasso_estimation(
             lam = np.full_like(cov_np, alpha, dtype=np.float64)
             np.fill_diagonal(lam, 0.0)
             precision, _, _, _, _, _ = quic(cov_np, lam, tol=tol, max_iter=max_iter)
-            return torch.tensor(precision, dtype=dtype, device=device)
+            return torch.tensor(precision, dtype=dtype, device=device), events
         except ImportError:
+            events.append(
+                {
+                    "stage": "solver_fallback",
+                    "from": "quic",
+                    "to": "sklearn",
+                    "reason": "inverse_covariance import failed",
+                }
+            )
             method = "sklearn"
         except Exception as error:
             if not fallback:
                 raise
             warnings.warn(f"QUIC graphical lasso failed; falling back to sklearn/ridge precision. Error: {error}", RuntimeWarning)
+            events.append(
+                {
+                    "stage": "solver_fallback",
+                    "from": "quic",
+                    "to": "sklearn",
+                    "reason": str(error),
+                }
+            )
             method = "sklearn"
 
     if method == "sklearn":
@@ -113,12 +154,20 @@ def _single_glasso_estimation(
 
             model = GraphicalLasso(alpha=alpha, max_iter=max_iter, tol=tol)
             model.fit(solver_cov.detach().cpu().numpy())
-            return torch.tensor(model.precision_, dtype=dtype, device=device)
+            return torch.tensor(model.precision_, dtype=dtype, device=device), events
         except Exception as error:
             if not fallback:
                 raise
             warnings.warn(f"sklearn GraphicalLasso failed; using ridge/pinv precision fallback. Error: {error}", RuntimeWarning)
-            return _ridge_precision_fallback(solver_cov, alpha, device, dtype)
+            events.append(
+                {
+                    "stage": "solver_fallback",
+                    "from": "sklearn",
+                    "to": "ridge_pinv",
+                    "reason": str(error),
+                }
+            )
+            return _ridge_precision_fallback(solver_cov, alpha, device, dtype), events
 
     raise ValueError(f"Unknown graphical lasso method: {method}")
 
@@ -154,6 +203,7 @@ def glasso_estimation(
     max_iter=20,
     tol=1e-4,
     allow_backward=False,
+    return_events=False,
 ):
     """
     Estimate the precision matrix (inverse covariance) using Graphical Lasso.
@@ -174,6 +224,8 @@ def glasso_estimation(
         max_iter: Maximum solver iterations. Capped at 20 for this model.
         tol: Solver tolerance.
         allow_backward: If False, Theta estimation is detached from autograd.
+        return_events: If True, also return fallback/eigensolver diagnostic
+            events produced while estimating Theta.
     Returns:
         Dense node precision matrix Theta, shape (N, N), or batched precision
         matrices, shape (B, N, N).
@@ -185,26 +237,28 @@ def glasso_estimation(
     cov_matrix = 0.5 * (cov_matrix + cov_matrix.transpose(-1, -2))
 
     if cov_matrix.ndim == 2:
-        return normalize_theta(
-            _single_glasso_estimation(
-                cov_matrix,
-                alpha,
-                method,
-                rho,
-                eps,
-                eigh_shift,
-                eigh_shift_retries,
-                fallback,
-                max_iter,
-                tol,
-                allow_backward,
-                device,
-                dtype,
-            )
+        theta, events = _single_glasso_estimation(
+            cov_matrix,
+            alpha,
+            method,
+            rho,
+            eps,
+            eigh_shift,
+            eigh_shift_retries,
+            fallback,
+            max_iter,
+            tol,
+            allow_backward,
+            device,
+            dtype,
         )
+        theta = normalize_theta(theta)
+        return (theta, events) if return_events else theta
     if cov_matrix.ndim == 3:
-        theta_list = [
-            _single_glasso_estimation(
+        theta_list = []
+        events = []
+        for i in range(cov_matrix.size(0)):
+            theta_i, events_i = _single_glasso_estimation(
                 cov_matrix[i],
                 alpha,
                 method,
@@ -219,9 +273,13 @@ def glasso_estimation(
                 device,
                 dtype,
             )
-            for i in range(cov_matrix.size(0))
-        ]
-        return normalize_theta(torch.stack(theta_list, dim=0))
+            theta_list.append(theta_i)
+            for event in events_i:
+                event = dict(event)
+                event["cov_batch_index"] = i
+                events.append(event)
+        theta = normalize_theta(torch.stack(theta_list, dim=0))
+        return (theta, events) if return_events else theta
     raise ValueError("cov_matrix must have shape (N, N) or (B, N, N)")
 
 
@@ -291,7 +349,6 @@ DEFAULT_GRAPH_INFO = {
 DEFAULT_ADMM_INFO = {
     "ADMM_iters": 30,
     "CG_iters": 3,
-    "PGD_iters": 3,
     "mu_u_init": 3,
     "mu_d1_init": 3,
     "mu_d2_init": 3,
@@ -392,6 +449,7 @@ class UnrollingModel(nn.Module):
         self.use_deflation = use_deflation
         self.deflation_samples = deflation_samples
         self.last_deflation_multi_x = None
+        self.last_glasso_events = []
         self.debug_numerics = False
         self.debug_context = ""
         self.debug_records = []
@@ -664,6 +722,49 @@ class UnrollingModel(nn.Module):
             else:
                 param.data = torch.clamp(param.data, 0.0, max_value)
 
+    def _record_glasso_events(self, block_idx, source, cov_matrix, events):
+        """Store GLASSO fallback/eigensolver events from the latest forward."""
+        for event in events:
+            event = dict(event)
+            event["block"] = block_idx
+            event["theta_source"] = source
+            event["cov_shape"] = tuple(cov_matrix.shape)
+            self.last_glasso_events.append(event)
+
+    def _estimate_theta_for_block(self, block_idx, source, signal):
+        """Estimate normalized Theta for one unrolled block.
+
+        Args:
+            block_idx: index of the current unrolled block.
+            source: either ``"output"`` for the current reconstructed signal or
+                ``"multi_x"`` for deflation modes from the previous block.
+            signal: ``output`` with shape (B, T, N, C), or ``multi_x`` with
+                shape (B, K, T, N, C).
+
+        Returns:
+            Normalized Theta with shape (N, N) for ``output`` source or
+            (B, N, N) for ``multi_x`` source.
+        """
+        cov_label = "theta_cov_from_multi_x" if source == "multi_x" else "theta_cov"
+        cov_matrix = node_covariance(signal[..., 0:1], unbiased=True)
+        cov_matrix = self._debug_tensor(f"block_{block_idx}.{cov_label}", cov_matrix)
+        theta, glasso_events = glasso_estimation(
+            cov_matrix,
+            alpha=self.glasso_alpha,
+            method=self.glasso_method,
+            rho=self.glasso_rho,
+            eps=self.glasso_eps,
+            eigh_shift=self.glasso_eigh_shift,
+            eigh_shift_retries=self.glasso_eigh_shift_retries,
+            fallback=self.glasso_fallback,
+            max_iter=self.glasso_max_iter,
+            tol=self.glasso_tol,
+            allow_backward=self.glasso_allow_backward,
+            return_events=True,
+        )
+        self._record_glasso_events(block_idx, source, cov_matrix, glasso_events)
+        return self._debug_tensor(f"block_{block_idx}.Theta", theta)
+
     def forward(self, y, t_list, output_graph=False):
         """Run the stacked unrolling model.
 
@@ -691,6 +792,7 @@ class UnrollingModel(nn.Module):
             directed_graph_list = []
             undirected_graph_list = []
         self.last_deflation_multi_x = [] if self.use_deflation else None
+        self.last_glasso_events = []
         multi_x = None  # Used for deflation across blocks.
 
         if self.use_norm:
@@ -763,39 +865,9 @@ class UnrollingModel(nn.Module):
                 # estimation. Theta ablation also disables this branch globally.
                 admm_block.Theta = None
             elif multi_x is None or len(self.last_deflation_multi_x) == 0:
-                cov_matrix = node_covariance(output[..., 0:1], unbiased=True)
-                cov_matrix = self._debug_tensor(f"block_{i}.theta_cov", cov_matrix)
-                admm_block.Theta = glasso_estimation(
-                    cov_matrix,
-                    alpha=self.glasso_alpha,
-                    method=self.glasso_method,
-                    rho=self.glasso_rho,
-                    eps=self.glasso_eps,
-                    eigh_shift=self.glasso_eigh_shift,
-                    eigh_shift_retries=self.glasso_eigh_shift_retries,
-                    fallback=self.glasso_fallback,
-                    max_iter=self.glasso_max_iter,
-                    tol=self.glasso_tol,
-                    allow_backward=self.glasso_allow_backward,
-                )
-                admm_block.Theta = self._debug_tensor(f"block_{i}.Theta", admm_block.Theta)
+                admm_block.Theta = self._estimate_theta_for_block(i, "output", output)
             else:
-                cov_matrix = node_covariance(multi_x[..., 0:1], unbiased=True)
-                cov_matrix = self._debug_tensor(f"block_{i}.theta_cov_from_multi_x", cov_matrix)
-                admm_block.Theta = glasso_estimation(
-                    cov_matrix,
-                    alpha=self.glasso_alpha,
-                    method=self.glasso_method,
-                    rho=self.glasso_rho,
-                    eps=self.glasso_eps,
-                    eigh_shift=self.glasso_eigh_shift,
-                    eigh_shift_retries=self.glasso_eigh_shift_retries,
-                    fallback=self.glasso_fallback,
-                    max_iter=self.glasso_max_iter,
-                    tol=self.glasso_tol,
-                    allow_backward=self.glasso_allow_backward,
-                )
-                admm_block.Theta = self._debug_tensor(f"block_{i}.Theta", admm_block.Theta)
+                admm_block.Theta = self._estimate_theta_for_block(i, "multi_x", multi_x)
 
             try:
                 if self.predict_only:

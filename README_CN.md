@@ -132,13 +132,14 @@ multiQ -> Q_df / Q_i -> exp(...) graph weights -> d_ew -> ADMMBlock -> output ->
 | `simple` | Yes | Yes | Yes | Yes | Yes | No | No | Yes | No | No | Yes |
 | `Theta` | Yes | Yes | Yes | No | Yes | Yes | Yes | Yes | Yes | Yes | No |
 
-`Theta` 消融时，`lambda_theta` 是否存在目前等价于 `ablation!="Theta"`，但代码分支使用显式 ablation 状态，而不是 `hasattr(lambda_theta)`。`UT` 中 `mu_d1` 和 `rho` 仍然会创建，但 forward 路径不会使用有向时间 L1 更新。`PGD_iters` 会从配置读取，但当前 cleaned ADMM forward 路径没有使用。
+`Theta` 消融时，`lambda_theta` 是否存在目前等价于 `ablation!="Theta"`，但代码分支使用显式 ablation 状态，而不是 `hasattr(lambda_theta)`。`UT` 中 `mu_d1` 和 `rho` 仍然会创建，但 forward 路径不会使用有向时间 L1 更新。cleaned ADMM 路径只暴露实际使用的迭代配置：外层 `num_layers`、内层 `CG_iters` 和可选 deflation CG 设置。
 
 训练时每 20 个 batch 会通过 `tqdm.write` 输出一次当前 batch 的每个 block 的 Theta 稀疏度 `nnz / numel`，不会破坏进度条。同一行还会输出每个 block 的 `lambda_theta`；标量直接打印，向量/list 打印 min / median / max。浮点数使用 3 位有效数字的科学计数法。因为 `Theta` 是每个 batch 重新估计的，不是持久模型参数，所以这个稀疏度描述的是最近一次 forward。
 
 `Theta` 进入 ADMM 前会先把负的对角线元素 clamp 到 0，并把归一化分母为 0 的位置设为 0，以避免 NaN/Inf。
 
 `model.glasso_method`、`model.glasso_alpha`、`model.glasso_rho`、`model.glasso_eps`、`model.glasso_eigh_shift`、`model.glasso_eigh_shift_retries` 和 `model.glasso_fallback` 在 `train/config.yaml` 中配置，也可以用命令行临时覆盖。`glasso_alpha` 是所有 Graphical Lasso 后端的正则强度；`glasso_rho` 只传给 `glasso_pytorch` ADMM solver，`quic` 和 `sklearn` 会忽略它。`glasso_eps` 是可选的协方差对角 jitter，默认是 `0.0`，因为它会改变原始 GLASSO 问题。现在默认使用的是只作用在特征值分解求解器上的 shift recovery：如果 ADMM Theta 更新中的 `torch.linalg.eigh(A)` 失败，solver 会尝试 `eigh(A + delta I)`，然后把返回的特征值减回 `delta`。在精确算术下，这不会改变原本的 ADMM 更新。只有这些不改变谱问题的重试仍失败时，`glasso_fallback=True` 才会在原始协方差矩阵上 fallback 到 sklearn/quic；ridge/pinv 只是所有 GLASSO solver 都失败后的最终有限输出保护。
+如果训练中 GLASSO 触发 eigensolver fallback，训练日志会写出 `GLASSO fallback observed`，包括 epoch/batch、block index、Theta 来源、协方差维度、ADMM iteration、backend、shift 数值、retry index，以及 solver 从 ADMM 切到 sklearn/ridge 的路径。
 
 ## 训练和测试
 

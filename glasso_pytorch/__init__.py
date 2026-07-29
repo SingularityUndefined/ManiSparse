@@ -1,5 +1,5 @@
-from dataclasses import dataclass
-from typing import Optional, Tuple, Union
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -17,6 +17,7 @@ class GraphicalLassoResult:
     primal_residual: float
     dual_residual: float
     dual_gap: float
+    eigh_events: List[Dict[str, Any]] = field(default_factory=list)
 
 
 def _as_batch_matrix(emp_cov: torch.Tensor) -> Tuple[torch.Tensor, bool]:
@@ -60,7 +61,7 @@ def _eigh_with_shift_recovery(
     initial_shift: float,
     shift_retries: int,
     cpu_fallback: bool,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> Tuple[torch.Tensor, torch.Tensor, Optional[Dict[str, Any]]]:
     """Run symmetric eigendecomposition with spectrum-preserving fallbacks.
 
     The shift fallback uses eigh(A + delta I), then subtracts delta from the
@@ -68,7 +69,8 @@ def _eigh_with_shift_recovery(
     arithmetic and does not change the ADMM graphical-lasso objective.
     """
     try:
-        return torch.linalg.eigh(matrix)
+        eigvals, eigvecs = torch.linalg.eigh(matrix)
+        return eigvals, eigvecs, None
     except RuntimeError as direct_error:
         last_error = direct_error
 
@@ -80,7 +82,16 @@ def _eigh_with_shift_recovery(
         try:
             cpu_matrix = matrix.detach().to(device="cpu", dtype=torch.float64)
             eigvals, eigvecs = torch.linalg.eigh(cpu_matrix)
-            return eigvals.to(device=matrix.device, dtype=matrix.dtype), eigvecs.to(device=matrix.device, dtype=matrix.dtype)
+            return (
+                eigvals.to(device=matrix.device, dtype=matrix.dtype),
+                eigvecs.to(device=matrix.device, dtype=matrix.dtype),
+                {
+                    "backend": "torch_cpu_float64",
+                    "shift": 0.0,
+                    "retry": 0,
+                    "reason": str(last_error),
+                },
+            )
         except RuntimeError as error:
             last_error = error
 
@@ -91,7 +102,12 @@ def _eigh_with_shift_recovery(
             shifted = matrix + shift * eye
             try:
                 eigvals, eigvecs = torch.linalg.eigh(shifted)
-                return eigvals - shift, eigvecs
+                return eigvals - shift, eigvecs, {
+                    "backend": f"torch_{matrix.device.type}",
+                    "shift": float(shift),
+                    "retry": retry_idx,
+                    "reason": str(last_error),
+                }
             except RuntimeError as error:
                 last_error = error
 
@@ -101,7 +117,12 @@ def _eigh_with_shift_recovery(
                     eigvals, eigvecs = torch.linalg.eigh(cpu_shifted)
                     eigvals = eigvals.to(device=matrix.device, dtype=matrix.dtype) - shift
                     eigvecs = eigvecs.to(device=matrix.device, dtype=matrix.dtype)
-                    return eigvals, eigvecs
+                    return eigvals, eigvecs, {
+                        "backend": "torch_cpu_float64_shifted",
+                        "shift": float(shift),
+                        "retry": retry_idx,
+                        "reason": str(last_error),
+                    }
                 except RuntimeError as error:
                     last_error = error
 
@@ -248,6 +269,7 @@ def graphical_lasso(
     converged = False
     primal_residual = float("inf")
     dual_residual = float("inf")
+    eigh_events: List[Dict[str, Any]] = []
 
     for n_iter in range(1, max_iter + 1):
         z_old = z.clone()
@@ -258,12 +280,19 @@ def graphical_lasso(
         # (d + sqrt(d^2 + 4 rho)) / (2 rho).
         eig_input = rho * (z - u) - cov
         eig_input = 0.5 * (eig_input + eig_input.transpose(-1, -2))
-        eigvals, eigvecs = _eigh_with_shift_recovery(
+        eigvals, eigvecs, eigh_event = _eigh_with_shift_recovery(
             eig_input,
             initial_shift=eigh_shift,
             shift_retries=eigh_shift_retries,
             cpu_fallback=eigh_cpu_fallback,
         )
+        if eigh_event is not None:
+            eigh_event = dict(eigh_event)
+            eigh_event["admm_iter"] = n_iter
+            eigh_event["matrix_shape"] = tuple(eig_input.shape)
+            eigh_event["dtype"] = str(eig_input.dtype)
+            eigh_event["device"] = str(eig_input.device)
+            eigh_events.append(eigh_event)
         theta_eigvals = (eigvals + torch.sqrt(eigvals.square() + 4.0 * rho)) / (2.0 * rho)
         theta = (eigvecs * theta_eigvals.unsqueeze(-2)) @ eigvecs.transpose(-1, -2)
         theta = 0.5 * (theta + theta.transpose(-1, -2))
@@ -310,6 +339,7 @@ def graphical_lasso(
             primal_residual=primal_residual,
             dual_residual=dual_residual,
             dual_gap=float(dual_gap.mean().detach().cpu()),
+            eigh_events=eigh_events,
         )
     return precision
 
