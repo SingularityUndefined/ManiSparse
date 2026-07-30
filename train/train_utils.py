@@ -32,6 +32,72 @@ from utils import WeightedMSELoss, seed_everything, setup_logger
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 
+MODEL_CONFIG_PATHS = {
+    "t_in": ("sequence", "t_in"),
+    "t_out": ("sequence", "t_out"),
+    "use_one_channel": ("sequence", "use_one_channel"),
+    "kNN": ("graph", "kNN"),
+    "theta_method": ("theta", "method"),
+    "theta_kNN": ("theta", "local_kNN"),
+    "interval": ("graph", "interval"),
+    "num_blocks": ("architecture", "num_blocks"),
+    "num_layers": ("architecture", "num_layers"),
+    "CG_iters": ("architecture", "CG_iters"),
+    "num_heads": ("architecture", "num_heads"),
+    "feature_channels": ("architecture", "feature_channels"),
+    "use_extrapolation": ("architecture", "use_extrapolation"),
+    "le_emb": ("architecture", "learnable_embedding"),
+    "use_deflation": ("deflation", "enabled"),
+    "deflation_samples": ("deflation", "samples"),
+    "deflation_CG_iters": ("deflation", "CG_iters"),
+    "deflation_tol": ("deflation", "tol"),
+    "glasso_backend": ("theta", "glasso", "backend"),
+    "glasso_alpha": ("theta", "glasso", "alpha"),
+    "glasso_rho": ("theta", "glasso", "rho"),
+    "glasso_eps": ("theta", "glasso", "eps"),
+    "glasso_eigh_shift": ("theta", "glasso", "eigh_shift"),
+    "glasso_eigh_shift_retries": ("theta", "glasso", "eigh_shift_retries"),
+    "glasso_fallback": ("theta", "glasso", "fallback"),
+    "kalofolias_graph": ("theta", "kalofolias", "graph"),
+    "kalofolias_alpha": ("theta", "kalofolias", "alpha"),
+    "kalofolias_beta": ("theta", "kalofolias", "beta"),
+    "kalofolias_max_iter": ("theta", "kalofolias", "max_iter"),
+    "kalofolias_tol": ("theta", "kalofolias", "tol"),
+    "kalofolias_threshold": ("theta", "kalofolias", "threshold"),
+    "kalofolias_output_mode": ("theta", "kalofolias", "output_mode"),
+    "kalofolias_normalize_distances": ("theta", "kalofolias", "normalize_distances"),
+    "use_stable_graph_learning": ("graph_learning", "use_stable_graph_learning"),
+    "sharedM": ("graph_learning", "sharedM"),
+    "sharedQ": ("graph_learning", "sharedQ"),
+    "diff_interval": ("graph_learning", "diff_interval"),
+}
+
+
+MODEL_DEFAULTS = {
+    "use_deflation": True,
+    "le_emb": True,
+    "use_stable_graph_learning": False,
+    "deflation_samples": 5,
+    "deflation_tol": 1e-6,
+    "theta_method": "glasso",
+    "glasso_backend": "admm",
+    "glasso_alpha": 0.2,
+    "glasso_rho": 1.0,
+    "glasso_eps": 0.0,
+    "glasso_eigh_shift": 1e-6,
+    "glasso_eigh_shift_retries": 4,
+    "glasso_fallback": True,
+    "kalofolias_alpha": 0.3,
+    "kalofolias_beta": 1.0,
+    "kalofolias_graph": "dense",
+    "kalofolias_max_iter": 200,
+    "kalofolias_tol": 1e-4,
+    "kalofolias_threshold": 1e-4,
+    "kalofolias_output_mode": "laplacian",
+    "kalofolias_normalize_distances": True,
+}
+
+
 @dataclass
 class ExperimentNames:
     logs_dir: str
@@ -70,6 +136,54 @@ def load_config(config_path):
         return yaml.safe_load(f)
 
 
+def _nested_get(mapping, path, default=None):
+    """Return a nested config value, falling back to default when absent."""
+    current = mapping
+    for key in path:
+        if not isinstance(current, dict) or key not in current:
+            return default
+        current = current[key]
+    return current
+
+
+def _nested_set(mapping, path, value):
+    """Set a nested config value, creating intermediate dicts as needed."""
+    current = mapping
+    for key in path[:-1]:
+        current = current.setdefault(key, {})
+    current[path[-1]] = value
+
+
+def _flatten_model_config(model_section):
+    """Build the internal flat model config from the grouped YAML section."""
+    flat = {}
+    for flat_key, path in MODEL_CONFIG_PATHS.items():
+        value = _nested_get(model_section, path, None)
+        if value is None and flat_key in model_section:
+            value = model_section[flat_key]
+        if value is not None:
+            flat[flat_key] = value
+    return flat
+
+
+def get_model_config(config):
+    """Return the internal flat model config generated from grouped YAML."""
+    return config.get("_model", _flatten_model_config(config["model"]))
+
+
+def _validate_model_config(model_config):
+    """Validate the grouped model config after defaults and CLI overrides."""
+    if model_config["theta_method"] not in {"glasso", "kalofolias"}:
+        raise ValueError("model.theta.method must be one of: glasso, kalofolias")
+    if model_config["glasso_backend"] not in {"admm", "quic", "sklearn"}:
+        raise ValueError("model.theta.glasso.backend must be one of: admm, quic, sklearn")
+    if model_config["kalofolias_graph"] not in {"dense", "local"}:
+        raise ValueError("model.theta.kalofolias.graph must be one of: dense, local")
+    if model_config["theta_method"] == "kalofolias" and model_config["kalofolias_graph"] == "local":
+        if model_config["theta_kNN"] <= model_config["kNN"]:
+            raise ValueError("model.theta.local_kNN must be larger than model.graph.kNN for local Kalofolias")
+
+
 def _add_bool_override(parser, name, dest, help_text):
     """Add paired boolean flags that leave config unchanged when omitted."""
     group = parser.add_mutually_exclusive_group()
@@ -95,8 +209,9 @@ def parse_args(argv=None):
     parser.add_argument("--batchsize", help="batch size", type=int, required=True)
     parser.add_argument("--mode", help="normalization mode", default="standardize", type=str)
 
-    parser.add_argument("--neighbors", help="temporary override for model.kNN", default=None, type=int)
-    parser.add_argument("--interval", help="temporary override for model.interval", default=None, type=int)
+    parser.add_argument("--neighbors", help="temporary override for model.graph.kNN", default=None, type=int)
+    parser.add_argument("--theta-neighbors", help="temporary override for model.theta.local_kNN", default=None, type=int)
+    parser.add_argument("--interval", help="temporary override for model.graph.interval", default=None, type=int)
     parser.add_argument("--FElayers", help="feature extractor layers", default=1, type=int)
     parser.add_argument("--ablation", help="operator to eliminate in ablation study", default="None", type=str)
 
@@ -109,44 +224,57 @@ def parse_args(argv=None):
     parser.add_argument("--stepsize", help="stepLR stepsize", default=8, type=int)
     parser.add_argument("--gamma", help="stepLR gamma", default=0.2, type=float)
 
-    _add_bool_override(parser, "sharedM", "sharedM", "temporary override for model.sharedM")
-    _add_bool_override(parser, "sharedQ", "sharedQ", "temporary override for model.sharedQ")
-    _add_bool_override(parser, "diff-interval", "diff_interval", "temporary override for model.diff_interval")
+    _add_bool_override(parser, "sharedM", "sharedM", "temporary override for model.graph_learning.sharedM")
+    _add_bool_override(parser, "sharedQ", "sharedQ", "temporary override for model.graph_learning.sharedQ")
+    _add_bool_override(parser, "diff-interval", "diff_interval", "temporary override for model.graph_learning.diff_interval")
     _add_bool_override(
         parser,
         "stable-graph-learning",
         "use_stable_graph_learning",
-        "temporary override for model.use_stable_graph_learning",
+        "temporary override for model.graph_learning.use_stable_graph_learning",
     )
 
     parser.add_argument("--epochs", help="running epochs", default=70, type=int)
     parser.add_argument("--start_epochs", help="start epochs", default=0, type=int)
     parser.add_argument("--loggrad", help="log gradient norms; -1 disables it", default=-1, type=int)
 
-    parser.add_argument("--tout", help="temporary override for model.t_out", default=None, type=int)
+    parser.add_argument("--tout", help="temporary override for model.sequence.t_out", default=None, type=int)
     parser.add_argument("--trunc", dest="trunc", action="store_true")
     parser.set_defaults(trunc=False)
-    parser.add_argument("--le-emb", help="learnable embedding", dest="le_emb", action="store_true")
-    parser.set_defaults(le_emb=False)
-    parser.add_argument("--blocks", help="temporary override for model.num_blocks", default=None, type=int)
-    parser.add_argument("--layers", help="temporary override for model.num_layers", default=None, type=int)
-    parser.add_argument("--CGiters", help="temporary override for model.CG_iters", default=None, type=int)
-    _add_bool_override(parser, "deflation", "deflation", "temporary override for model.use_deflation")
-    parser.add_argument("--deflation-samples", help="temporary override for model.deflation_samples", default=None, type=int)
+    _add_bool_override(parser, "le-emb", "le_emb", "temporary override for model.architecture.learnable_embedding")
+    parser.add_argument("--blocks", help="temporary override for model.architecture.num_blocks", default=None, type=int)
+    parser.add_argument("--layers", help="temporary override for model.architecture.num_layers", default=None, type=int)
+    parser.add_argument("--CGiters", help="temporary override for model.architecture.CG_iters", default=None, type=int)
+    _add_bool_override(parser, "deflation", "deflation", "temporary override for model.deflation.enabled")
+    parser.add_argument("--deflation-samples", help="temporary override for model.deflation.samples", default=None, type=int)
     parser.add_argument(
         "--deflation-CGiters",
-        help="temporary override for model.deflation_CG_iters",
+        help="temporary override for model.deflation.CG_iters",
         default=None,
         type=int,
     )
-    parser.add_argument("--deflation-tol", help="temporary override for model.deflation_tol", default=None, type=float)
-    parser.add_argument("--glasso-method", help="temporary override for model.glasso_method", default=None, type=str)
-    parser.add_argument("--glasso-alpha", help="temporary override for model.glasso_alpha", default=None, type=float)
-    parser.add_argument("--glasso-rho", help="temporary override for model.glasso_rho", default=None, type=float)
-    parser.add_argument("--glasso-eps", help="temporary override for model.glasso_eps", default=None, type=float)
-    parser.add_argument("--glasso-eigh-shift", help="temporary override for model.glasso_eigh_shift", default=None, type=float)
-    parser.add_argument("--glasso-eigh-shift-retries", help="temporary override for model.glasso_eigh_shift_retries", default=None, type=int)
-    _add_bool_override(parser, "glasso-fallback", "glasso_fallback", "temporary override for model.glasso_fallback")
+    parser.add_argument("--deflation-tol", help="temporary override for model.deflation.tol", default=None, type=float)
+    parser.add_argument("--theta-method", help="temporary override for model.theta.method", default=None, type=str, choices=["glasso", "kalofolias"])
+    parser.add_argument("--glasso-backend", help="temporary override for model.theta.glasso.backend", default=None, type=str, choices=["admm", "quic", "sklearn"])
+    parser.add_argument("--glasso-alpha", help="temporary override for model.theta.glasso.alpha", default=None, type=float)
+    parser.add_argument("--glasso-rho", help="temporary override for model.theta.glasso.rho", default=None, type=float)
+    parser.add_argument("--glasso-eps", help="temporary override for model.theta.glasso.eps", default=None, type=float)
+    parser.add_argument("--glasso-eigh-shift", help="temporary override for model.theta.glasso.eigh_shift", default=None, type=float)
+    parser.add_argument("--glasso-eigh-shift-retries", help="temporary override for model.theta.glasso.eigh_shift_retries", default=None, type=int)
+    _add_bool_override(parser, "glasso-fallback", "glasso_fallback", "temporary override for model.theta.glasso.fallback")
+    parser.add_argument("--kalofolias-graph", help="temporary override for model.theta.kalofolias.graph", default=None, type=str, choices=["dense", "local"])
+    parser.add_argument("--kalofolias-alpha", help="temporary override for model.theta.kalofolias.alpha", default=None, type=float)
+    parser.add_argument("--kalofolias-beta", help="temporary override for model.theta.kalofolias.beta", default=None, type=float)
+    parser.add_argument("--kalofolias-max-iter", help="temporary override for model.theta.kalofolias.max_iter", default=None, type=int)
+    parser.add_argument("--kalofolias-tol", help="temporary override for model.theta.kalofolias.tol", default=None, type=float)
+    parser.add_argument("--kalofolias-threshold", help="temporary override for model.theta.kalofolias.threshold", default=None, type=float)
+    parser.add_argument("--kalofolias-output-mode", help="temporary override for model.theta.kalofolias.output_mode", default=None, type=str)
+    _add_bool_override(
+        parser,
+        "kalofolias-normalize-distances",
+        "kalofolias_normalize_distances",
+        "temporary override for model.theta.kalofolias.normalize_distances",
+    )
     parser.add_argument("--stride", help="temporary override for data_stride", default=None, type=int)
     parser.add_argument("--lr", help="temporary override for learning_rate", default=None, type=float)
     parser.add_argument("--predonly", dest="pred_only", action="store_true")
@@ -158,9 +286,10 @@ def parse_args(argv=None):
 
 def apply_args_to_config(config, args):
     """Apply CLI overrides to the loaded config in-place."""
-    model_config = config["model"]
+    model_config = _flatten_model_config(config["model"])
     arg_to_config_key = {
         "neighbors": "kNN",
+        "theta_neighbors": "theta_kNN",
         "interval": "interval",
         "sharedM": "sharedM",
         "sharedQ": "sharedQ",
@@ -170,35 +299,42 @@ def apply_args_to_config(config, args):
         "layers": "num_layers",
         "CGiters": "CG_iters",
         "tout": "t_out",
+        "le_emb": "le_emb",
         "deflation_samples": "deflation_samples",
         "deflation_CGiters": "deflation_CG_iters",
         "deflation_tol": "deflation_tol",
         "deflation": "use_deflation",
-        "glasso_method": "glasso_method",
+        "theta_method": "theta_method",
+        "glasso_backend": "glasso_backend",
         "glasso_alpha": "glasso_alpha",
         "glasso_rho": "glasso_rho",
         "glasso_eps": "glasso_eps",
         "glasso_eigh_shift": "glasso_eigh_shift",
         "glasso_eigh_shift_retries": "glasso_eigh_shift_retries",
         "glasso_fallback": "glasso_fallback",
+        "kalofolias_graph": "kalofolias_graph",
+        "kalofolias_alpha": "kalofolias_alpha",
+        "kalofolias_beta": "kalofolias_beta",
+        "kalofolias_max_iter": "kalofolias_max_iter",
+        "kalofolias_tol": "kalofolias_tol",
+        "kalofolias_threshold": "kalofolias_threshold",
+        "kalofolias_output_mode": "kalofolias_output_mode",
+        "kalofolias_normalize_distances": "kalofolias_normalize_distances",
     }
     for arg_name, config_key in arg_to_config_key.items():
         value = getattr(args, arg_name)
         if value is not None:
             model_config[config_key] = value
+            _nested_set(config["model"], MODEL_CONFIG_PATHS[config_key], value)
 
-    model_config.setdefault("use_deflation", False)
-    model_config.setdefault("use_stable_graph_learning", False)
-    model_config.setdefault("deflation_samples", 5)
+    for key, value in MODEL_DEFAULTS.items():
+        model_config.setdefault(key, value)
+    model_config.setdefault("theta_kNN", model_config["kNN"] + 4)
     model_config.setdefault("deflation_CG_iters", model_config["CG_iters"])
-    model_config.setdefault("deflation_tol", 1e-6)
-    model_config.setdefault("glasso_method", "admm")
-    model_config.setdefault("glasso_alpha", 0.2)
-    model_config.setdefault("glasso_rho", 1.0)
-    model_config.setdefault("glasso_eps", 0.0)
-    model_config.setdefault("glasso_eigh_shift", 1e-6)
-    model_config.setdefault("glasso_eigh_shift_retries", 4)
-    model_config.setdefault("glasso_fallback", True)
+    _validate_model_config(model_config)
+    for key, value in model_config.items():
+        _nested_set(config["model"], MODEL_CONFIG_PATHS[key], value)
+    config["_model"] = model_config
 
     if args.stride is not None:
         config["data_stride"] = args.stride
@@ -218,13 +354,14 @@ def prepare_runtime(args):
 def build_loss_fn(config):
     """Build the loss function specified by `config['loss_function']`."""
     loss_name = config["loss_function"]
+    model_config = get_model_config(config)
     if loss_name == "MSE":
         return nn.MSELoss()
     if loss_name == "Huber":
         return nn.HuberLoss(delta=1)
     if loss_name == "Mix":
-        t_in = config["model"]["t_in"]
-        return WeightedMSELoss(t_in, t_in + config["model"]["t_out"])
+        t_in = model_config["t_in"]
+        return WeightedMSELoss(t_in, t_in + model_config["t_out"])
     raise ValueError("config['loss_function'] should be one of: MSE, Huber, Mix")
 
 
@@ -240,41 +377,53 @@ def resolve_dataset_dir(dataset_name, base_dir="../TS_datasets/"):
 
 def build_experiment_names(config, args):
     """Create log/model directory names without touching the filesystem."""
-    logs_dir = "logs_learnable_emb" if args.le_emb else "dense_logs_new"
     learning_rate = config["learning_rate"]
-    experiment_dir = f"lr_{learning_rate:.0e}_seed_{args.seed}"
+    model_config = get_model_config(config)
+    logs_dir = "logs_learnable_emb" if model_config["le_emb"] else "dense_logs_new"
 
     dataset_name = args.dataset
-    num_blocks = config["model"]["num_blocks"]
-    num_layers = config["model"]["num_layers"]
-    num_heads = config["model"]["num_heads"]
-    interval = config["model"]["interval"]
-    feature_channels = config["model"]["feature_channels"]
+    theta_method = model_config.get("theta_method", "glasso")
+    theta_family = theta_method
+    if theta_method == "kalofolias":
+        theta_family = f"kalofolias_{model_config['kalofolias_graph']}"
+    elif theta_method == "glasso":
+        theta_family = f"glasso_{model_config['glasso_backend']}"
+    lr_seed_dir = f"lr_{learning_rate:.0e}_seed_{args.seed}"
+    num_blocks = model_config["num_blocks"]
+    num_layers = model_config["num_layers"]
+    num_heads = model_config["num_heads"]
+    interval = model_config["interval"]
+    feature_channels = model_config["feature_channels"]
     loss_name = config["loss_function"]
 
-    name = f"{dataset_name}_s{config['data_stride']}_{num_blocks}b{num_layers}_{num_heads}h_{feature_channels}f_{args.FElayers}FE"
+    name = (
+        f"s{config['data_stride']}_{num_blocks}b{num_layers}_{num_heads}h_"
+        f"{feature_channels}f_{args.FElayers}FE_"
+        f"k{model_config['kNN']}_thetaK{model_config['theta_kNN']}_int{interval}"
+    )
     if args.pred_only:
         name = "predOnly_" + name
-    if config["model"].get("use_deflation", False):
-        name = f"deflate{config['model']['deflation_samples']}_" + name
+    if model_config.get("use_deflation", False):
+        name = f"deflate{model_config['deflation_samples']}_" + name
     if args.trunc:
         name = "trunc_" + name
     if args.ablation != "None":
         name = f"wo_{args.ablation}_" + name
-    if not config["model"]["use_extrapolation"]:
+    if not model_config["use_extrapolation"]:
         name = "LR_" + name
-    if not config["model"]["use_one_channel"]:
+    if not model_config["use_one_channel"]:
         name = "AllChannel_" + name
-    if config["model"]["sharedM"]:
+    if model_config["sharedM"]:
         name = "shareM_" + name
-    if config["model"]["sharedQ"]:
+    if model_config["sharedQ"]:
         name = "shareQ_" + name
-    if config["model"]["diff_interval"]:
+    if model_config["diff_interval"]:
         name = "diffV_" + name
     name += "_normed_loss" if config["normed_loss"] else "_true_loss"
 
+    experiment_dir = os.path.join(theta_family, dataset_name, lr_seed_dir)
     experiment_name = os.path.join(experiment_dir, name)
-    log_filename = f"nn_{config['model']['kNN']}_int_{interval}_{loss_name}.log"
+    log_filename = f"{loss_name}.log"
     return ExperimentNames(logs_dir, experiment_dir, experiment_name, log_filename)
 
 
@@ -313,9 +462,10 @@ def create_loggers(paths, names, args):
 
 def create_data(config, args, device):
     """Load train/val/test splits and create the normalization object."""
+    model_config = get_model_config(config)
     dataset_dir = resolve_dataset_dir(args.dataset)
-    T = config["model"]["t_in"] + config["model"]["t_out"]
-    t_in = config["model"]["t_in"]
+    T = model_config["t_in"] + model_config["t_out"]
+    t_in = model_config["t_in"]
     stride = config["data_stride"]
     return_time = True
 
@@ -329,7 +479,7 @@ def create_data(config, args, device):
             args.batchsize,
             config["num_workers"],
             return_time,
-            use_one_channel=config["model"]["use_one_channel"],
+            use_one_channel=model_config["use_one_channel"],
             truncated=args.trunc,
         )
     else:
@@ -342,7 +492,7 @@ def create_data(config, args, device):
             args.batchsize,
             config["num_workers"],
             return_time,
-            use_one_channel=config["model"]["use_one_channel"],
+            use_one_channel=model_config["use_one_channel"],
         )
 
     train_set = datasets_and_loaders[0]
@@ -352,7 +502,7 @@ def create_data(config, args, device):
 
 def build_admm_info(config):
     """Collect ADMM hyperparameters in the format expected by `UnrollingModel`."""
-    model_config = config["model"]
+    model_config = get_model_config(config)
     return {
         "ADMM_iters": model_config["num_layers"],
         "CG_iters": model_config["CG_iters"],
@@ -368,43 +518,54 @@ def build_admm_info(config):
 
 def create_model(config, args, train_set, device):
     """Build `UnrollingModel` from config, CLI overrides, and dataset graph info."""
-    T = config["model"]["t_in"] + config["model"]["t_out"]
-    t_in = config["model"]["t_in"]
+    model_config = get_model_config(config)
+    T = model_config["t_in"] + model_config["t_out"]
+    t_in = model_config["t_in"]
     admm_info = build_admm_info(config)
 
     model = UnrollingModel(
-        config["model"]["num_blocks"],
+        model_config["num_blocks"],
         device,
         T,
         t_in,
-        config["model"]["num_heads"],
-        config["model"]["interval"],
+        model_config["num_heads"],
+        model_config["interval"],
         train_set.signal_channel,
-        config["model"]["feature_channels"],
+        model_config["feature_channels"],
         GNN_layers=2,
         graph_info=train_set.graph_info,
         ADMM_info=admm_info,
-        k_hop=config["model"]["kNN"],
+        k_hop=model_config["kNN"],
+        theta_k_hop=model_config["theta_kNN"],
         ablation=args.ablation,
         st_emb_info=config["st_emb_info"],
-        use_extrapolation=config["model"]["use_extrapolation"],
+        use_extrapolation=model_config["use_extrapolation"],
         extrapolation_agg_layers=args.FElayers,
-        use_one_channel=config["model"]["use_one_channel"],
-        sharedM=config["model"]["sharedM"],
-        sharedQ=config["model"]["sharedQ"],
-        diff_interval=config["model"]["diff_interval"],
-        use_stable_graph_learning=config["model"]["use_stable_graph_learning"],
+        use_one_channel=model_config["use_one_channel"],
+        sharedM=model_config["sharedM"],
+        sharedQ=model_config["sharedQ"],
+        diff_interval=model_config["diff_interval"],
+        use_stable_graph_learning=model_config["use_stable_graph_learning"],
         predict_only=args.pred_only,
-        le_emb=args.le_emb,
-        use_deflation=config["model"].get("use_deflation", False),
-        deflation_samples=config["model"]["deflation_samples"],
-        glasso_method=config["model"]["glasso_method"],
-        glasso_alpha=config["model"]["glasso_alpha"],
-        glasso_rho=config["model"]["glasso_rho"],
-        glasso_eps=config["model"]["glasso_eps"],
-        glasso_eigh_shift=config["model"]["glasso_eigh_shift"],
-        glasso_eigh_shift_retries=config["model"]["glasso_eigh_shift_retries"],
-        glasso_fallback=config["model"]["glasso_fallback"],
+        le_emb=model_config["le_emb"],
+        use_deflation=model_config.get("use_deflation", False),
+        deflation_samples=model_config["deflation_samples"],
+        theta_method=model_config["theta_method"],
+        glasso_backend=model_config["glasso_backend"],
+        glasso_alpha=model_config["glasso_alpha"],
+        glasso_rho=model_config["glasso_rho"],
+        glasso_eps=model_config["glasso_eps"],
+        glasso_eigh_shift=model_config["glasso_eigh_shift"],
+        glasso_eigh_shift_retries=model_config["glasso_eigh_shift_retries"],
+        glasso_fallback=model_config["glasso_fallback"],
+        kalofolias_alpha=model_config["kalofolias_alpha"],
+        kalofolias_beta=model_config["kalofolias_beta"],
+        kalofolias_graph=model_config["kalofolias_graph"],
+        kalofolias_max_iter=model_config["kalofolias_max_iter"],
+        kalofolias_tol=model_config["kalofolias_tol"],
+        kalofolias_threshold=model_config["kalofolias_threshold"],
+        kalofolias_output_mode=model_config["kalofolias_output_mode"],
+        kalofolias_normalize_distances=model_config["kalofolias_normalize_distances"],
     ).to(device)
     return model, admm_info
 
@@ -432,15 +593,24 @@ def create_optimizer_and_scheduler(config, args, model):
     return optimizer, scheduler
 
 
-def collect_theta_nnz_ratios(model):
-    """Return per-block Theta sparsity ratios for the current forward state.
+def collect_theta_support_deltas(model):
+    """Return per-block Theta support changes against the original kNN graph.
 
     Theta is estimated inside `UnrollingModel.forward`, so these values describe
-    the most recent batch that passed through the model.  A `None` Theta means
-    the branch was skipped, for example when `ablation="Theta"`.
+    the most recent batch that passed through the model.  Block 0 is skipped
+    because the first unrolled block intentionally does not receive Theta.
+    A `None` Theta means the branch was skipped, for example when
+    `ablation="Theta"`.
+
+    For local Kalofolias, the comparison is row-local and directed:
+        baseline support: model.nearest_nodes[:, 1:] with shape (N, kNN)
+        learned support: Theta over theta_neighbor_list, shape (N, theta.local_kNN)
+    The reported values are average added and removed edges per node.
     """
     stats = []
     for block_idx, block in enumerate(model.model_blocks):
+        if block_idx == 0:
+            continue
         admm_block = block["ADMM_block"]
         theta = getattr(admm_block, "Theta", None)
         lambda_theta = _summarize_lambda_theta(getattr(admm_block, "lambda_theta", None))
@@ -452,6 +622,7 @@ def collect_theta_nnz_ratios(model):
                     "nnz": 0,
                     "numel": 0,
                     "shape": None,
+                    "support_delta": None,
                     "lambda_theta": lambda_theta,
                 }
             )
@@ -460,6 +631,7 @@ def collect_theta_nnz_ratios(model):
         theta = torch.as_tensor(theta).detach()
         nnz = torch.count_nonzero(theta).item()
         numel = theta.numel()
+        support_delta = _theta_support_delta_against_knn(model, admm_block, theta)
         stats.append(
             {
                 "block_idx": block_idx,
@@ -467,10 +639,88 @@ def collect_theta_nnz_ratios(model):
                 "nnz": nnz,
                 "numel": numel,
                 "shape": tuple(theta.shape),
+                "support_delta": support_delta,
                 "lambda_theta": lambda_theta,
             }
         )
     return stats
+
+
+def _knn_baseline_mask(model, candidate_nodes, device):
+    """Return mask showing which candidate slots are in the original kNN graph."""
+    base_neighbors = torch.as_tensor(model.nearest_nodes[:, 1:], device=device, dtype=torch.long)
+    candidate_nodes = torch.as_tensor(candidate_nodes, device=device, dtype=torch.long)
+    if candidate_nodes.ndim != 2:
+        raise ValueError("candidate_nodes must have shape (N, K_candidate)")
+    valid_base = base_neighbors >= 0
+    return ((candidate_nodes.unsqueeze(-1) == base_neighbors.unsqueeze(1)) & valid_base.unsqueeze(1)).any(dim=-1)
+
+
+def _theta_support_delta_against_knn(model, admm_block, theta):
+    """Compare learned Theta support to the original kNN support.
+
+    Returns average per-node support changes:
+        added_per_node: learned Theta edges outside the original kNN list.
+        removed_per_node: original kNN edges missing from learned Theta.
+    """
+    device = theta.device
+    uses_local_kalofolias = (
+        getattr(model, "theta_method", "").lower() == "kalofolias"
+        and getattr(model, "kalofolias_graph", "").lower() == "local"
+    )
+    threshold = getattr(model, "kalofolias_threshold", 0.0) if uses_local_kalofolias else 0.0
+    base_neighbors = torch.as_tensor(model.nearest_nodes[:, 1:], device=device, dtype=torch.long)
+    original_baseline_count = (base_neighbors >= 0).sum(dim=-1).to(torch.float32).unsqueeze(0)
+
+    if getattr(admm_block, "theta_neighbor_list", None) is not None and theta.ndim in (2, 3):
+        candidate_nodes = torch.as_tensor(admm_block.theta_neighbor_list, device=device, dtype=torch.long)
+        baseline_mask = _knn_baseline_mask(model, candidate_nodes, device)
+        learned_support = torch.abs(theta) > threshold
+        if learned_support.ndim == 2:
+            learned_support = learned_support.unsqueeze(0)
+
+        baseline_mask_batched = baseline_mask.unsqueeze(0).expand(learned_support.size(0), -1, -1)
+        added_per_node = torch.logical_and(learned_support, ~baseline_mask_batched).sum(dim=-1).to(torch.float32)
+        learned_base_count = torch.logical_and(learned_support, baseline_mask_batched).sum(dim=-1).to(torch.float32)
+        removed_per_node = (original_baseline_count - learned_base_count).clamp_min(0.0)
+        learned_per_node = learned_support.sum(dim=-1).to(torch.float32)
+
+        return {
+            "kind": "local",
+            "threshold": float(threshold),
+            "baseline_edges_per_node": float(original_baseline_count.mean().detach().cpu()),
+            "learned_edges_per_node": float(learned_per_node.mean().detach().cpu()),
+            "added_per_node": float(added_per_node.mean().detach().cpu()),
+            "removed_per_node": float(removed_per_node.mean().detach().cpu()),
+        }
+
+    if theta.ndim in (2, 3):
+        n_nodes = theta.size(-1)
+        candidate_nodes = torch.arange(n_nodes, device=device).repeat(n_nodes, 1)
+        baseline_mask = _knn_baseline_mask(model, candidate_nodes, device)
+        self_mask = torch.eye(n_nodes, device=device, dtype=torch.bool)
+        baseline_mask = torch.logical_and(baseline_mask, ~self_mask)
+        learned_support = torch.abs(theta) > threshold
+        if learned_support.ndim == 2:
+            learned_support = learned_support.unsqueeze(0)
+        learned_support = torch.logical_and(learned_support, ~self_mask.unsqueeze(0))
+
+        baseline_mask_batched = baseline_mask.unsqueeze(0).expand(learned_support.size(0), -1, -1)
+        added_per_node = torch.logical_and(learned_support, ~baseline_mask_batched).sum(dim=-1).to(torch.float32)
+        learned_base_count = torch.logical_and(learned_support, baseline_mask_batched).sum(dim=-1).to(torch.float32)
+        removed_per_node = (original_baseline_count - learned_base_count).clamp_min(0.0)
+        learned_per_node = learned_support.sum(dim=-1).to(torch.float32)
+
+        return {
+            "kind": "dense",
+            "threshold": float(threshold),
+            "baseline_edges_per_node": float(original_baseline_count.mean().detach().cpu()),
+            "learned_edges_per_node": float(learned_per_node.mean().detach().cpu()),
+            "added_per_node": float(added_per_node.mean().detach().cpu()),
+            "removed_per_node": float(removed_per_node.mean().detach().cpu()),
+        }
+
+    return {"kind": "unsupported"}
 
 
 def _summarize_lambda_theta(lambda_theta):
@@ -505,19 +755,18 @@ def _format_lambda_theta(lambda_stats):
     if kind == "empty":
         return "empty"
     if kind == "scalar":
-        return f"{lambda_stats['value']:.3e}"
+        return f"{lambda_stats['value']:.4f}"
     if kind == "nonfinite":
         return f"nonfinite(numel={lambda_stats['numel']})"
     return (
-        f"min={lambda_stats['min']:.3e}, "
-        f"median={lambda_stats['median']:.3e}, "
-        f"max={lambda_stats['max']:.3e}"
+        f"[{lambda_stats['min']:.4f}, {lambda_stats['max']:.4f}], "
+        f"median={lambda_stats['median']:.4f}"
     )
 
 
-def format_theta_nnz_batch(theta_stats, epoch, iteration_count, total_batches):
-    """Format current-batch per-block Theta sparsity for tqdm-safe training output."""
-    prefix = f"Theta nnz ratios [epoch {epoch + 1}, batch {iteration_count}/{total_batches}]"
+def format_theta_support_batch(theta_stats, epoch, iteration_count, total_batches):
+    """Format current-batch Theta support changes for tqdm-safe training output."""
+    prefix = f"Theta support delta [epoch {epoch + 1}, batch {iteration_count}/{total_batches}]"
     if not theta_stats:
         return f"{prefix}: no ADMM blocks"
 
@@ -528,8 +777,19 @@ def format_theta_nnz_batch(theta_stats, epoch, iteration_count, total_batches):
         if stat["ratio"] is None:
             parts.append(f"{block_name}=skipped, lambda_theta={lambda_text}")
             continue
+        support_delta = stat.get("support_delta")
+        if support_delta is not None and support_delta.get("kind") in {"local", "dense"}:
+            parts.append(
+                f"{block_name}=+{support_delta['added_per_node']:.2f}/node, "
+                f"-{support_delta['removed_per_node']:.2f}/node "
+                f"(learned={support_delta['learned_edges_per_node']:.2f}/node, "
+                f"base={support_delta['baseline_edges_per_node']:.2f}/node, "
+                f"kind={support_delta['kind']}, shape={stat['shape']}), "
+                f"lambda_theta={lambda_text}"
+            )
+            continue
         parts.append(
-            f"{block_name}={stat['ratio']:.3e} "
+            f"{block_name}=support_delta_unavailable "
             f"({stat['nnz']}/{stat['numel']}, shape={stat['shape']}), "
             f"lambda_theta={lambda_text}"
         )
@@ -538,11 +798,23 @@ def format_theta_nnz_batch(theta_stats, epoch, iteration_count, total_batches):
 
 def _log_nested_config(logger, config):
     """Write the effective config after CLI overrides are applied."""
+    def _log_mapping(prefix, mapping):
+        for key, value in mapping.items():
+            if str(key).startswith("_"):
+                continue
+            path = f"{prefix}.{key}" if prefix else str(key)
+            if isinstance(value, dict):
+                logger.info("\t%s:", path)
+                _log_mapping(path, value)
+            else:
+                logger.info("\t%s: %s", path, value)
+
     for key, value in config.items():
+        if key.startswith("_"):
+            continue
         if isinstance(value, dict):
             logger.info("\t%s:", key)
-            for k, v in value.items():
-                logger.info("\t\t%s: %s", k, v)
+            _log_mapping(str(key), value)
         else:
             logger.info("\t%s: %s", key, value)
 
@@ -551,6 +823,7 @@ def _log_cli_arguments(logger, args):
     """Write runtime args and only the CLI overrides that were actually used."""
     config_override_args = {
         "neighbors",
+        "theta_neighbors",
         "interval",
         "sharedM",
         "sharedQ",
@@ -560,17 +833,27 @@ def _log_cli_arguments(logger, args):
         "layers",
         "CGiters",
         "tout",
+        "le_emb",
         "deflation",
         "deflation_samples",
         "deflation_CGiters",
         "deflation_tol",
-        "glasso_method",
+        "theta_method",
+        "glasso_backend",
         "glasso_alpha",
         "glasso_rho",
         "glasso_eps",
         "glasso_eigh_shift",
         "glasso_eigh_shift_retries",
         "glasso_fallback",
+        "kalofolias_graph",
+        "kalofolias_alpha",
+        "kalofolias_beta",
+        "kalofolias_max_iter",
+        "kalofolias_tol",
+        "kalofolias_threshold",
+        "kalofolias_output_mode",
+        "kalofolias_normalize_distances",
         "stride",
         "lr",
     }
@@ -583,13 +866,22 @@ def _log_cli_arguments(logger, args):
 
 def _log_effective_model_flags(logger, config, model):
     """Log key effective flags, including what reached GraphLearningModule."""
-    model_config = config["model"]
+    model_config = get_model_config(config)
     logger.info(
         "Effective graph flags from config: sharedM=%s, sharedQ=%s, diff_interval=%s, use_stable_graph_learning=%s",
         model_config["sharedM"],
         model_config["sharedQ"],
         model_config["diff_interval"],
         model_config["use_stable_graph_learning"],
+    )
+    logger.info(
+        "Effective Theta graph settings: theta_method=%s, glasso_backend=%s, kalofolias_graph=%s, kNN=%s, theta_local_kNN=%s, kalofolias_output_mode=%s",
+        model_config["theta_method"],
+        model_config["glasso_backend"],
+        model_config["kalofolias_graph"],
+        model_config["kNN"],
+        model_config["theta_kNN"],
+        model_config["kalofolias_output_mode"],
     )
     if len(model.model_blocks) == 0:
         return
@@ -615,12 +907,13 @@ def log_run_header(logger, args, config, model, train_set, signal_channels, admm
     _log_nested_config(logger, config)
 
     total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    model_config = get_model_config(config)
     logger.info("~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~")
     logger.info("MODEL SUMMARY:")
     logger.info("pretrained path: %s", model_pretrained_path)
-    logger.info("feature channels: %d", config["model"]["feature_channels"])
+    logger.info("feature channels: %d", model_config["feature_channels"])
     logger.info("Total parameters: %d", total_params)
-    logger.info("ADMM blocks: %d", config["model"]["num_blocks"])
+    logger.info("ADMM blocks: %d", model_config["num_blocks"])
     logger.info("ADMM info: %s", admm_info)
     _log_effective_model_flags(logger, config, model)
     logger.info(

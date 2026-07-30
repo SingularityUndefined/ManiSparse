@@ -9,32 +9,63 @@ normed_loss: False
 data_stride: 3
 
 model:
-  t_in: 12
-  t_out: 12
-  kNN: 6
-  interval: 6
-  num_blocks: 5
-  num_layers: 25
-  CG_iters: 3
-  use_deflation: False
-  deflation_samples: 5
-  deflation_CG_iters: 3
-  deflation_tol: 1.0e-6
-  glasso_method: admm
-  glasso_alpha: 0.2
-  glasso_rho: 2.0
-  glasso_eps: 0.0
-  glasso_eigh_shift: 1.0e-6
-  glasso_eigh_shift_retries: 4
-  glasso_fallback: True
-  num_heads: 4
-  feature_channels: 6
-  use_extrapolation: True
-  use_one_channel: True
-  use_stable_graph_learning: True
-  sharedM: False
-  sharedQ: True
-  diff_interval: True
+  sequence:
+    t_in: 12
+    t_out: 12
+    use_one_channel: True
+
+  graph:
+    kNN: 6
+    interval: 6
+
+  architecture:
+    num_blocks: 5
+    num_layers: 25
+    CG_iters: 3
+    num_heads: 4
+    feature_channels: 6
+    use_extrapolation: True
+    learnable_embedding: True
+
+  deflation:
+    enabled: True
+    samples: 5
+    CG_iters: 3
+    tol: 1.0e-6
+
+  theta:
+    # method: glasso or kalofolias
+    method: glasso
+    # Candidate neighbor count used only when method=kalofolias and kalofolias.graph=local.
+    # Default convention is graph.kNN + 4; with graph.kNN=6 this is 10.
+    local_kNN: 10
+
+    glasso:
+      # backend: admm, quic, or sklearn
+      backend: admm
+      alpha: 0.2
+      rho: 2.0
+      eps: 0.0
+      eigh_shift: 1.0e-6
+      eigh_shift_retries: 4
+      fallback: True
+
+    kalofolias:
+      # graph: dense or local
+      graph: dense
+      alpha: 0.3
+      beta: 1.0
+      max_iter: 200
+      tol: 1.0e-4
+      threshold: 1.0e-4
+      output_mode: laplacian
+      normalize_distances: True
+
+  graph_learning:
+    use_stable_graph_learning: True
+    sharedM: False
+    sharedQ: True
+    diff_interval: True
 
 ADMM_params:
   mu_u: 2

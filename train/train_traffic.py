@@ -20,14 +20,15 @@ from train.train_utils import (
     apply_args_to_config,
     build_experiment_names,
     build_loss_fn,
-    collect_theta_nnz_ratios,
+    collect_theta_support_deltas,
     create_data,
     create_loggers,
     create_model,
     create_optimizer_and_scheduler,
     create_training_paths,
     create_writer,
-    format_theta_nnz_batch,
+    format_theta_support_batch,
+    get_model_config,
     log_run_header,
     parse_args,
     prepare_runtime,
@@ -262,8 +263,9 @@ def _optimizer_state_health(optimizer, max_lines=40):
 
 def _train_forward(model, y, x, t_list, data_normalization, config, loss_fn, masked_flag, args):
     """Normalize one training batch, run the model, recover output, and compute loss."""
-    t_in = config["model"]["t_in"]
-    use_one_channel = config["model"]["use_one_channel"]
+    model_config = get_model_config(config)
+    t_in = model_config["t_in"]
+    use_one_channel = model_config["use_one_channel"]
 
     normed_y = data_normalization.normalize_data(y)
     normed_x = data_normalization.normalize_data(x, use_one_channel)
@@ -352,7 +354,7 @@ def _maybe_write_tensorboard(writer, model, output, x, loss, rmse_per_time, loss
 def _handle_training_value_error(error, model, test_loader, data_normalization, config, device, signal_channels, logger, train_loss_list, val_loss_list, plot_path):
     """Save current loss curve, run a final test pass, then re-raise the training error."""
     plot_loss_curve(train_loss_list, val_loss_list, plot_path)
-    use_one_channel = config["model"]["use_one_channel"]
+    use_one_channel = get_model_config(config)["use_one_channel"]
     try:
         if use_one_channel:
             metrics = test(model, test_loader, data_normalization, False, config, device, signal_channels, use_one_channel=True)
@@ -401,8 +403,9 @@ def train_one_epoch(
 ):
     """Run one training epoch and return epoch-level metrics."""
     model.train()
-    T = config["model"]["t_in"] + config["model"]["t_out"]
-    t_in = config["model"]["t_in"]
+    model_config = get_model_config(config)
+    T = model_config["t_in"] + model_config["t_out"]
+    t_in = model_config["t_in"]
     rmse_per_time = torch.zeros((T,))
     loss_acc = 0.0
     metric_sums = _empty_train_metrics()
@@ -435,14 +438,14 @@ def train_one_epoch(
                 extra_lines=[
                     f"forward_error: {error}",
                     f"mode={args.mode}, normed_loss={config['normed_loss']}, "
-                    f"use_one_channel={config['model']['use_one_channel']}",
+                    f"use_one_channel={model_config['use_one_channel']}",
                 ]
                 + _format_glasso_fallback_events(model),
             )
         _log_glasso_fallback_events(model, logger, epoch, num_epochs, iteration_count, train_loader)
         if iteration_count % 20 == 0:
-            theta_stats = collect_theta_nnz_ratios(model)
-            tqdm.write(format_theta_nnz_batch(theta_stats, epoch, iteration_count, total_batches))
+            theta_stats = collect_theta_support_deltas(model)
+            tqdm.write(format_theta_support_batch(theta_stats, epoch, iteration_count, total_batches))
 
         if not torch.isfinite(loss).all():
             _raise_training_numerical_error(
@@ -460,7 +463,7 @@ def train_one_epoch(
                 logger,
                 extra_lines=[
                     f"mode={args.mode}, normed_loss={config['normed_loss']}, "
-                    f"use_one_channel={config['model']['use_one_channel']}"
+                    f"use_one_channel={model_config['use_one_channel']}"
                 ],
             )
 
@@ -496,7 +499,7 @@ def train_one_epoch(
                 extra_lines=[
                     f"first_bad_tensor: {_format_bad_tensor_info(nan_info)}",
                     f"mode={args.mode}, normed_loss={config['normed_loss']}, "
-                    f"use_one_channel={config['model']['use_one_channel']}",
+                    f"use_one_channel={model_config['use_one_channel']}",
                 ]
                 + _format_glasso_fallback_events(model)
                 + diagnostic_lines,
@@ -521,7 +524,7 @@ def train_one_epoch(
                 extra_lines=[
                     f"first_bad_tensor: {_format_bad_tensor_info(nan_info)}",
                     f"mode={args.mode}, normed_loss={config['normed_loss']}, "
-                    f"use_one_channel={config['model']['use_one_channel']}",
+                    f"use_one_channel={model_config['use_one_channel']}",
                     "Bad values appeared after optimizer.step(); optimizer state follows.",
                 ]
                 + _format_glasso_fallback_events(model)
@@ -562,7 +565,7 @@ def train_one_epoch(
 def evaluate(model, loader, data_normalization, masked_flag, config, device, signal_channels, loss_fn):
     """Run validation/test evaluation and normalize return values across channel modes."""
     try:
-        if config["model"]["use_one_channel"]:
+        if get_model_config(config)["use_one_channel"]:
             val_loss, metrics = test(
                 model,
                 loader,
