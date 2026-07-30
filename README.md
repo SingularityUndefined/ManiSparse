@@ -66,9 +66,9 @@ If spatial-temporal embedding is enabled, `SpatialTemporalEmbedding(t_list)` is 
 | 1. Build graph-learning input | `output_emb = concat(output, shared_output_emb)` when ST embedding is enabled; otherwise `output_emb = output`. | `output_emb` keeps batch/time/node axes `(B, T, N, *)`. |
 | 2. Extract features | `features = FeatureExtractor(output_emb)`. | `features: (B, T, N, H, F)`, where `H=num_heads` and `F=feature_channels`. |
 | 3. Learn graph weights | `u_ew, d_ew = GraphLearningModule(features)`. | `u_ew: (B, T, N, K, H)` for spatial neighbors; `d_ew: (B, T - 1, interval, N, H)` for temporal directed edges. These are assigned to the current `ADMMBlock`. |
-| 4. Estimate Theta | For block `0` or `ablation="Theta"`, set `Theta=None`. Otherwise compute centered node covariance from `output[..., 0:1]`, or from the previous deflated `multi_x[..., 0:1]` when available, then call `glasso_estimation` and `normalize_theta`. | Plain covariance gives `Theta: (N, N)`; deflated covariance gives batched `Theta: (B, N, N)`. |
+| 4. Estimate Theta | For block `0` or `ablation="Theta"`, set `Theta=None`. Otherwise estimate Theta from `output[..., 0:1]`, or from the previous deflated `multi_x[..., 0:1]` when available. `theta.method="glasso"` uses centered node covariance and a GLASSO backend. `theta.method="kalofolias"` uses the smooth signal directly. | Dense GLASSO and dense Kalofolias give `Theta: (N, N)` or batched `(B, N, N)`. Local Kalofolias gives local candidate weights `(N, K_theta)` or `(B, N, K_theta)` over `model.theta.local_kNN` neighbors. |
 | 5. ADMM update | Run `ADMMBlock` on signal channels only. With `use_one_channel=True`, the ADMM input is `output[..., 0:1]`; otherwise it is `output`. | Returns `output_new: (B, T, N, C_admm)`. If `predict_only=True`, the observed prefix is copied back before ADMM. |
-| 6. Optional deflation | Deflation runs only when `model.use_deflation=True`, this is not the final block, and `ablation!="Theta"`. | ADMM returns `(output_new, multi_x)`. `multi_x` is stored in `last_deflation_multi_x` and can feed the next block's Theta estimation. The final block skips deflation and returns only `output_new`. |
+| 6. Optional deflation | Deflation runs only when `model.deflation.enabled=True`, this is not the final block, and `ablation!="Theta"`. | ADMM returns `(output_new, multi_x)`. `multi_x` is stored in `last_deflation_multi_x` and can feed the next block's Theta estimation. The final block skips deflation and returns only `output_new`. |
 | 7. Skip blend | `output = p_i * output_new + (1 - p_i) * output_old`, where `p_i = skip_connection_weights[i]`. | `output_old` is the previous block input; in the first one-channel block it uses `output[..., 0:1]` so channel shapes match. |
 
 When `output_graph=True`, the model also returns the stacked learned graph weights:
@@ -108,16 +108,16 @@ Each unrolled block follows the same high-level order:
 |---|---|---|
 | Feature extraction | `FeatureExtractor` | Builds features with shape `(B, T, N, H, F)` from the current sequence and optional ST embeddings. |
 | Graph learning | `GraphLearningModule`, `multiM`, `multiQ` | Returns spatial weights `u_ew: (B, T, N, K, H)` and temporal weights `d_ew: (B, T - 1, interval, N, H)`. |
-| Theta estimation | `node_covariance`, `glasso_estimation`, `normalize_theta` | Estimates dense node matrix `Theta` from the current output, then normalizes it as `Theta_ij / sqrt(Theta_ii * Theta_jj)`. Skipped for the first block and skipped entirely for `ablation="Theta"`. |
+| Theta estimation | `node_covariance`, `glasso_estimation`, `KalofoliasGraphLearningModule`, `LocalKalofoliasGraphLearning`, `normalize_theta` | Estimates Theta from the current output. `theta.method=glasso` estimates dense precision from covariance using `theta.glasso.backend`. `theta.method=kalofolias` estimates a graph from smooth signals; `theta.kalofolias.graph=dense` returns a dense graph-derived matrix, while `local` returns candidate-edge weights on `theta.local_kNN`. Skipped for the first block and skipped entirely for `ablation="Theta"`. |
 | ADMM update | `ADMMBlock` | Updates the signal using the branches listed below. |
 | Skip connection | `skip_connection_weights[i]` | Blends each block output with the previous block output. |
-| Deflation | `DeflationCGSolver` | Runs only on intermediate blocks when `model.use_deflation=True` and `ablation!="Theta"`. The first deflated mode is the normal ADMM output. The final block skips deflation and returns the normal ADMM output. |
+| Deflation | `DeflationCGSolver` | Runs only on intermediate blocks when `model.deflation.enabled=True` and `ablation!="Theta"`. The first deflated mode is the normal ADMM output. The final block skips deflation and returns the normal ADMM output. |
 
 Current valid ablation names are `None`, `DGLR`, `DGTV`, `UT`, `simple`, and `Theta`.
 
 | Ablation | What changes in the ADMM step | Branches skipped or modified |
 |---|---|---|
-| `None` | Full split ADMM. | Uses spatial `z_u`, temporal `z_d`, directed temporal L1 `phi/gamma`, directed temporal L2 `cLdr`, dense `Theta`, and optional deflation. |
+| `None` | Full split ADMM. | Uses spatial `z_u`, temporal `z_d`, directed temporal L1 `phi/gamma`, directed temporal L2 `cLdr`, Theta, and optional deflation. Theta is dense for GLASSO and dense Kalofolias, and local for `theta.method=kalofolias, theta.kalofolias.graph=local`. |
 | `DGLR` | Removes the temporal L2 / graph Laplacian regularization branch. | Skips `z_d` solve and `gamma_d` update. No `mu_d2`, `rho_d`, or `zd_solver`. |
 | `DGTV` | Removes the directed temporal L1 / graph TV branch. | Skips `phi/gamma`, `phi_direct`, `gamma` update, and the `Ldr_T(gamma + rho * phi)` term. No `mu_d1` or `rho`. |
 | `UT` | Uses undirected temporal graph normalization and an undirected temporal operator. | Graph learning sets `directed_time=False`; `z_d` uses `apply_op_Ln` instead of `apply_op_cLdr`. It also skips `phi/gamma` and the directed temporal L1 update. |
@@ -137,10 +137,16 @@ Parameter and solver existence by ablation:
 
 For `Theta`, `lambda_theta` existence is currently equivalent to `ablation!="Theta"`, but the code uses the explicit ablation state rather than `hasattr(lambda_theta)` for branch decisions. For `UT`, `mu_d1` and `rho` are still created, but the forward path does not use the directed temporal L1 update. The cleaned ADMM path exposes only the iterations it actually uses: outer `num_layers`, inner `CG_iters`, and optional deflation CG settings.
 
-During training, every 20 batches prints the current-batch per-block Theta sparsity as `nnz / numel` through `tqdm.write`, so the progress bar is preserved. The same line also reports each block's `lambda_theta`; scalar values are printed directly, while vector/list values are summarized as min / median / max. Floating-point values use scientific notation with 3 significant digits. Because `Theta` is re-estimated for each batch rather than stored as a persistent model parameter, the sparsity value describes the most recent forward pass.
-Before `Theta` enters ADMM, negative diagonal entries are clamped to zero and entries with zero diagonal normalization denominator are set to zero to avoid NaN/Inf values.
-`model.glasso_method`, `model.glasso_alpha`, `model.glasso_rho`, `model.glasso_eps`, `model.glasso_eigh_shift`, `model.glasso_eigh_shift_retries`, and `model.glasso_fallback` are configured in `train/config.yaml` and can be temporarily overridden from the command line. `glasso_alpha` is the Graphical Lasso regularization strength for all solver backends; `glasso_rho` is passed to the `glasso_pytorch` ADMM solver and is ignored by `quic` and `sklearn`. `glasso_eps` is optional covariance diagonal jitter and defaults to `0.0` because it changes the GLASSO problem. The default numerical protection is instead eigensolver-only shift recovery: when `torch.linalg.eigh(A)` fails in the ADMM Theta update, the solver tries `eigh(A + delta I)` and subtracts `delta` from the returned eigenvalues. This keeps the original ADMM update unchanged in exact arithmetic. `glasso_fallback=True` falls back to sklearn/quic on the original covariance matrix only if the ADMM backend still fails after these spectrum-preserving retries; the ridge/pinv fallback is a final finite-output guard after all GLASSO solvers fail.
+During training, every 20 batches prints the current-batch per-block Theta support change through `tqdm.write`, so the progress bar is preserved. The baseline support is the original main kNN graph `model.nearest_nodes[:, 1:]`. The log reports `added/node` and `removed/node`: the average number of learned Theta edges per node outside the original kNN list, and the average number of original kNN edges per node missing from learned Theta. The same line also reports each block's `lambda_theta`; scalar values are printed directly, while vector/list values are summarized as `[min, max], median`. Lambda values use 4 decimals. Because `Theta` is re-estimated for each batch rather than stored as a persistent model parameter, these support-change values describe the most recent forward pass. For local Kalofolias, support is computed on the local candidate set `N * theta.local_kNN`, not on `N * N`.
+Before dense `Theta` enters ADMM, negative diagonal entries are clamped to zero and entries with zero diagonal normalization denominator are set to zero to avoid NaN/Inf values. For local Kalofolias, ADMM does not build a dense diagonal-normalized matrix. It stores local nonnegative weights and applies the normalized local Laplacian as `x_i - sum_j w_ij / sqrt(d_i d_j) x_j` when `model.theta.kalofolias.output_mode: laplacian`.
+Theta configuration is grouped in `train/config.yaml`. `model.theta.method` selects the family: `glasso` or `kalofolias`. If `method=glasso`, `model.theta.glasso.backend` selects `admm`, `quic`, or `sklearn`; `alpha`, `rho`, `eps`, eigensolver shift settings, and fallback behavior live under `model.theta.glasso`. If `method=kalofolias`, `model.theta.kalofolias.graph` selects `dense` or `local`; Kalofolias solver settings live under `model.theta.kalofolias`. Local Kalofolias uses `model.theta.local_kNN`, which defaults to `model.graph.kNN + 4`; the current YAML value is `graph.kNN=6`, `theta.local_kNN=10`. The default Kalofolias output mode inside the unrolled model is `laplacian`, because ADMM consumes `Theta` as a regularization operator. `glasso.rho` is used only by the `glasso.backend=admm` solver. `glasso.eps` is optional covariance diagonal jitter and defaults to `0.0` because it changes the GLASSO problem. The default numerical protection is instead eigensolver-only shift recovery: when `torch.linalg.eigh(A)` fails in the ADMM Theta update, the solver tries `eigh(A + delta I)` and subtracts `delta` from the returned eigenvalues. This keeps the original ADMM update unchanged in exact arithmetic. `glasso.fallback=True` falls back to sklearn/quic on the original covariance matrix only if the ADMM backend still fails after these spectrum-preserving retries; the ridge/pinv fallback is a final finite-output guard after all GLASSO solvers fail.
 When GLASSO uses an eigensolver fallback during training, the training log writes `GLASSO fallback observed` with the epoch/batch location, block index, Theta source, covariance shape, ADMM iteration, backend, shift value, retry index, and fallback path if the solver changes from ADMM to sklearn/ridge.
+
+Training artifacts are grouped by method first, then dataset, then learning-rate/seed, then the remaining run parameters:
+
+```text
+<logs_root>/train_Logs/<theta_family>/<dataset>/lr_<lr>_seed_<seed>/<other_params>/<loss>.log
+```
 
 ## Training and Testing
 
@@ -148,15 +154,29 @@ The default settings are in `train/config.yaml`. We provide multiple parsers to 
 
 **Example 1**: running main experiment on PEMS03 dataset:
 ```
-python -m train.train_traffic --dataset PEMS03 --cuda 0 --batchsize 12 --le-emb --neighbors 4
+python -m train.train_traffic --dataset PEMS03 --cuda 0 --batchsize 12 --neighbors 4
 ```
 
 **Example 2**: running 'w/o DGLR' experiment on METR-LA dataset:
 ```
-python -m train.train_traffic --dataset METR-LA --cuda 1 --ablation DGLR --batchsize 16 --le-emb
+python -m train.train_traffic --dataset METR-LA --cuda 1 --ablation DGLR --batchsize 16
 ```
 
 **Example 3**: running 'w/o undirected temporal graph' experiment on PEMS-BAY:
 ```
-python -m train.train_traffic --dataset PEMS-BAY --cuda 0 --ablation UT --batchsize 64 --le-emb
+python -m train.train_traffic --dataset PEMS-BAY --cuda 0 --ablation UT --batchsize 64
+```
+
+**Example 4**: temporarily enable local Kalofolias Theta on PEMS03:
+```
+python -m train.train_traffic --dataset PEMS03 --cuda 0 --batchsize 12 --theta-method kalofolias --kalofolias-graph local --theta-neighbors 10
+```
+
+For a persistent run setting, prefer editing `train/config.yaml`:
+`model.theta.method: kalofolias`, `model.theta.kalofolias.graph: local`, and
+`model.theta.local_kNN: 10`.
+
+**Example 5**: temporarily enable GLASSO ADMM Theta on PEMS03:
+```
+python -m train.train_traffic --dataset PEMS03 --cuda 0 --batchsize 12 --theta-method glasso --glasso-backend admm
 ```
