@@ -201,6 +201,8 @@ class ADMMBlock(nn.Module):
         self.u_ew = None
         self.d_ew = None
         self.Theta = None
+        self.theta_neighbor_list = None
+        self.theta_operator_mode = "matrix"
 
         self.ADMM_iters = ADMM_info["ADMM_iters"]
         self.CG_iters = ADMM_info["CG_iters"]
@@ -364,12 +366,15 @@ class ADMMBlock(nn.Module):
         return x - (self.u_ew.unsqueeze(-1) * neighbor_x).sum(3)
 
     def apply_op_Theta(self, x):
-        """Apply the optional dense node-level Theta matrix.
+        """Apply the optional node-level Theta operator.
 
         Args:
             x: (B, T, N, H, C)
             self.Theta: (N, N), shared by the batch, or (B, N, N), one dense
-                node matrix per batch sample.
+                node matrix per batch sample. For local Kalofolias, Theta is a
+                local edge-weight tensor with shape (N, K_theta) or
+                (B, N, K_theta), and `theta_neighbor_list` gives the
+                corresponding node indices with shape (N, K_theta).
 
         Returns:
             Theta @ x over the node dimension, also (B, T, N, H, C).
@@ -377,13 +382,92 @@ class ADMMBlock(nn.Module):
         if self.Theta is None:
             return torch.zeros_like(x)
         Theta = torch.as_tensor(self.Theta, device=x.device, dtype=x.dtype)
+        if self._is_local_theta(Theta):
+            return self._apply_local_theta_to_head_x(Theta, x)
         if Theta.ndim == 2:
             return torch.einsum("ij,btjhc->btihc", Theta, x)
         if Theta.ndim == 3:
             if Theta.size(0) != x.size(0):
                 raise ValueError("batched Theta must have the same batch size as x")
             return torch.einsum("bij,btjhc->btihc", Theta, x)
-        raise ValueError("Theta must have shape (N, N) or (B, N, N)")
+        raise ValueError("Theta must have shape (N, N), (B, N, N), (N, K_theta), or (B, N, K_theta)")
+
+    def _is_local_theta(self, Theta):
+        """Whether Theta is stored on a local candidate neighbor list."""
+        if self.theta_neighbor_list is None or Theta.ndim not in (2, 3):
+            return False
+        theta_neighbor_list = torch.as_tensor(self.theta_neighbor_list, device=Theta.device, dtype=torch.long)
+        return Theta.size(-2) == self.n_nodes and Theta.size(-1) == theta_neighbor_list.size(1)
+
+    def _theta_neighbor_list(self, device):
+        """Return the local Theta neighbor list as integer indices."""
+        if self.theta_neighbor_list is None:
+            raise ValueError("local Theta requires theta_neighbor_list")
+        theta_neighbor_list = torch.as_tensor(self.theta_neighbor_list, device=device, dtype=torch.long)
+        if theta_neighbor_list.ndim != 2 or theta_neighbor_list.size(0) != self.n_nodes:
+            raise ValueError("theta_neighbor_list must have shape (N, K_theta)")
+        if torch.any(theta_neighbor_list < 0) or torch.any(theta_neighbor_list >= self.n_nodes):
+            raise ValueError("theta_neighbor_list contains invalid node indices")
+        return theta_neighbor_list
+
+    @staticmethod
+    def _safe_local_laplacian_weights(weights, degree, neighbor_degree):
+        """Return weights normalized as D^{-1/2} W D^{-1/2}."""
+        denom = torch.sqrt(degree.unsqueeze(-1).clamp_min(0) * neighbor_degree.clamp_min(0))
+        eps = torch.finfo(weights.dtype).eps
+        return torch.where(denom > 0, weights / denom.clamp_min(eps), torch.zeros_like(weights))
+
+    def _apply_local_theta_to_head_x(self, Theta, x):
+        """Apply local adjacency or normalized local Laplacian to ADMM head tensors.
+
+        Args:
+            Theta: local edge weights, (N, K_theta) or (B, N, K_theta).
+            x: ADMM head tensor, (B, T, N, H, C).
+        """
+        theta_neighbor_list = self._theta_neighbor_list(x.device)
+        flat_neighbors = theta_neighbor_list.reshape(-1)
+        neighbor_x = x[:, :, flat_neighbors].reshape(
+            x.size(0),
+            x.size(1),
+            self.n_nodes,
+            theta_neighbor_list.size(1),
+            self.n_heads,
+            self.n_channels,
+        )
+
+        if Theta.ndim == 2:
+            if Theta.size(0) != self.n_nodes:
+                raise ValueError("local Theta must have shape (N, K_theta)")
+            weights = Theta.view(1, 1, self.n_nodes, -1, 1, 1)
+            degree = Theta.sum(dim=-1)
+            neighbor_degree = degree[theta_neighbor_list]
+            diag_scale = (degree > 0).to(x.dtype).view(1, 1, self.n_nodes, 1, 1)
+            local_weights = weights
+            if self.theta_operator_mode == "laplacian":
+                local_weights = self._safe_local_laplacian_weights(Theta, degree, neighbor_degree).view(
+                    1, 1, self.n_nodes, -1, 1, 1
+                )
+        elif Theta.ndim == 3:
+            if Theta.size(0) != x.size(0):
+                raise ValueError("batched local Theta must have the same batch size as x")
+            weights = Theta.view(x.size(0), 1, self.n_nodes, -1, 1, 1)
+            degree = Theta.sum(dim=-1)
+            neighbor_degree = degree[:, theta_neighbor_list]
+            diag_scale = (degree > 0).to(x.dtype).view(x.size(0), 1, self.n_nodes, 1, 1)
+            local_weights = weights
+            if self.theta_operator_mode == "laplacian":
+                local_weights = self._safe_local_laplacian_weights(Theta, degree, neighbor_degree).view(
+                    x.size(0), 1, self.n_nodes, -1, 1, 1
+                )
+        else:
+            raise ValueError("local Theta must have shape (N, K_theta) or (B, N, K_theta)")
+
+        neighbor_term = (local_weights * neighbor_x).sum(dim=3)
+        if self.theta_operator_mode == "adjacency":
+            return neighbor_term
+        if self.theta_operator_mode == "laplacian":
+            return diag_scale * x - neighbor_term
+        raise ValueError("theta_operator_mode must be one of: matrix, adjacency, laplacian")
 
     def apply_op_Ldr(self, x):
         """Apply directed temporal difference operator L_d.
@@ -541,11 +625,62 @@ class ADMMBlock(nn.Module):
         if self.Theta is None:
             return torch.zeros_like(x)
         Theta = torch.as_tensor(self.Theta, device=x.device, dtype=x.dtype)
+        if self._is_local_theta(Theta):
+            return self._apply_local_theta_to_output_x(Theta, x)
         if Theta.ndim == 2:
             return torch.einsum("ij,btjc->btic", Theta, x)
         if Theta.ndim == 3:
             return torch.einsum("bij,btjc->btic", Theta, x)
-        raise ValueError("Theta must have shape (N, N) or (B, N, N)")
+        raise ValueError("Theta must have shape (N, N), (B, N, N), (N, K_theta), or (B, N, K_theta)")
+
+    def _apply_local_theta_to_output_x(self, Theta, x):
+        """Apply local Theta to output-scale tensors used by deflation.
+
+        Args:
+            Theta: local edge weights, (N, K_theta) or (B, N, K_theta).
+            x: output tensor, (B, T, N, C).
+        """
+        theta_neighbor_list = self._theta_neighbor_list(x.device)
+        flat_neighbors = theta_neighbor_list.reshape(-1)
+        neighbor_x = x[:, :, flat_neighbors].reshape(
+            x.size(0),
+            x.size(1),
+            self.n_nodes,
+            theta_neighbor_list.size(1),
+            self.n_channels,
+        )
+
+        if Theta.ndim == 2:
+            weights = Theta.view(1, 1, self.n_nodes, -1, 1)
+            degree = Theta.sum(dim=-1)
+            neighbor_degree = degree[theta_neighbor_list]
+            diag_scale = (degree > 0).to(x.dtype).view(1, 1, self.n_nodes, 1)
+            local_weights = weights
+            if self.theta_operator_mode == "laplacian":
+                local_weights = self._safe_local_laplacian_weights(Theta, degree, neighbor_degree).view(
+                    1, 1, self.n_nodes, -1, 1
+                )
+        elif Theta.ndim == 3:
+            if Theta.size(0) != x.size(0):
+                raise ValueError("batched local Theta must have the same batch size as x")
+            weights = Theta.view(x.size(0), 1, self.n_nodes, -1, 1)
+            degree = Theta.sum(dim=-1)
+            neighbor_degree = degree[:, theta_neighbor_list]
+            diag_scale = (degree > 0).to(x.dtype).view(x.size(0), 1, self.n_nodes, 1)
+            local_weights = weights
+            if self.theta_operator_mode == "laplacian":
+                local_weights = self._safe_local_laplacian_weights(Theta, degree, neighbor_degree).view(
+                    x.size(0), 1, self.n_nodes, -1, 1
+                )
+        else:
+            raise ValueError("local Theta must have shape (N, K_theta) or (B, N, K_theta)")
+
+        neighbor_term = (local_weights * neighbor_x).sum(dim=3)
+        if self.theta_operator_mode == "adjacency":
+            return neighbor_term
+        if self.theta_operator_mode == "laplacian":
+            return diag_scale * x - neighbor_term
+        raise ValueError("theta_operator_mode must be one of: matrix, adjacency, laplacian")
 
     def _deflation_lhs(self, x, iteration):
         """Apply I + mu_u Lu + lambda_theta Theta for deflation solves."""

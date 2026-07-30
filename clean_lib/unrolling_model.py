@@ -14,6 +14,8 @@ from clean_lib.backup_modules import (
 )
 from clean_lib.feature_extractor import FeatureExtractor, GNNExtrapolation, GraphSAGEExtrapolation
 from clean_lib.graph_learning_module import GraphLearningModule
+from kalofolias_graph_learning import KalofoliasGraphLearningModule
+from local_kalofolias import LocalKalofoliasGraphLearning
 
 
 def _single_glasso_estimation(
@@ -42,7 +44,10 @@ def _single_glasso_estimation(
         try:
             from glasso_pytorch import graphical_lasso
 
-            solver_cov_torch = solver_cov if allow_backward else solver_cov.to(torch.float64)
+            # Keep the normal ADMM path in the covariance dtype used by the
+            # model. The lower-level eigensolver fallback will try CPU float64
+            # only if the original dtype/device eigensolve fails.
+            solver_cov_torch = solver_cov
             last_error = None
             try:
                 if allow_backward:
@@ -340,6 +345,24 @@ def node_covariance(signal, unbiased=True):
 
     raise ValueError("signal must have shape (B, T, N, C) or (B, K, T, N, C)")
 
+
+def node_signal_matrix(signal):
+    """Reshape model signals into Kalofolias node-signal matrices.
+
+    Args:
+        signal: `(B, T, N, C)` for one shared graph estimate, or
+            `(B, K, T, N, C)` for one graph estimate per batch item.
+
+    Returns:
+        `(N, B*T*C)` for a shared graph, or `(B, N, K*T*C)` for batched graphs.
+    """
+    if signal.ndim == 4:
+        return signal.permute(2, 0, 1, 3).reshape(signal.size(2), -1)
+    if signal.ndim == 5:
+        batch_size, _, _, n_nodes, _ = signal.shape
+        return signal.permute(0, 3, 1, 2, 4).reshape(batch_size, n_nodes, -1)
+    raise ValueError("signal must have shape (B, T, N, C) or (B, K, T, N, C)")
+
 DEFAULT_GRAPH_INFO = {
     "n_nodes": None,
     "u_edges": None,
@@ -387,6 +410,7 @@ class UnrollingModel(nn.Module):
         signal_channels,
         feature_channels,
         k_hop,
+        theta_k_hop=None,
         GNN_alpha=0.2,
         graph_info=None,
         ADMM_info=None,
@@ -406,7 +430,8 @@ class UnrollingModel(nn.Module):
         use_stable_graph_learning=False,
         predict_only=False,
         le_emb=False,
-        glasso_method="admm",
+        theta_method="glasso",
+        glasso_backend="admm",
         glasso_alpha=0.2,
         glasso_rho=1.0,
         glasso_eps=0.0,
@@ -416,7 +441,15 @@ class UnrollingModel(nn.Module):
         glasso_max_iter=20,
         glasso_tol=1e-4,
         glasso_allow_backward=False,
-        use_deflation=False,
+        kalofolias_alpha=0.3,
+        kalofolias_beta=1.0,
+        kalofolias_graph="dense",
+        kalofolias_max_iter=200,
+        kalofolias_tol=1e-4,
+        kalofolias_threshold=1e-4,
+        kalofolias_output_mode="laplacian",
+        kalofolias_normalize_distances=True,
+        use_deflation=True,
         deflation_samples=None,
     ):
         super().__init__()
@@ -436,7 +469,16 @@ class UnrollingModel(nn.Module):
         self.use_extrapolation = use_extrapolation
         self.use_st_emb = use_st_emb
         self.use_stable_graph_learning = use_stable_graph_learning
-        self.glasso_method = glasso_method
+        self.theta_method = theta_method.lower()
+        self.glasso_backend = glasso_backend.lower()
+        self.kalofolias_graph = kalofolias_graph.lower()
+        if self.theta_method not in {"glasso", "kalofolias"}:
+            raise ValueError("theta_method must be one of: glasso, kalofolias")
+        if self.glasso_backend not in {"admm", "quic", "sklearn"}:
+            raise ValueError("glasso_backend must be one of: admm, quic, sklearn")
+        if self.kalofolias_graph not in {"dense", "local"}:
+            raise ValueError("kalofolias_graph must be one of: dense, local")
+        self.theta_k_hop = k_hop if theta_k_hop is None else theta_k_hop
         self.glasso_alpha = glasso_alpha
         self.glasso_rho = glasso_rho
         self.glasso_eps = glasso_eps
@@ -446,6 +488,23 @@ class UnrollingModel(nn.Module):
         self.glasso_max_iter = min(glasso_max_iter, 20)
         self.glasso_tol = glasso_tol
         self.glasso_allow_backward = glasso_allow_backward
+        self.kalofolias_alpha = kalofolias_alpha
+        self.kalofolias_beta = kalofolias_beta
+        self.kalofolias_max_iter = kalofolias_max_iter
+        self.kalofolias_tol = kalofolias_tol
+        self.kalofolias_threshold = kalofolias_threshold
+        self.kalofolias_output_mode = kalofolias_output_mode
+        self.kalofolias_normalize_distances = kalofolias_normalize_distances
+        self.kalofolias_graph_estimator = KalofoliasGraphLearningModule(
+            alpha=kalofolias_alpha,
+            beta=kalofolias_beta,
+            max_iter=kalofolias_max_iter,
+            tol=kalofolias_tol,
+            threshold=kalofolias_threshold,
+            output_mode=kalofolias_output_mode,
+            normalize_distances=kalofolias_normalize_distances,
+            allow_backward=glasso_allow_backward,
+        )
         self.use_deflation = use_deflation
         self.deflation_samples = deflation_samples
         self.last_deflation_multi_x = None
@@ -466,6 +525,24 @@ class UnrollingModel(nn.Module):
             graph_info["u_dist"],
             k_hop,
             device=self.device,
+        )
+        self.theta_nearest_nodes, self.theta_nearest_dists = find_k_nearest_neighbors(
+            graph_info["n_nodes"],
+            graph_info["u_edges"],
+            graph_info["u_dist"],
+            self.theta_k_hop,
+            device=self.device,
+        )
+        self.theta_neighbor_list = self._build_theta_neighbor_list(k_hop)
+        self.local_kalofolias_graph_estimator = LocalKalofoliasGraphLearning(
+            self.theta_neighbor_list,
+            alpha=kalofolias_alpha,
+            beta=kalofolias_beta,
+            max_iter=kalofolias_max_iter,
+            tol=kalofolias_tol,
+            threshold=kalofolias_threshold,
+            normalize_distances=kalofolias_normalize_distances,
+            allow_backward=glasso_allow_backward,
         )
         self.connect_list = connect_list(graph_info["n_nodes"], graph_info["u_edges"], self.device)
 
@@ -602,6 +679,33 @@ class UnrollingModel(nn.Module):
         self.y_norm_shape = [self.t_in, graph_info["n_nodes"], signal_channels]
         self.norm_shape = [self.T, graph_info["n_nodes"], signal_channels]
 
+    def _build_theta_neighbor_list(self, graph_k_hop):
+        """Return the Theta-only local candidate list, excluding the self column.
+
+        `nearest_nodes` is built with column 0 equal to the node itself.  Local
+        Kalofolias estimates only off-diagonal candidate edge weights, so ADMM
+        receives `theta_neighbor_list` with shape `(N, theta.local_kNN)`.
+        """
+        uses_local_kalofolias = self._uses_local_kalofolias()
+        if uses_local_kalofolias and self.theta_k_hop <= graph_k_hop:
+            raise ValueError(
+                "model.theta.local_kNN must be larger than model.graph.kNN when "
+                "model.theta.method='kalofolias' and model.theta.kalofolias.graph='local'"
+            )
+
+        theta_neighbor_list = self.theta_nearest_nodes[:, 1:].to(torch.long)
+        if uses_local_kalofolias and theta_neighbor_list.numel() == 0:
+            raise ValueError("theta_neighbor_list is empty; set model.theta.local_kNN > 0")
+        if uses_local_kalofolias and torch.any(theta_neighbor_list < 0):
+            bad_rows = torch.nonzero((theta_neighbor_list < 0).any(dim=1), as_tuple=False).flatten()
+            preview = bad_rows[:10].detach().cpu().tolist()
+            raise ValueError(
+                "theta_neighbor_list contains -1 padding. Local Kalofolias "
+                "requires a complete candidate list for every node. "
+                f"bad_node_preview={preview}, theta.local_kNN={self.theta_k_hop}"
+            )
+        return theta_neighbor_list
+
     def set_debug_numerics(self, enabled, context=""):
         """Enable detailed tensor/gradient diagnostics for one training rerun."""
         self.debug_numerics = enabled
@@ -731,6 +835,14 @@ class UnrollingModel(nn.Module):
             event["cov_shape"] = tuple(cov_matrix.shape)
             self.last_glasso_events.append(event)
 
+    def _uses_local_kalofolias(self):
+        """Whether Theta is learned as local candidate-edge weights."""
+        return self.theta_method == "kalofolias" and self.kalofolias_graph == "local"
+
+    def _uses_dense_kalofolias(self):
+        """Whether Theta is learned as a dense Kalofolias graph matrix."""
+        return self.theta_method == "kalofolias" and self.kalofolias_graph == "dense"
+
     def _estimate_theta_for_block(self, block_idx, source, signal):
         """Estimate normalized Theta for one unrolled block.
 
@@ -742,16 +854,36 @@ class UnrollingModel(nn.Module):
                 shape (B, K, T, N, C).
 
         Returns:
-            Normalized Theta with shape (N, N) for ``output`` source or
-            (B, N, N) for ``multi_x`` source.
+            Dense GLASSO/Kalofolias branches return Theta with shape (N, N) for
+            ``output`` source or (B, N, N) for ``multi_x`` source. The local
+            Kalofolias branch returns candidate-edge weights with shape
+            (N, K_theta) or (B, N, K_theta); ADMMBlock applies them through
+            `theta_neighbor_list` without materializing a dense matrix.
         """
+        if self.theta_method == "kalofolias" and self._uses_local_kalofolias():
+            signal_matrix = node_signal_matrix(signal[..., 0:1])
+            signal_matrix = self._debug_tensor(f"block_{block_idx}.local_kalofolias_signal_matrix", signal_matrix)
+            theta = self.local_kalofolias_graph_estimator(signal_matrix)
+            return self._debug_tensor(f"block_{block_idx}.Theta_local", theta)
+
+        if self.theta_method == "kalofolias" and self._uses_dense_kalofolias():
+            signal_matrix = node_signal_matrix(signal[..., 0:1])
+            signal_matrix = self._debug_tensor(f"block_{block_idx}.kalofolias_signal_matrix", signal_matrix)
+            theta = self.kalofolias_graph_estimator(signal_matrix)
+            if self.kalofolias_output_mode.lower() == "laplacian":
+                theta = normalize_theta(theta)
+            return self._debug_tensor(f"block_{block_idx}.Theta", theta)
+
+        if self.theta_method != "glasso":
+            raise ValueError(f"Unsupported theta_method={self.theta_method}")
+
         cov_label = "theta_cov_from_multi_x" if source == "multi_x" else "theta_cov"
         cov_matrix = node_covariance(signal[..., 0:1], unbiased=True)
         cov_matrix = self._debug_tensor(f"block_{block_idx}.{cov_label}", cov_matrix)
         theta, glasso_events = glasso_estimation(
             cov_matrix,
             alpha=self.glasso_alpha,
-            method=self.glasso_method,
+            method=self.glasso_backend,
             rho=self.glasso_rho,
             eps=self.glasso_eps,
             eigh_shift=self.glasso_eigh_shift,
@@ -852,14 +984,19 @@ class UnrollingModel(nn.Module):
 
             admm_block.u_ew = u_ew
             admm_block.d_ew = d_ew
+            admm_block.theta_neighbor_list = self.theta_neighbor_list if self._uses_local_kalofolias() else None
+            admm_block.theta_operator_mode = self.kalofolias_output_mode.lower() if self._uses_local_kalofolias() else "matrix"
             # Theta branch:
             #   output[..., 0:1] is (B, T, N, 1).
-            #   node_covariance centers each node signal before computing the
-            #   unbiased covariance matrix. Plain output gives (N, N);
-            #   deflated multi_x gives one covariance per batch, (B, N, N).
-            #   glasso_estimation returns normalized Theta with shape (N, N)
-            #   or (B, N, N), consumed by ADMMBlock.apply_op_Theta over the
-            #   node dimension.
+            #   GLASSO methods first compute centered node covariance, then a
+            #   normalized dense precision matrix. The Kalofolias method uses
+            #   the smooth signal itself and returns a graph-derived matrix.
+            #   Local Kalofolias also uses smooth signals, but returns only
+            #   local edge weights over theta_neighbor_list.
+            #   Plain output gives (N, N); deflated multi_x gives one matrix
+            #   per batch, (B, N, N). Local Kalofolias gives (N, K_theta) or
+            #   (B, N, K_theta). ADMMBlock.apply_op_Theta consumes either
+            #   representation over the node dimension.
             if self.ablation == "Theta" or is_first_block:
                 # The first block has no previous ADMM-refined signal for Theta
                 # estimation. Theta ablation also disables this branch globally.
