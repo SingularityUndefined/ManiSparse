@@ -594,7 +594,7 @@ def create_optimizer_and_scheduler(config, args, model):
 
 
 def collect_theta_support_deltas(model):
-    """Return per-block Theta support changes against the original kNN graph.
+    """Return per-block Theta support statistics for the latest forward pass.
 
     Theta is estimated inside `UnrollingModel.forward`, so these values describe
     the most recent batch that passed through the model.  Block 0 is skipped
@@ -605,7 +605,9 @@ def collect_theta_support_deltas(model):
     For local Kalofolias, the comparison is row-local and directed:
         baseline support: model.nearest_nodes[:, 1:] with shape (N, kNN)
         learned support: Theta over theta_neighbor_list, shape (N, theta.local_kNN)
-    The reported values are average added and removed edges per node.
+    Dense Theta (GLASSO or dense Kalofolias) reports off-diagonal sparsity,
+    recall against the original main kNN graph, and min/median/max nonzero
+    degree. Local Kalofolias reports the same values plus kNN precision.
     """
     stats = []
     for block_idx, block in enumerate(model.model_blocks):
@@ -656,6 +658,33 @@ def _knn_baseline_mask(model, candidate_nodes, device):
     return ((candidate_nodes.unsqueeze(-1) == base_neighbors.unsqueeze(1)) & valid_base.unsqueeze(1)).any(dim=-1)
 
 
+def _theta_graph_metrics(learned_support, baseline_mask_batched, candidate_mask=None):
+    """Compute unweighted support metrics for the current Theta graph.
+
+    ``learned_support`` is boolean with shape ``(B, N, K)``.  Degree is the
+    count of nonzero outgoing edges, never a sum of their weights.
+    """
+    selected_edges = learned_support.sum().item()
+    selected_base_edges = torch.logical_and(learned_support, baseline_mask_batched).sum().item()
+    baseline_edges = baseline_mask_batched.sum().item()
+    degrees = learned_support.sum(dim=-1).to(torch.float32).reshape(-1)
+    if candidate_mask is None:
+        candidate_mask = torch.ones_like(learned_support, dtype=torch.bool)
+    candidate_edges = candidate_mask.sum().item()
+    return {
+        "selected_edges": selected_edges,
+        "candidate_edges": candidate_edges,
+        "sparsity": 1.0 - selected_edges / candidate_edges if candidate_edges else None,
+        "base_edges_selected": selected_base_edges,
+        "base_edges": baseline_edges,
+        "precision": selected_base_edges / selected_edges if selected_edges else None,
+        "recall": selected_base_edges / baseline_edges if baseline_edges else None,
+        "degree_min": degrees.min().item() if degrees.numel() else None,
+        "degree_median": degrees.median().item() if degrees.numel() else None,
+        "degree_max": degrees.max().item() if degrees.numel() else None,
+    }
+
+
 def _theta_support_delta_against_knn(model, admm_block, theta):
     """Compare learned Theta support to the original kNN support.
 
@@ -692,6 +721,7 @@ def _theta_support_delta_against_knn(model, admm_block, theta):
             "learned_edges_per_node": float(learned_per_node.mean().detach().cpu()),
             "added_per_node": float(added_per_node.mean().detach().cpu()),
             "removed_per_node": float(removed_per_node.mean().detach().cpu()),
+            "graph_metrics": _theta_graph_metrics(learned_support, baseline_mask_batched),
         }
 
     if theta.ndim in (2, 3):
@@ -706,6 +736,7 @@ def _theta_support_delta_against_knn(model, admm_block, theta):
         learned_support = torch.logical_and(learned_support, ~self_mask.unsqueeze(0))
 
         baseline_mask_batched = baseline_mask.unsqueeze(0).expand(learned_support.size(0), -1, -1)
+        candidate_mask_batched = (~self_mask).unsqueeze(0).expand_as(learned_support)
         added_per_node = torch.logical_and(learned_support, ~baseline_mask_batched).sum(dim=-1).to(torch.float32)
         learned_base_count = torch.logical_and(learned_support, baseline_mask_batched).sum(dim=-1).to(torch.float32)
         removed_per_node = (original_baseline_count - learned_base_count).clamp_min(0.0)
@@ -718,6 +749,11 @@ def _theta_support_delta_against_knn(model, admm_block, theta):
             "learned_edges_per_node": float(learned_per_node.mean().detach().cpu()),
             "added_per_node": float(added_per_node.mean().detach().cpu()),
             "removed_per_node": float(removed_per_node.mean().detach().cpu()),
+            "graph_metrics": _theta_graph_metrics(
+                learned_support,
+                baseline_mask_batched,
+                candidate_mask_batched,
+            ),
         }
 
     return {"kind": "unsupported"}
@@ -765,35 +801,43 @@ def _format_lambda_theta(lambda_stats):
 
 
 def format_theta_support_batch(theta_stats, epoch, iteration_count, total_batches):
-    """Format current-batch Theta support changes for tqdm-safe training output."""
-    prefix = f"Theta support delta [epoch {epoch + 1}, batch {iteration_count}/{total_batches}]"
+    """Format latest-batch Theta graph metrics with one block per line."""
+    prefix = f"Theta support [epoch {epoch + 1}, batch {iteration_count}/{total_batches}]"
     if not theta_stats:
         return f"{prefix}: no ADMM blocks"
 
-    parts = []
+    lines = [prefix]
     for stat in theta_stats:
         block_name = f"block_{stat['block_idx']}"
         lambda_text = _format_lambda_theta(stat["lambda_theta"])
         if stat["ratio"] is None:
-            parts.append(f"{block_name}=skipped, lambda_theta={lambda_text}")
+            lines.append(f"  {block_name}: skipped, lambda_theta={lambda_text}")
             continue
         support_delta = stat.get("support_delta")
         if support_delta is not None and support_delta.get("kind") in {"local", "dense"}:
-            parts.append(
-                f"{block_name}=+{support_delta['added_per_node']:.2f}/node, "
-                f"-{support_delta['removed_per_node']:.2f}/node "
-                f"(learned={support_delta['learned_edges_per_node']:.2f}/node, "
-                f"base={support_delta['baseline_edges_per_node']:.2f}/node, "
-                f"kind={support_delta['kind']}, shape={stat['shape']}), "
+            graph_metrics = support_delta["graph_metrics"]
+            sparsity_text = "n/a" if graph_metrics["sparsity"] is None else f"{graph_metrics['sparsity']:.1%}"
+            recall_text = "n/a" if graph_metrics["recall"] is None else f"{graph_metrics['recall']:.1%}"
+            metrics_text = (
+                f"sparsity={sparsity_text}, kNN_recall={recall_text}, "
+                f"degree(min/median/max)="
+                f"{graph_metrics['degree_min']:.0f}/{graph_metrics['degree_median']:.0f}/{graph_metrics['degree_max']:.0f}"
+            )
+            if support_delta["kind"] == "local":
+                precision_text = "n/a" if graph_metrics["precision"] is None else f"{graph_metrics['precision']:.1%}"
+                metrics_text += f", kNN_precision={precision_text}"
+            lines.append(
+                f"  {block_name} [{support_delta['kind']}]: {metrics_text}; "
+                f"selected={graph_metrics['selected_edges']}/{graph_metrics['candidate_edges']}, "
                 f"lambda_theta={lambda_text}"
             )
             continue
-        parts.append(
-            f"{block_name}=support_delta_unavailable "
+        lines.append(
+            f"  {block_name}: support_delta_unavailable "
             f"({stat['nnz']}/{stat['numel']}, shape={stat['shape']}), "
             f"lambda_theta={lambda_text}"
         )
-    return f"{prefix}: " + "; ".join(parts)
+    return "\n".join(lines)
 
 
 def _log_nested_config(logger, config):
@@ -875,12 +919,13 @@ def _log_effective_model_flags(logger, config, model):
         model_config["use_stable_graph_learning"],
     )
     logger.info(
-        "Effective Theta graph settings: theta_method=%s, glasso_backend=%s, kalofolias_graph=%s, kNN=%s, theta_local_kNN=%s, kalofolias_output_mode=%s",
+        "Effective Theta graph settings: theta_method=%s, glasso_backend=%s, kalofolias_graph=%s, kNN=%s, theta_local_kNN(requested/effective)=%s/%s, kalofolias_output_mode=%s",
         model_config["theta_method"],
         model_config["glasso_backend"],
         model_config["kalofolias_graph"],
         model_config["kNN"],
         model_config["theta_kNN"],
+        getattr(model, "theta_effective_k_hop", model_config["theta_kNN"]),
         model_config["kalofolias_output_mode"],
     )
     if len(model.model_blocks) == 0:
