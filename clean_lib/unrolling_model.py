@@ -685,6 +685,13 @@ class UnrollingModel(nn.Module):
         `nearest_nodes` is built with column 0 equal to the node itself.  Local
         Kalofolias estimates only off-diagonal candidate edge weights, so ADMM
         receives `theta_neighbor_list` with shape `(N, theta.local_kNN)`.
+
+        A physical sensor graph can contain a small disconnected component. In
+        that case a requested ``theta.local_kNN`` may be larger than the number
+        of reachable non-self nodes for a few rows, and the shortest-path
+        helper pads those rows with ``-1``. Local Kalofolias cannot consume
+        padded candidates. We therefore use the largest complete local width
+        shared by every node, rather than inventing non-geometric neighbors.
         """
         uses_local_kalofolias = self._uses_local_kalofolias()
         if uses_local_kalofolias and self.theta_k_hop <= graph_k_hop:
@@ -697,13 +704,24 @@ class UnrollingModel(nn.Module):
         if uses_local_kalofolias and theta_neighbor_list.numel() == 0:
             raise ValueError("theta_neighbor_list is empty; set model.theta.local_kNN > 0")
         if uses_local_kalofolias and torch.any(theta_neighbor_list < 0):
-            bad_rows = torch.nonzero((theta_neighbor_list < 0).any(dim=1), as_tuple=False).flatten()
+            valid_counts = (theta_neighbor_list >= 0).sum(dim=1)
+            effective_k = int(valid_counts.min().item())
+            bad_rows = torch.nonzero(valid_counts < self.theta_k_hop, as_tuple=False).flatten()
             preview = bad_rows[:10].detach().cpu().tolist()
-            raise ValueError(
-                "theta_neighbor_list contains -1 padding. Local Kalofolias "
-                "requires a complete candidate list for every node. "
-                f"bad_node_preview={preview}, theta.local_kNN={self.theta_k_hop}"
+            if effective_k <= 0:
+                raise ValueError(
+                    "Local Kalofolias has no valid non-self candidate for at least one node. "
+                    f"bad_node_preview={preview}; check that the geometry graph has no isolated nodes."
+                )
+            warnings.warn(
+                "Local Kalofolias reduced theta.local_kNN to the largest complete "
+                f"geometry-neighbor list: requested={self.theta_k_hop}, effective={effective_k}, "
+                f"affected_node_preview={preview}."
             )
+            theta_neighbor_list = theta_neighbor_list[:, :effective_k]
+            self.theta_effective_k_hop = effective_k
+        else:
+            self.theta_effective_k_hop = theta_neighbor_list.size(1)
         return theta_neighbor_list
 
     def set_debug_numerics(self, enabled, context=""):
