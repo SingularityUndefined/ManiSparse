@@ -58,7 +58,7 @@ class WeightedMSELoss(nn.Module):
         return rec_loss * self.weights + pred_loss
 
 
-def plot_loss_curve(train_loss, val_loss, save_path, val_freq=5, use_log=False):
+def plot_loss_curve(train_loss, val_loss, save_path, val_freq=1, use_log=False):
     """保存训练/验证 loss 曲线，验证 loss 的横轴按 `val_freq` 对齐。"""
     import matplotlib.pyplot as plt
 
@@ -166,7 +166,7 @@ def _forward_eval_batch(model, y, x, t_list, data_normalization, masked_flag, co
         normed_output/normed_x: 归一化尺度上的输出和目标，供 test_series 保存
         undirected_graphs/directed_graphs: `output_graph=True` 时模型额外返回的图序列
     """
-    t_in = config['model']['t_in']
+    t_in = config['model']['sequence']['t_in']
     normalize_one_channel = _model_uses_one_channel(config, use_one_channel)
 
     if data_normalization is None:
@@ -274,7 +274,7 @@ def test(model, val_loader, data_normalization, masked_flag, config, device, sig
     """
     assert mode in ['val', 'test']
     model.eval()
-    t_in = config['model']['t_in']
+    t_in = config['model']['sequence']['t_in']
     output_list = []
     x_list = []
     running_loss = 0.0
