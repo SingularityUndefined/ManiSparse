@@ -11,7 +11,9 @@ import copy
 import gc
 import math
 import os
+import random
 
+import numpy as np
 import torch
 import torch.nn as nn
 from tqdm import tqdm
@@ -27,11 +29,15 @@ from train.train_utils import (
     create_optimizer_and_scheduler,
     create_training_paths,
     create_writer,
+    format_theta_epoch_summary,
     format_theta_support_batch,
+    format_spatial_balance_summary,
     get_model_config,
     log_run_header,
     parse_args,
+    plot_theta_metric_history,
     prepare_runtime,
+    summarize_theta_metric_samples,
 )
 from utils import (
     change_model_location,
@@ -299,14 +305,17 @@ def _empty_train_metrics():
 def _update_train_metrics(sums, loss, output, x, t_in, masked_flag):
     """Accumulate training metrics for one batch on recovered data scale."""
     sums["running_loss"] += loss.item()
-    sums["rec_mse"] += ((x[:, :t_in] - output[:, :t_in]) ** 2).detach().cpu().mean().item()
+    # Training loss above deliberately uses raw output.  Clamp only the copy
+    # used for reported metrics.
+    metric_output = output.clamp_min(0)
+    sums["rec_mse"] += ((x[:, :t_in] - metric_output[:, :t_in]) ** 2).detach().cpu().mean().item()
 
     if masked_flag:
         x_pred = x[:, t_in:]
-        output_pred = output[:, t_in:]
+        output_pred = metric_output[:, t_in:]
     else:
         x_pred = x[:, t_in:]
-        output_pred = output[:, t_in:]
+        output_pred = metric_output[:, t_in:]
 
     sums["pred_mse"] += ((x_pred - output_pred) ** 2).detach().cpu().mean().item()
     sums["pred_mae"] += torch.abs(output_pred - x_pred).detach().cpu().mean().item()
@@ -314,7 +323,7 @@ def _update_train_metrics(sums, loss, output, x, t_in, masked_flag):
     if mask.any():
         sums["pred_mape"] += (torch.abs(output_pred[mask] - x_pred[mask]) / torch.abs(x_pred[mask])).detach().cpu().mean().item() * 100
         sums["pred_mape_count"] += 1
-    sums["nearest_loss"] += ((x[:, t_in] - output[:, t_in]) ** 2).detach().cpu().mean().item()
+    sums["nearest_loss"] += ((x[:, t_in] - metric_output[:, t_in]) ** 2).detach().cpu().mean().item()
 
 
 def _finalize_train_metrics(sums, num_batches):
@@ -410,6 +419,7 @@ def train_one_epoch(
     loss_acc = 0.0
     metric_sums = _empty_train_metrics()
     total_batches = len(train_loader)
+    theta_samples = []
 
     for iter_idx, (y, x, t_list) in enumerate(tqdm(train_loader)):
         if iter_idx > 0 and iter_idx % 128 == 0:
@@ -445,6 +455,7 @@ def train_one_epoch(
         _log_glasso_fallback_events(model, logger, epoch, num_epochs, iteration_count, train_loader)
         if iteration_count % 20 == 0:
             theta_stats = collect_theta_support_deltas(model)
+            theta_samples.append(theta_stats)
             tqdm.write(format_theta_support_batch(theta_stats, epoch, iteration_count, total_batches))
 
         if not torch.isfinite(loss).all():
@@ -559,7 +570,10 @@ def train_one_epoch(
         _update_train_metrics(metric_sums, loss, output, x, t_in, masked_flag)
 
     logger.info("output: (%f, %f)", output.detach().cpu().max().item(), output.detach().cpu().min().item())
-    return _finalize_train_metrics(metric_sums, len(train_loader))
+    train_metrics = _finalize_train_metrics(metric_sums, len(train_loader))
+    train_metrics["theta_summary"] = summarize_theta_metric_samples(theta_samples)
+    logger.info("%s", format_theta_epoch_summary(train_metrics["theta_summary"], epoch))
+    return train_metrics
 
 
 def evaluate(model, loader, data_normalization, masked_flag, config, device, signal_channels, loss_fn):
@@ -599,7 +613,7 @@ def evaluate(model, loader, data_normalization, masked_flag, config, device, sig
 
 
 def log_eval_metrics(logger, prefix, epoch_text, loss, metrics, metrics_d, signal_channels):
-    """Write validation/test metrics to the logger, including per-channel metrics."""
+    """Write aggregate and long-tail diagnostics for validation/test metrics."""
     logger.info(
         "%s: Epoch [%s], Loss:%.4f, rec_RMSE:%.4f, RMSE:%.4f, MAE:%.4f, MAPE(%%):%.4f",
         prefix,
@@ -609,6 +623,25 @@ def log_eval_metrics(logger, prefix, epoch_text, loss, metrics, metrics_d, signa
         metrics["pred_RMSE"],
         metrics["pred_MAE"],
         metrics["pred_MAPE"],
+    )
+    logger.info(
+        "%s forecast diagnostics: Huber(delta=1):%.4f, |err| P95/P99/max:%.4f/%.4f/%.4f, |err|>100:%.4f%%",
+        prefix,
+        metrics["pred_Huber"],
+        metrics["pred_abs_error_p95"],
+        metrics["pred_abs_error_p99"],
+        metrics["pred_abs_error_max"],
+        metrics["pred_abs_error_gt_100_rate"] * 100,
+    )
+    logger.info(
+        "%s max-error location: sample=%d, forecast_step=%d, node=%d, channel=%d, prediction=%.4f, truth=%.4f",
+        prefix,
+        metrics["pred_max_error_sample"],
+        metrics["pred_max_error_step"],
+        metrics["pred_max_error_node"],
+        metrics["pred_max_error_channel"],
+        metrics["pred_max_error_prediction"],
+        metrics["pred_max_error_truth"],
     )
     if metrics_d is not None:
         for i in range(signal_channels):
@@ -637,6 +670,10 @@ def maybe_periodic_test(model, test_loader, data_normalization, masked_flag, con
     except TypeError:
         state_dict = torch.load(checkpoint_path)
     best_model.load_state_dict(state_dict)
+    # Older checkpoints may predate the non-negative Theta-regularizer
+    # projection.  Apply the same constraints used after every optimizer step
+    # before evaluating them.
+    best_model.clamp_param(config["clamp"] if config["clamp"] > 0 else None)
     best_model.zero_grad()
 
     test_loss, test_metrics, test_metrics_d = evaluate(
@@ -654,6 +691,63 @@ def maybe_periodic_test(model, test_loader, data_normalization, masked_flag, con
     gc.collect()
     torch.cuda.empty_cache()
     del best_model
+
+
+def _capture_rng_state():
+    """Capture all RNG states needed to continue an epoch-boundary run."""
+    state = {"python": random.getstate(), "numpy": np.random.get_state(), "torch": torch.get_rng_state()}
+    if torch.cuda.is_available():
+        state["cuda"] = torch.cuda.get_rng_state_all()
+    return state
+
+
+def _restore_rng_state(state):
+    """Restore RNG states from a resumable training checkpoint."""
+    if not state:
+        return
+    random.setstate(state["python"])
+    np.random.set_state(state["numpy"])
+    torch.set_rng_state(state["torch"])
+    if "cuda" in state and torch.cuda.is_available():
+        torch.cuda.set_rng_state_all(state["cuda"])
+
+
+def _load_training_state(path, model, optimizer, scheduler, device):
+    """Load a full epoch-boundary checkpoint and return its metadata."""
+    try:
+        state = torch.load(path, map_location=device, weights_only=False)
+    except TypeError:
+        state = torch.load(path, map_location=device)
+    required = {"model", "optimizer", "next_epoch", "best_val_loss", "best_epoch"}
+    missing = required.difference(state)
+    if missing:
+        raise ValueError(f"{path} is not a resumable training-state checkpoint; missing {sorted(missing)}")
+    model.load_state_dict(state["model"])
+    optimizer.load_state_dict(state["optimizer"])
+    if scheduler is not None and state.get("scheduler") is not None:
+        scheduler.load_state_dict(state["scheduler"])
+    _restore_rng_state(state.get("rng"))
+    return state
+
+
+def _save_training_state(path, model, optimizer, scheduler, next_epoch, best_val_loss, best_epoch, train_loss_list, val_loss_list, theta_metric_history):
+    """Atomically save all state required to resume at the next epoch."""
+    state = {
+        "format_version": 1,
+        "next_epoch": next_epoch,
+        "model": model.state_dict(),
+        "optimizer": optimizer.state_dict(),
+        "scheduler": None if scheduler is None else scheduler.state_dict(),
+        "best_val_loss": best_val_loss,
+        "best_epoch": best_epoch,
+        "train_loss_list": train_loss_list,
+        "val_loss_list": val_loss_list,
+        "theta_metric_history": theta_metric_history,
+        "rng": _capture_rng_state(),
+    }
+    temporary_path = path + ".tmp"
+    torch.save(state, temporary_path)
+    os.replace(temporary_path, path)
 
 
 def main(argv=None):
@@ -675,7 +769,33 @@ def main(argv=None):
     print("args.ablation", args.ablation)
     model, admm_info = create_model(config, args, train_set, device)
     optimizer, scheduler = create_optimizer_and_scheduler(config, args, model)
+
+    masked_flag = False
+    best_val_loss = 20
+    best_epoch = args.start_epochs
+    train_loss_list = []
+    val_loss_list = []
+    theta_metric_history = []
+    start_epoch = args.start_epochs
     model_pretrained_path = None
+
+    resume_path = args.resume
+    if resume_path is None and args.auto_resume and os.path.isfile(paths.train_state_path):
+        resume_path = paths.train_state_path
+    if resume_path is not None:
+        state = _load_training_state(resume_path, model, optimizer, scheduler, device)
+        start_epoch = state["next_epoch"]
+        best_val_loss = state["best_val_loss"]
+        best_epoch = state["best_epoch"]
+        train_loss_list = state.get("train_loss_list", [])
+        val_loss_list = state.get("val_loss_list", [])
+        theta_metric_history = state.get("theta_metric_history", [])
+        model_pretrained_path = resume_path
+        logger.info("Resumed full training state from %s at epoch %d", resume_path, start_epoch + 1)
+    elif args.start_epochs > 0:
+        model_pretrained_path = os.path.join(paths.model_dir, f"val_{args.start_epochs}.pth")
+        model = change_model_location(model, model_pretrained_path, device)
+
     log_run_header(logger, args, config, model, train_set, signal_channels, admm_info, model_pretrained_path)
     if grad_logger is not None:
         grad_logger.info("------BEGIN TRAINING PROCESS-------")
@@ -683,19 +803,10 @@ def main(argv=None):
     print("log path", os.path.join(paths.log_dir, names.log_filename))
     print("tensorboard log path", paths.tensorboard_logdir)
 
-    masked_flag = False
-    best_val_loss = 20
-    best_epoch = args.start_epochs
-    if args.start_epochs > 0:
-        model_pretrained_path = os.path.join(paths.model_dir, f"val_{args.start_epochs}.pth")
-        model = change_model_location(model, model_pretrained_path, device)
-
-    train_loss_list = []
-    val_loss_list = []
     num_epochs = args.epochs
 
     try:
-        for epoch in range(args.start_epochs, num_epochs):
+        for epoch in range(start_epoch, num_epochs):
             try:
                 train_metrics = train_one_epoch(
                     model,
@@ -730,6 +841,7 @@ def main(argv=None):
                 )
 
             train_loss_list.append(train_metrics["loss"])
+            theta_metric_history.append({"epoch": epoch + 1, "summary": train_metrics["theta_summary"]})
             logger.info(
                 "Training: Epoch [%d/%d], LR:%.2e, Loss:%.4f, rec_RMSE: %.4f, "
                 "RMSE_next:%.4f, RMSE:%.4f, MAE:%.4f, MAPE(%%):%.4f",
@@ -755,6 +867,7 @@ def main(argv=None):
             )
             val_loss_list.append(val_loss)
             log_eval_metrics(logger, "Validation", f"{epoch + 1}/{num_epochs}", val_loss, metrics, metrics_d, signal_channels)
+            logger.info("%s", format_spatial_balance_summary(model, f"Validation spatial balance [epoch {epoch + 1}]"))
 
             if val_loss < best_val_loss:
                 best_val_loss = val_loss
@@ -781,8 +894,22 @@ def main(argv=None):
                 epoch,
                 num_epochs,
             )
+            _save_training_state(
+                paths.train_state_path,
+                model,
+                optimizer,
+                scheduler,
+                epoch + 1,
+                best_val_loss,
+                best_epoch,
+                train_loss_list,
+                val_loss_list,
+                theta_metric_history,
+            )
+            logger.info("Saved resumable training state: %s (next epoch %d)", paths.train_state_path, epoch + 2)
     finally:
         plot_loss_curve(train_loss_list, val_loss_list, paths.plot_path)
+        plot_theta_metric_history(theta_metric_history, paths.theta_plot_path)
         writer.close()
 
 

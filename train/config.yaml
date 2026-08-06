@@ -32,6 +32,9 @@ model:
     samples: 5
     CG_iters: 3
     tol: 1.0e-6
+    # Experimental: retain the full multi-mode deflation computation graph.
+    # This is substantially more memory-intensive than detached deflation.
+    allow_backward: False
 
   theta:
     # method: glasso or kalofolias
@@ -60,6 +63,10 @@ model:
       threshold: 1.0e-4
       output_mode: laplacian
       normalize_distances: True
+      # Let gradients flow through the local Kalofolias solver.  This costs
+      # considerably more memory; leave disabled for the normal detached-Theta
+      # training path.
+      allow_backward: False
 
   graph_learning:
     use_stable_graph_learning: True
