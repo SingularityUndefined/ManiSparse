@@ -63,9 +63,9 @@ tensorboard
 | 1. 构造图学习输入 | 启用 ST embedding 时 `output_emb = concat(output, shared_output_emb)`，否则 `output_emb = output`。 | `output_emb` 保留 `(B, T, N, *)` 轴。 |
 | 2. 提取特征 | `features = FeatureExtractor(output_emb)`。 | `features: (B, T, N, H, F)`，其中 `H=num_heads`，`F=feature_channels`。 |
 | 3. 学习图权重 | `u_ew, d_ew = GraphLearningModule(features)`。 | `u_ew: (B, T, N, K, H)` 表示空间邻居权重；`d_ew: (B, T - 1, interval, N, H)` 表示时间有向边权重。它们会被赋给当前 `ADMMBlock`。 |
-| 4. 估计 Theta | 第 0 个 block 或 `ablation="Theta"` 时设 `Theta=None`。否则从 `output[..., 0:1]` 计算中心化节点协方差；如果已有上一个 block 的 deflated `multi_x`，则从 `multi_x[..., 0:1]` 计算协方差，然后调用 `glasso_estimation` 和 `normalize_theta`。 | 普通协方差得到 `Theta: (N, N)`；deflated 协方差得到 batched `Theta: (B, N, N)`。 |
+| 4. 估计 Theta | 第 0 个 block 或 `ablation="Theta"` 时设 `Theta=None`。否则 GLASSO 从中心化协方差估计精度矩阵；Kalofolias 直接从当前 `output` 或上一个 block 的 multi-mode `multi_x` 学习平滑信号图。 | GLASSO 和 dense Kalofolias 给出 `(N, N)` 或 `(B, N, N)`；local Kalofolias 返回局部候选边权 `(N, K_theta)` 或 `(B, N, K_theta)`。 |
 | 5. ADMM 更新 | `ADMMBlock` 只接收信号通道。`use_one_channel=True` 时输入为 `output[..., 0:1]`，否则输入为 `output`。 | 返回 `output_new: (B, T, N, C_admm)`。如果 `predict_only=True`，ADMM 前会把观测前缀拷贝回去。 |
-| 6. 可选 deflation | 只有当 `model.use_deflation=True`、当前不是最后一个 block、且 `ablation!="Theta"` 时执行。 | ADMM 返回 `(output_new, multi_x)`。`multi_x` 存入 `last_deflation_multi_x`，可用于下一个 block 的 Theta 估计。最后一个 block 跳过 deflation，只返回 `output_new`。 |
+| 6. 可选 deflation | 只有当 `model.deflation.enabled=True`、当前不是最后一个 block、且 `ablation!="Theta"` 时执行。 | ADMM 返回 `(output_new, multi_x)`。`multi_x` 存入 `last_deflation_multi_x`，可用于下一个 block 的 Theta 估计。默认 detach；可通过可微分支保留完整计算图。最后一个 block 跳过 deflation。 |
 | 7. skip 融合 | `output = p_i * output_new + (1 - p_i) * output_old`，其中 `p_i = skip_connection_weights[i]`。 | `output_old` 是上一个 block 的输入；第一个 one-channel block 中使用 `output[..., 0:1]` 以匹配通道数。 |
 
 当 `output_graph=True` 时，模型还会返回堆叠后的图权重：
@@ -105,10 +105,10 @@ multiQ -> Q_df / Q_i -> exp(...) graph weights -> d_ew -> ADMMBlock -> output ->
 |---|---|---|
 | Feature extraction | `FeatureExtractor` | 从当前序列和可选 ST embedding 构造 `(B, T, N, H, F)` 特征。 |
 | Graph learning | `GraphLearningModule`, `multiM`, `multiQ` | 返回空间权重 `u_ew: (B, T, N, K, H)` 和时间权重 `d_ew: (B, T - 1, interval, N, H)`。 |
-| Theta estimation | `node_covariance`, `glasso_estimation`, `normalize_theta` | 从当前输出估计 dense node matrix `Theta`，并做 `Theta_ij / sqrt(Theta_ii * Theta_jj)` 归一化。第一个 block 和 `ablation="Theta"` 时跳过。 |
+| Theta estimation | `node_covariance`, `glasso_estimation`, `KalofoliasGraphLearningModule`, `LocalKalofoliasGraphLearning` | GLASSO 从协方差估计 dense Theta；Kalofolias 从平滑信号学习图，`graph=local` 时返回局部候选边权。第一个 block 和 `ablation="Theta"` 时跳过。 |
 | ADMM update | `ADMMBlock` | 用下面的分支更新信号。 |
 | Skip connection | `skip_connection_weights[i]` | 将当前 ADMM 输出和前一个 block 输出融合。 |
-| Deflation | `DeflationCGSolver` | 只在中间 block、`model.use_deflation=True` 且 `ablation!="Theta"` 时运行。最后一个 block 跳过 deflation。 |
+| Deflation | `DeflationCGSolver` | 只在中间 block、`model.deflation.enabled=True` 且 `ablation!="Theta"` 时运行。默认 no-grad；实验性可微模式会保留 fixed-CG、正交化和 multi-mode 的计算图。 |
 
 当前有效消融名称为 `None`、`DGLR`、`DGTV`、`UT`、`simple` 和 `Theta`。
 
@@ -134,9 +134,69 @@ multiQ -> Q_df / Q_i -> exp(...) graph weights -> d_ew -> ADMMBlock -> output ->
 
 `Theta` 消融时，`lambda_theta` 是否存在目前等价于 `ablation!="Theta"`，但代码分支使用显式 ablation 状态，而不是 `hasattr(lambda_theta)`。`UT` 中 `mu_d1` 和 `rho` 仍然会创建，但 forward 路径不会使用有向时间 L1 更新。cleaned ADMM 路径只暴露实际使用的迭代配置：外层 `num_layers`、内层 `CG_iters` 和可选 deflation CG 设置。
 
-训练时每 20 个 batch 会通过 `tqdm.write` 输出一次当前 batch 的每个 block 的 Theta 稀疏度 `nnz / numel`，不会破坏进度条。同一行还会输出每个 block 的 `lambda_theta`；标量直接打印，向量/list 打印 min / median / max。浮点数使用 3 位有效数字的科学计数法。因为 `Theta` 是每个 batch 重新估计的，不是持久模型参数，所以这个稀疏度描述的是最近一次 forward。
+### ADMM 参数初始化、约束与数值投影
+
+空间正则项以 `mu_u L^u + lambda_theta Theta` 的形式进入 ADMM。为了避免两个独立自由参数通过负值相互抵消，`mu_u` 与 `lambda_theta` 不再分别直接学习，而是在每个 block、每个 ADMM iteration 使用共享总强度和 sigmoid 分配：
+
+```text
+total = softplus(raw_total)
+gate  = sigmoid(raw_gate)
+mu_u          = total * gate
+lambda_theta  = total * (1 - gate)
+```
+
+因此恒有 `mu_u > 0`、`lambda_theta >= 0`，且 `mu_u + lambda_theta = total`。`ADMM_params.mu_u` 与 `ADMM_params.lambda_theta` 仍是初始化值：例如默认 `2` 与 `1` 分别初始化为 `total=3`、`mu_share=2/3`，之后 `raw_total` 与 `raw_gate` 会正常学习。这个初始化远离 sigmoid 的 0/1 饱和区。
+
+其余有明确 ADMM 含义的参数在每次 optimizer step 后投影到合法域：
+
+| 参数 | 约束 | 原因 |
+|---|---|---|
+| `mu_d1`, `mu_d2` | `> eps` | 时间正则强度必须为正。 |
+| `rho`, `rho_u`, `rho_d` | `> eps` | ADMM penalty 必须为正，避免线性系统退化。 |
+| CG `alpha` | `[0, clamp]` | 避免负步长和过大的学习步长。 |
+| CG `beta` | `[0, +inf)` | 避免负搜索方向系数。 |
+
+普通神经网络权重、`multiM/multiQ`、skip 权重不做这种正性约束。该参数化改变了 state dict 的参数名，因此旧的仅模型权重 `val_<epoch>.pth` 不能直接加载到新结构；应使用新结构重新训练。
+
+### 可微 multi-mode deflation 与 local Kalofolias 分支
+
+默认配置下，deflation 是辅助图估计步骤：`multi_x`、deflation CG 和 local Kalofolias 均在 no-grad/detach 路径中运行。这样最省显存、数值最稳，但 loss 不会经由 `Theta -> multi_x` 回传到前一个 block。
+
+若需要端到端经过 multi-mode Theta 估计反传，必须同时开启下面两个开关：
+
+```yaml
+model:
+  deflation:
+    allow_backward: True
+  theta:
+    kalofolias:
+      allow_backward: True
+```
+
+等价 CLI：
+
+```bash
+--kalofolias-allow-backward --deflation-allow-backward
+```
+
+开启 `kalofolias.allow_backward=True` 而未显式设置 deflation 开关时，代码会自动把 `deflation.allow_backward` 设为 `True`。若显式传 `--no-deflation-allow-backward`，会保留该消融设置并给出 warning，因为此时 `multi_x` 仍 detach，Kalofolias 不能通过 deflation 回传梯度。
+
+可微分支使用固定次数 CG，移除输入 detach/no-grad，并以 `torch.stack` 组合 modes，从而保留：
+
+```text
+loss -> 后续 ADMM -> Theta -> local Kalofolias -> multi_x
+     -> multi-mode deflation CG / 正交化 -> 前一 ADMM block
+```
+
+PEMS03、batch=1 的一次前向加反向测试中，默认 detached 路径峰值 allocated 约 1917 MiB；同时开启两条可微分支约 2431 MiB。该值会随 batch size、mode 数、CG iteration 和 block 数增长。当前没有 gradient checkpoint；可微 deflation 以额外显存换取真实梯度。
+
+训练时每 20 个 batch 会通过 `tqdm.write` 输出一次当前 batch 的每个 block 的 Theta 图指标，不会破坏进度条。除稀疏度、kNN recall/precision 与度统计外，同一行还会输出 `mu_u`、`lambda_theta`、`total=mu_u+lambda_theta` 和 `mu_share=mu_u/total` 的范围与中位数。因为 `Theta` 是每个 batch 重新估计的，不是持久模型参数，所以这些图指标描述的是最近一次 forward。
+
+每个 training epoch 结束时，`Theta epoch summary` 还会对每 20 batch 的采样求平均：除图指标外，汇总 `mu_u`、`lambda_theta`、`total` 与 `mu_share` 的采样中位数均值。每次 validation 后参数不会更新，因此日志会直接打印各 block 当前的完整范围；这与对 validation batch 求均值等价。
 
 `Theta` 进入 ADMM 前会先把负的对角线元素 clamp 到 0，并把归一化分母为 0 的位置设为 0，以避免 NaN/Inf。
+
+Kalofolias 配置位于 `model.theta.kalofolias`，其中 `graph: dense|local` 选择图表示，`local_kNN` 指定 local 候选边宽度。local 模式在 ADMM 中应用归一化局部 Laplacian，而不物化 dense 矩阵。若物理传感器图的某一连通分量无法提供请求数量的邻居，代码保留请求宽度，将缺失 slot mask 为零；它们不会进入求解器、ADMM 算子或图指标。日志会报告每个节点可用邻居数的最小/最大值。
 
 `model.glasso_method`、`model.glasso_alpha`、`model.glasso_rho`、`model.glasso_eps`、`model.glasso_eigh_shift`、`model.glasso_eigh_shift_retries` 和 `model.glasso_fallback` 在 `train/config.yaml` 中配置，也可以用命令行临时覆盖。`glasso_alpha` 是所有 Graphical Lasso 后端的正则强度；`glasso_rho` 只传给 `glasso_pytorch` ADMM solver，`quic` 和 `sklearn` 会忽略它。`glasso_eps` 是可选的协方差对角 jitter，默认是 `0.0`，因为它会改变原始 GLASSO 问题。现在默认使用的是只作用在特征值分解求解器上的 shift recovery：如果 ADMM Theta 更新中的 `torch.linalg.eigh(A)` 失败，solver 会尝试 `eigh(A + delta I)`，然后把返回的特征值减回 `delta`。在精确算术下，这不会改变原本的 ADMM 更新。只有这些不改变谱问题的重试仍失败时，`glasso_fallback=True` 才会在原始协方差矩阵上 fallback 到 sklearn/quic；ridge/pinv 只是所有 GLASSO solver 都失败后的最终有限输出保护。
 如果训练中 GLASSO 触发 eigensolver fallback，训练日志会写出 `GLASSO fallback observed`，包括 epoch/batch、block index、Theta 来源、协方差维度、ADMM iteration、backend、shift 数值、retry index，以及 solver 从 ADMM 切到 sklearn/ridge 的路径。
@@ -162,3 +222,53 @@ python -m train.train_traffic --dataset METR-LA --cuda 1 --ablation DGLR --batch
 ```bash
 python -m train.train_traffic --dataset PEMS-BAY --cuda 0 --ablation UT --batchsize 64 --le-emb
 ```
+
+**示例 4**：在 PEMS03 上运行 local Kalofolias，并允许完整 multi-mode deflation 与 Theta 反传：
+
+```bash
+python -m train.train_traffic \
+  --dataset PEMS03 \
+  --cuda 1 \
+  --batchsize 1 \
+  --neighbors 4 \
+  --theta-method kalofolias \
+  --kalofolias-graph local \
+  --theta-neighbors 10 \
+  --kalofolias-allow-backward
+```
+
+最后一个开关会自动开启 `deflation.allow_backward`。若希望命令完全显式，也可额外传 `--deflation-allow-backward`。batch size 应根据显存调整；上例的 batch=1 是可微分支的保守起点。
+
+### 实验目录、日志与自动断点续训
+
+训练产物按 Theta 方法、数据集、学习率/随机种子和其余超参数组织：
+
+```text
+logs_learnable_emb/
+└── kalofolias_local/
+    └── PEMS03/
+        └── lr_5e-04_seed_3407/
+            └── diffV_shareQ_kaloBW1_deflateBW1_deflate5_.../
+```
+
+目录名中的 `kaloBW0/1` 表示 `kalofolias.allow_backward` 是否关闭/开启，`deflateBW0/1` 对应 `deflation.allow_backward`。这样不会把可微分支与默认 detached 分支的 checkpoint、日志混在同一个目录。
+
+模型目录中有两类 checkpoint：
+
+```text
+models/<experiment_name>/Huber/
+├── val_<epoch>.pth          # validation 最优时保存；只含 model.state_dict()
+└── last_train_state.pth     # 每个完整 epoch 覆盖保存；用于断点续训
+```
+
+`last_train_state.pth` 包含模型、optimizer、scheduler、下一 epoch、最佳 validation 状态、loss/Theta 历史以及 Python/NumPy/PyTorch CPU/CUDA 的 RNG 状态。以相同实验目录再次启动时会自动恢复它；可用以下选项控制：
+
+```bash
+# 指定一个完整训练状态文件
+--resume /path/to/last_train_state.pth
+
+# 忽略自动发现的 last_train_state.pth，从头训练
+--no-auto-resume
+```
+
+恢复粒度是 epoch 边界：如果进程在一个 epoch 中途退出，会从该 epoch 开始重跑；当前没有 iteration 级 checkpoint 或 gradient checkpoint。
