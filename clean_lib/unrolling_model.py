@@ -449,6 +449,7 @@ class UnrollingModel(nn.Module):
         kalofolias_threshold=1e-4,
         kalofolias_output_mode="laplacian",
         kalofolias_normalize_distances=True,
+        kalofolias_allow_backward=False,
         use_deflation=True,
         deflation_samples=None,
     ):
@@ -495,6 +496,7 @@ class UnrollingModel(nn.Module):
         self.kalofolias_threshold = kalofolias_threshold
         self.kalofolias_output_mode = kalofolias_output_mode
         self.kalofolias_normalize_distances = kalofolias_normalize_distances
+        self.kalofolias_allow_backward = kalofolias_allow_backward
         self.kalofolias_graph_estimator = KalofoliasGraphLearningModule(
             alpha=kalofolias_alpha,
             beta=kalofolias_beta,
@@ -503,7 +505,7 @@ class UnrollingModel(nn.Module):
             threshold=kalofolias_threshold,
             output_mode=kalofolias_output_mode,
             normalize_distances=kalofolias_normalize_distances,
-            allow_backward=glasso_allow_backward,
+            allow_backward=kalofolias_allow_backward,
         )
         self.use_deflation = use_deflation
         self.deflation_samples = deflation_samples
@@ -536,13 +538,14 @@ class UnrollingModel(nn.Module):
         self.theta_neighbor_list = self._build_theta_neighbor_list(k_hop)
         self.local_kalofolias_graph_estimator = LocalKalofoliasGraphLearning(
             self.theta_neighbor_list,
+            neighbor_mask=self.theta_neighbor_mask,
             alpha=kalofolias_alpha,
             beta=kalofolias_beta,
             max_iter=kalofolias_max_iter,
             tol=kalofolias_tol,
             threshold=kalofolias_threshold,
             normalize_distances=kalofolias_normalize_distances,
-            allow_backward=glasso_allow_backward,
+            allow_backward=kalofolias_allow_backward,
         )
         self.connect_list = connect_list(graph_info["n_nodes"], graph_info["u_edges"], self.device)
 
@@ -689,9 +692,10 @@ class UnrollingModel(nn.Module):
         A physical sensor graph can contain a small disconnected component. In
         that case a requested ``theta.local_kNN`` may be larger than the number
         of reachable non-self nodes for a few rows, and the shortest-path
-        helper pads those rows with ``-1``. Local Kalofolias cannot consume
-        padded candidates. We therefore use the largest complete local width
-        shared by every node, rather than inventing non-geometric neighbors.
+        helper pads those rows with ``-1``. We retain the requested width for
+        all other rows, replace padded indices with the row's own node only as
+        a safe gather target, and record a mask that forces those slots to zero
+        throughout local Kalofolias and ADMM.
         """
         uses_local_kalofolias = self._uses_local_kalofolias()
         if uses_local_kalofolias and self.theta_k_hop <= graph_k_hop:
@@ -703,25 +707,27 @@ class UnrollingModel(nn.Module):
         theta_neighbor_list = self.theta_nearest_nodes[:, 1:].to(torch.long)
         if uses_local_kalofolias and theta_neighbor_list.numel() == 0:
             raise ValueError("theta_neighbor_list is empty; set model.theta.local_kNN > 0")
-        if uses_local_kalofolias and torch.any(theta_neighbor_list < 0):
+        self.theta_neighbor_mask = theta_neighbor_list >= 0
+        self.theta_effective_k_hop = theta_neighbor_list.size(1)
+        self.theta_valid_k_min = int(self.theta_neighbor_mask.sum(dim=1).min().item())
+        self.theta_valid_k_max = int(self.theta_neighbor_mask.sum(dim=1).max().item())
+        if uses_local_kalofolias and torch.any(~self.theta_neighbor_mask):
             valid_counts = (theta_neighbor_list >= 0).sum(dim=1)
-            effective_k = int(valid_counts.min().item())
             bad_rows = torch.nonzero(valid_counts < self.theta_k_hop, as_tuple=False).flatten()
             preview = bad_rows[:10].detach().cpu().tolist()
-            if effective_k <= 0:
+            if self.theta_valid_k_min <= 0:
                 raise ValueError(
                     "Local Kalofolias has no valid non-self candidate for at least one node. "
                     f"bad_node_preview={preview}; check that the geometry graph has no isolated nodes."
                 )
             warnings.warn(
-                "Local Kalofolias reduced theta.local_kNN to the largest complete "
-                f"geometry-neighbor list: requested={self.theta_k_hop}, effective={effective_k}, "
+                "Local Kalofolias found incomplete geometry-neighbor rows and will mask "
+                f"only their missing slots: requested={self.theta_k_hop}, "
+                f"valid_neighbors_per_node=[{self.theta_valid_k_min}, {self.theta_valid_k_max}], "
                 f"affected_node_preview={preview}."
             )
-            theta_neighbor_list = theta_neighbor_list[:, :effective_k]
-            self.theta_effective_k_hop = effective_k
-        else:
-            self.theta_effective_k_hop = theta_neighbor_list.size(1)
+            self_indices = torch.arange(theta_neighbor_list.size(0), device=theta_neighbor_list.device).unsqueeze(1)
+            theta_neighbor_list = torch.where(self.theta_neighbor_mask, theta_neighbor_list, self_indices)
         return theta_neighbor_list
 
     def set_debug_numerics(self, enabled, context=""):
@@ -824,11 +830,24 @@ class UnrollingModel(nn.Module):
         )
 
     def clamp_param(self, alpha_max=None, beta_max=None):
-        """Clamp learnable CG step sizes after optimizer updates."""
+        """Project constrained ADMM parameters after optimizer updates.
+
+        ``mu_u`` and ``lambda_theta`` are represented as a positive shared
+        total and a sigmoid split, so they need no post-step clipping.  The
+        remaining ADMM penalties ``mu_d*`` and ``rho*`` must remain positive.
+        Keep only these mathematically constrained quantities, plus the
+        learned CG step sizes, in their valid domains; ordinary network
+        weights remain unconstrained.
+        """
         for block in self.model_blocks:
             admm_block = block["ADMM_block"]
             self._clamp_cg_param(admm_block, "alpha", alpha_max)
             self._clamp_cg_param(admm_block, "beta", beta_max)
+            eps = torch.finfo(admm_block.mu_u.dtype).eps
+            for name in ("mu_d1", "mu_d2", "rho", "rho_u", "rho_d"):
+                parameter = getattr(admm_block, name, None)
+                if parameter is not None:
+                    parameter.data.clamp_(min=eps)
 
     def _clamp_cg_param(self, admm_block, prefix, max_value):
         suffixes = ["x"]
@@ -1003,6 +1022,7 @@ class UnrollingModel(nn.Module):
             admm_block.u_ew = u_ew
             admm_block.d_ew = d_ew
             admm_block.theta_neighbor_list = self.theta_neighbor_list if self._uses_local_kalofolias() else None
+            admm_block.theta_neighbor_mask = self.theta_neighbor_mask if self._uses_local_kalofolias() else None
             admm_block.theta_operator_mode = self.kalofolias_output_mode.lower() if self._uses_local_kalofolias() else "matrix"
             # Theta branch:
             #   output[..., 0:1] is (B, T, N, 1).

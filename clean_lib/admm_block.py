@@ -81,24 +81,26 @@ class UnrolledCGSolver(nn.Module):
 
 
 class DeflationCGSolver(nn.Module):
-    """Non-parametric CG solver used by multi-signal deflation.
+    """CG solver used by multi-signal deflation.
 
-    Unlike `UnrolledCGSolver`, this solver has no learnable step sizes and is
-    always executed under `torch.no_grad()`.  It works on ADMM output tensors
-    shaped (B, T, N, C), and treats all dimensions except batch as one
-    flattened vector space.
+    ``allow_backward=False`` preserves the original detached auxiliary-solver
+    behavior.  The experimental differentiable path uses a fixed number of CG
+    iterations so autograd can retain the complete multi-mode graph.
     """
 
-    def __init__(self, max_iter=10, tol=1e-6):
+    def __init__(self, max_iter=10, tol=1e-6, allow_backward=False):
         super().__init__()
         self.max_iter = max_iter
         self.tol = tol
+        self.allow_backward = allow_backward
 
     def solve(self, A_func, b, x0=None):
+        if self.allow_backward:
+            return self._solve(A_func, b, x0, early_stop=False)
         with torch.no_grad():
-            return self._solve_no_grad(A_func, b.detach(), None if x0 is None else x0.detach())
+            return self._solve(A_func, b.detach(), None if x0 is None else x0.detach(), early_stop=True)
 
-    def _solve_no_grad(self, A_func, b, x0=None):
+    def _solve(self, A_func, b, x0=None, early_stop=True):
         if x0 is None:
             x = torch.zeros_like(b)
         else:
@@ -110,7 +112,7 @@ class DeflationCGSolver(nn.Module):
         rsold = (r * r).sum(dim=reduce_dims)
         eps = torch.finfo(b.dtype).eps
 
-        if torch.all(torch.sqrt(rsold) < self.tol):
+        if early_stop and torch.all(torch.sqrt(rsold) < self.tol):
             return x
 
         for _ in range(self.max_iter):
@@ -124,7 +126,7 @@ class DeflationCGSolver(nn.Module):
             x = x + alpha.view(view_shape) * p
             r = r - alpha.view(view_shape) * Ap
             rsnew = (r * r).sum(dim=reduce_dims)
-            if torch.all(torch.sqrt(rsnew) < self.tol):
+            if early_stop and torch.all(torch.sqrt(rsnew) < self.tol):
                 break
 
             valid_rsold = rsold > eps
@@ -202,6 +204,7 @@ class ADMMBlock(nn.Module):
         self.d_ew = None
         self.Theta = None
         self.theta_neighbor_list = None
+        self.theta_neighbor_mask = None
         self.theta_operator_mode = "matrix"
 
         self.ADMM_iters = ADMM_info["ADMM_iters"]
@@ -209,6 +212,7 @@ class ADMMBlock(nn.Module):
         self.deflation_samples = ADMM_info.get("deflation_samples", 2)
         self.deflation_CG_iters = ADMM_info.get("deflation_CG_iters", self.CG_iters)
         self.deflation_tol = ADMM_info.get("deflation_tol", 1e-6)
+        self.deflation_allow_backward = ADMM_info.get("deflation_allow_backward", False)
 
         self.mu_u_init = ADMM_info["mu_u_init"]
         self.mu_d1_init = ADMM_info["mu_d1_init"]
@@ -260,15 +264,49 @@ class ADMMBlock(nn.Module):
     def beta_zd(self):
         return self.zd_solver.beta
 
+    @property
+    def mu_u(self):
+        """Spatial-graph weight, balanced with ``lambda_theta`` when present.
+
+        The two spatial regularizers share one positive total strength.  A
+        sigmoid gate chooses the fraction assigned to the learned graph
+        Laplacian, while the remainder weights the local-Theta Laplacian.
+        """
+        if self._couple_mu_theta:
+            total = torch.nn.functional.softplus(self.mu_theta_total_raw)
+            return total * torch.sigmoid(self.mu_theta_gate_logits)
+        return self._mu_u
+
+    @property
+    def lambda_theta(self):
+        """Learned-Theta weight complementary to :attr:`mu_u`."""
+        if not self._couple_mu_theta:
+            raise AttributeError("lambda_theta is unavailable when Theta is ablated")
+        total = torch.nn.functional.softplus(self.mu_theta_total_raw)
+        return total * (1.0 - torch.sigmoid(self.mu_theta_gate_logits))
+
     def _init_admm_parameters(self):
-        self.mu_u = self._vector_parameter(self.mu_u_init)
+        self._couple_mu_theta = self._uses_theta_regularizer()
+        if self._couple_mu_theta:
+            # Parameterize mu_u + lambda_theta as a positive total and split
+            # it between the two spatial Laplacians with a sigmoid gate.
+            total_init = self.mu_u_init + self.lambda_init
+            if total_init <= 0:
+                raise ValueError("mu_u_init + lambda_init must be positive")
+            gate_init = self.mu_u_init / total_init
+            if not 0 < gate_init < 1:
+                raise ValueError("mu_u_init and lambda_init must both be positive")
+            total_raw_init = math.log(math.expm1(total_init))
+            gate_raw_init = math.log(gate_init / (1.0 - gate_init))
+            self.mu_theta_total_raw = self._vector_parameter(total_raw_init)
+            self.mu_theta_gate_logits = self._vector_parameter(gate_raw_init)
+        else:
+            self._mu_u = self._vector_parameter(self.mu_u_init)
 
         if self.ablation != "DGTV":
             self.mu_d1 = self._vector_parameter(self.mu_d1_init)
         if self.ablation != "DGLR":
             self.mu_d2 = self._vector_parameter(self.mu_d2_init)
-        if self._uses_theta_regularizer():
-            self.lambda_theta = self._vector_parameter(self.lambda_init)
 
         rho_init = math.sqrt(self.n_nodes / self.T)
         self.rho_init = rho_init
@@ -316,6 +354,7 @@ class ADMMBlock(nn.Module):
         self.deflation_solver = DeflationCGSolver(
             max_iter=self.deflation_CG_iters,
             tol=self.deflation_tol,
+            allow_backward=self.deflation_allow_backward,
         )
 
     def _make_cg_solver(self, name, alpha_init, beta_init):
@@ -707,11 +746,19 @@ class ADMMBlock(nn.Module):
             return x
         output = x
         for basis_idx in range(n_basis):
-            output = self._remove_mode_projection(output, basis[:, basis_idx])
+            q = basis[basis_idx] if isinstance(basis, list) else basis[:, basis_idx]
+            output = self._remove_mode_projection(output, q)
         return output
 
     def _initial_deflation_state(self, rhs, e_step_x, n_modes):
         """Initialize multi_x so mode 0 is exactly the original ADMM output."""
+        first_q = self._normalize_mode(e_step_x)
+        projected_rhs = self._remove_mode_projection(rhs, first_q)
+        if self.deflation_allow_backward:
+            # Lists and torch.stack preserve the graph from every mode back to
+            # the ADMM output; indexed writes into a preallocated tensor do not.
+            return [e_step_x], [first_q], projected_rhs
+
         multi_x = torch.zeros(
             (e_step_x.size(0), n_modes) + tuple(e_step_x.shape[1:]),
             dtype=e_step_x.dtype,
@@ -720,9 +767,7 @@ class ADMMBlock(nn.Module):
         multi_x[:, 0] = e_step_x
 
         basis = torch.zeros_like(multi_x)
-        first_q = self._normalize_mode(e_step_x)
         basis[:, 0] = first_q
-        projected_rhs = self._remove_mode_projection(rhs, first_q)
         return multi_x, basis, projected_rhs
 
     def _run_deflation(self, rhs, e_step_x, n_modes, iteration):
@@ -749,13 +794,16 @@ class ADMMBlock(nn.Module):
 
             z = self.deflation_solver.solve(projected_A_func, projected_rhs)
             x_k = self._project_orthogonal(z, basis, mode_idx)
-            multi_x[:, mode_idx] = x_k
-
             q_k = self._normalize_mode(x_k)
-            basis[:, mode_idx] = q_k
+            if self.deflation_allow_backward:
+                multi_x.append(x_k)
+                basis.append(q_k)
+            else:
+                multi_x[:, mode_idx] = x_k
+                basis[:, mode_idx] = q_k
             projected_rhs = self._remove_mode_projection(projected_rhs, q_k)
 
-        return multi_x
+        return torch.stack(multi_x, dim=1) if self.deflation_allow_backward else multi_x
 
     def forward(self, y, mask=None, deflation=False, deflation_samples=None, deflation_iteration=None):
         """Run one ADMM block over a sequence.
@@ -845,9 +893,11 @@ class ADMMBlock(nn.Module):
             deflation_iteration = self.ADMM_iters - 1
         if not 0 <= deflation_iteration < self.ADMM_iters:
             raise ValueError("deflation_iteration must be in [0, ADMM_iters)")
+        deflation_rhs_for_solver = deflation_rhs if self.deflation_allow_backward else deflation_rhs.detach()
+        output_for_solver = output if self.deflation_allow_backward else output.detach()
         multi_x = self._run_deflation(
-            deflation_rhs.detach(),
-            output.detach(),
+            deflation_rhs_for_solver,
+            output_for_solver,
             deflation_samples,
             deflation_iteration,
         )

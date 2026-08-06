@@ -169,6 +169,7 @@ def _local_objective(w: torch.Tensor, z: torch.Tensor, degree: torch.Tensor, alp
 def _solve_local(
     distances: torch.Tensor,
     neighbor_list: torch.Tensor,
+    neighbor_mask: torch.Tensor,
     alpha: float,
     beta: float,
     max_iter: int,
@@ -183,7 +184,15 @@ def _solve_local(
     if gamma <= 0:
         raise ValueError("step_size must be positive")
 
-    w = torch.full_like(distances, 1.0 / max(k_neighbors, 1))
+    neighbor_mask = neighbor_mask.to(device=distances.device, dtype=torch.bool)
+    if neighbor_mask.shape != distances.shape[-2:]:
+        raise ValueError("neighbor_mask must have shape (N, K) matching neighbor_list")
+    if torch.any(~neighbor_mask.any(dim=-1)):
+        raise ValueError("every node needs at least one valid local Kalofolias candidate")
+    mask = neighbor_mask if distances.ndim == 2 else neighbor_mask.unsqueeze(0)
+    valid_counts = neighbor_mask.sum(dim=-1).to(dtype=distances.dtype)
+    initial_weights = valid_counts.reciprocal().unsqueeze(-1) * neighbor_mask.to(dtype=distances.dtype)
+    w = initial_weights if distances.ndim == 2 else initial_weights.unsqueeze(0).expand_as(distances)
     d = torch.zeros_like(distances[..., 0])
     relative_change_history: List[float] = []
     objective_history: List[float] = []
@@ -198,16 +207,16 @@ def _solve_local(
         #   S w = row_sum(w), shape (..., N)
         #   S^T d = d[..., i] broadcast to every candidate edge of node i.
         st_d = d.unsqueeze(-1)
-        y = w - gamma * (2.0 * beta * w + st_d)
+        y = (w - gamma * (2.0 * beta * w + st_d)) * mask
         y_bar = d + gamma * w.sum(dim=-1)
 
-        p = torch.clamp(y - 2.0 * gamma * distances, min=0.0)
+        p = torch.clamp(y - 2.0 * gamma * distances, min=0.0) * mask
         p_bar = 0.5 * (y_bar - torch.sqrt(y_bar.square() + 4.0 * alpha * gamma))
 
-        q = p - gamma * (2.0 * beta * p + p_bar.unsqueeze(-1))
+        q = (p - gamma * (2.0 * beta * p + p_bar.unsqueeze(-1))) * mask
         q_bar = p_bar + gamma * p.sum(dim=-1)
 
-        w = w - y + q
+        w = (w - y + q) * mask
         d = d - y_bar + q_bar
 
         degree = w.sum(dim=-1)
@@ -218,7 +227,8 @@ def _solve_local(
         relative_change = float(relative_change_tensor.detach().cpu())
         objective_history.append(float(objective.detach().cpu()))
         relative_change_history.append(relative_change)
-        nnz_ratio_history.append(float((w > threshold).to(torch.float64).mean().detach().cpu()))
+        active_slots = neighbor_mask.sum().to(torch.float64)
+        nnz_ratio_history.append(float(((w > threshold).sum().to(torch.float64) / (active_slots * (1 if w.ndim == 2 else w.size(0)))).detach().cpu()))
         if relative_change <= tol:
             converged = True
             break
@@ -244,6 +254,7 @@ def learn_local_graph_from_smooth_signals(
     signals: Union[torch.Tensor, object],
     neighbor_list: Union[torch.Tensor, object],
     *,
+    neighbor_mask: Optional[Union[torch.Tensor, object]] = None,
     alpha: float = 0.3,
     beta: float = 1.0,
     max_iter: int = 200,
@@ -258,7 +269,10 @@ def learn_local_graph_from_smooth_signals(
 
     Args:
         signals: ``(N, S)`` or ``(B, N, S)`` smooth node signals.
-        neighbor_list: ``(N, K)`` candidate neighbor indices.
+        neighbor_list: ``(N, K)`` candidate neighbor indices. Invalid padded
+            slots may safely point to the row's own node when `neighbor_mask`
+            marks them false.
+        neighbor_mask: optional boolean valid-candidate mask, shape ``(N, K)``.
 
     Returns:
         Local weights with shape ``(N, K)`` or ``(B, N, K)`` by default.
@@ -275,10 +289,17 @@ def learn_local_graph_from_smooth_signals(
     signals = _validate_signals(signals)
     n_nodes = signals.size(-2)
     neighbor_list = _validate_neighbor_list(neighbor_list, n_nodes, signals.device)
+    if neighbor_mask is None:
+        neighbor_mask = torch.ones_like(neighbor_list, dtype=torch.bool)
+    else:
+        neighbor_mask = torch.as_tensor(neighbor_mask, device=signals.device, dtype=torch.bool)
+        if neighbor_mask.shape != neighbor_list.shape:
+            raise ValueError("neighbor_mask must have shape (N, K) matching neighbor_list")
     distances = _local_pairwise_squared_distances(signals, neighbor_list, normalize_distances)
     result = _solve_local(
         distances,
         neighbor_list,
+        neighbor_mask,
         alpha,
         beta,
         max_iter,
@@ -300,6 +321,7 @@ class LocalKalofoliasGraphLearning(nn.Module):
     def __init__(
         self,
         neighbor_list: Union[torch.Tensor, object],
+        neighbor_mask: Optional[Union[torch.Tensor, object]] = None,
         alpha: float = 0.3,
         beta: float = 1.0,
         max_iter: int = 200,
@@ -312,6 +334,9 @@ class LocalKalofoliasGraphLearning(nn.Module):
     ):
         super().__init__()
         self.register_buffer("neighbor_list", torch.as_tensor(neighbor_list, dtype=torch.long))
+        if neighbor_mask is None:
+            neighbor_mask = torch.ones_like(self.neighbor_list, dtype=torch.bool)
+        self.register_buffer("neighbor_mask", torch.as_tensor(neighbor_mask, dtype=torch.bool))
         self.alpha = alpha
         self.beta = beta
         self.max_iter = max_iter
@@ -328,6 +353,7 @@ class LocalKalofoliasGraphLearning(nn.Module):
             return learn_local_graph_from_smooth_signals(
                 signals,
                 self.neighbor_list,
+                neighbor_mask=self.neighbor_mask,
                 alpha=self.alpha,
                 beta=self.beta,
                 max_iter=self.max_iter,
@@ -342,6 +368,7 @@ class LocalKalofoliasGraphLearning(nn.Module):
             return learn_local_graph_from_smooth_signals(
                 signals.detach(),
                 self.neighbor_list,
+                neighbor_mask=self.neighbor_mask,
                 alpha=self.alpha,
                 beta=self.beta,
                 max_iter=self.max_iter,

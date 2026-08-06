@@ -214,9 +214,12 @@ def _update_channel_metrics(sums, output, x, t_in):
         pred_MAE: `t_in:` 预测区间的逐通道 MAE
         pred_MAPE: `t_in:` 预测区间的逐通道 MAPE，忽略接近 0 的真实值
     """
+    # Metrics are evaluated on physical, non-negative predictions.  Keep this
+    # local to metric calculation so validation loss still uses raw output.
+    metric_output = output.clamp_min(0)
     x_pred = x[:, t_in:]
-    output_pred = output[:, t_in:]
-    sums['rec_mse'] += ((x[:, :t_in] - output[:, :t_in]) ** 2).detach().mean((0, 1, 2)).cpu().numpy()
+    output_pred = metric_output[:, t_in:]
+    sums['rec_mse'] += ((x[:, :t_in] - metric_output[:, :t_in]) ** 2).detach().mean((0, 1, 2)).cpu().numpy()
     sums['pred_mse'] += ((x_pred - output_pred) ** 2).detach().mean((0, 1, 2)).cpu().numpy()
     sums['pred_mae'] += torch.abs(output_pred - x_pred).detach().mean((0, 1, 2)).cpu().numpy()
 
@@ -383,15 +386,34 @@ def compute_metrics(output, x, masked_flag, t_in):
     返回:
         rec_MSE: `:t_in` 重建区间的 MSE
         pred_MSE/pred_MAE/pred_MAPE: `t_in:` 预测区间的误差
+        pred_Huber: `t_in:` 预测区间、delta=1 的 Huber 误差；用于和训练
+            objective 做同尺度的诊断比较
+        pred_abs_error_p95/p99/max: 预测段绝对误差的长尾诊断
+        pred_abs_error_gt_100_rate: 预测段绝对误差大于 100 的元素占比
+        pred_max_error_*: 最大绝对误差对应的样本、预测步、节点、通道，以及
+            该位置的预测值和真实值
         pred_MSE_stepwise: 每个预测步的 MSE，shape (T - t_in,)
         truth_sq_stepwise/truth_sq: 真实值平方均值，用于计算 rNMSE
         nearest_loss: 第一个预测步 `t_in` 的 MSE
     """
-    rec_mse = ((x[:, :t_in] - output[:, :t_in]) ** 2).mean().item()
+    # Clamp only for reporting metrics.  In particular, callers that compute
+    # loss before calling this function retain the original model output.
+    metric_output = output.clamp_min(0)
+    rec_mse = ((x[:, :t_in] - metric_output[:, :t_in]) ** 2).mean().item()
     x_pred = x[:, t_in:]
-    output_pred = output[:, t_in:]
+    output_pred = metric_output[:, t_in:]
     pred_mse = ((x_pred - output_pred) ** 2).mean().item()
     pred_mae = torch.abs(output_pred - x_pred).mean().item()
+    abs_error = torch.abs(output_pred - x_pred)
+    # Keep this definition explicit instead of constructing a loss module on
+    # every evaluation.  It is equivalent to HuberLoss(delta=1,
+    # reduction="mean") and uses the same clamped predictions as RMSE/MAE.
+    pred_huber = torch.where(abs_error <= 1, 0.5 * abs_error.square(), abs_error - 0.5).mean().item()
+    max_error_flat_index = abs_error.reshape(-1).argmax()
+    max_sample, max_step, max_node, max_channel = (
+        int(index.item())
+        for index in torch.unravel_index(max_error_flat_index, abs_error.shape)
+    )
 
     mask = torch.abs(x_pred) > 1e-8
     if mask.any():
@@ -402,13 +424,24 @@ def compute_metrics(output, x, masked_flag, t_in):
     pred_mse_stepwise = ((x_pred - output_pred) ** 2).mean((0, 2, 3))
     truth_sq_stepwise = (x_pred ** 2).mean((0, 2, 3))
     truth_sq = (x_pred ** 2).mean()
-    nearest_loss = ((x[:, t_in] - output[:, t_in]) ** 2).mean().item()
+    nearest_loss = ((x[:, t_in] - metric_output[:, t_in]) ** 2).mean().item()
 
     return {
         'rec_MSE': rec_mse,
         'pred_MSE': pred_mse,
         'pred_MAE': pred_mae,
         'pred_MAPE': pred_mape,
+        'pred_Huber': pred_huber,
+        'pred_abs_error_p95': torch.quantile(abs_error, 0.95).item(),
+        'pred_abs_error_p99': torch.quantile(abs_error, 0.99).item(),
+        'pred_abs_error_max': abs_error.max().item(),
+        'pred_abs_error_gt_100_rate': (abs_error > 100).float().mean().item(),
+        'pred_max_error_sample': max_sample,
+        'pred_max_error_step': max_step,
+        'pred_max_error_node': max_node,
+        'pred_max_error_channel': max_channel,
+        'pred_max_error_prediction': output_pred[max_sample, max_step, max_node, max_channel].item(),
+        'pred_max_error_truth': x_pred[max_sample, max_step, max_node, max_channel].item(),
         'pred_MSE_stepwise': pred_mse_stepwise,
         'truth_sq_stepwise': truth_sq_stepwise,
         'truth_sq': truth_sq,
