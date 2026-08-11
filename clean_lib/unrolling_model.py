@@ -829,25 +829,45 @@ class UnrollingModel(nn.Module):
             torch.Tensor(Ldx_l2_list),
         )
 
-    def clamp_param(self, alpha_max=None, beta_max=None):
+    def clamp_param(self, alpha_max=None, beta_max=None, project_admm_penalties=True):
         """Project constrained ADMM parameters after optimizer updates.
 
-        ``mu_u`` and ``lambda_theta`` are represented as a positive shared
-        total and a sigmoid split, so they need no post-step clipping.  The
-        remaining ADMM penalties ``mu_d*`` and ``rho*`` must remain positive.
-        Keep only these mathematically constrained quantities, plus the
-        learned CG step sizes, in their valid domains; ordinary network
-        weights remain unconstrained.
+        With coupled spatial penalties, ``mu_u`` and ``lambda_theta`` use a
+        positive shared-total/sigmoid-split parameterization and need no
+        post-step clipping. With independent spatial penalties, their raw
+        parameters are projected pairwise so both are non-negative and at
+        least one of ``mu_u[i]`` and ``lambda_theta[i]`` is positive at every
+        ADMM iteration. The remaining ADMM penalties ``mu_d*`` and ``rho*``
+        are directly clipped to the positive domain.
+        ``project_admm_penalties=False`` is an ablation switch: it retains the
+        CG step-size clamp while deliberately skipping all ADMM-penalty
+        projection. Ordinary network weights remain unconstrained.
         """
         for block in self.model_blocks:
             admm_block = block["ADMM_block"]
             self._clamp_cg_param(admm_block, "alpha", alpha_max)
             self._clamp_cg_param(admm_block, "beta", beta_max)
-            eps = torch.finfo(admm_block.mu_u.dtype).eps
-            for name in ("mu_d1", "mu_d2", "rho", "rho_u", "rho_d"):
-                parameter = getattr(admm_block, name, None)
-                if parameter is not None:
-                    parameter.data.clamp_(min=eps)
+            if project_admm_penalties:
+                eps = torch.finfo(admm_block.mu_u.dtype).eps
+                for name in ("mu_d1", "mu_d2", "rho", "rho_u", "rho_d"):
+                    parameter = getattr(admm_block, name, None)
+                    if parameter is not None:
+                        parameter.data.clamp_(min=eps)
+                if not admm_block._couple_mu_theta:
+                    mu_u = getattr(admm_block, "_mu_u", None)
+                    lambda_theta = getattr(admm_block, "_lambda_theta", None)
+                    if mu_u is not None and lambda_theta is not None:
+                        # Project onto mu_u >= 0, lambda_theta >= 0, and
+                        # mu_u + lambda_theta > 0.  The strict final condition
+                        # is approximated with dtype epsilon.  If both values
+                        # would become zero, promote the originally larger one
+                        # so the smallest possible change is made.
+                        promote_mu_u = mu_u.data >= lambda_theta.data
+                        mu_u.data.clamp_(min=0)
+                        lambda_theta.data.clamp_(min=0)
+                        both_zero = (mu_u.data == 0) & (lambda_theta.data == 0)
+                        mu_u.data[both_zero & promote_mu_u] = eps
+                        lambda_theta.data[both_zero & ~promote_mu_u] = eps
 
     def _clamp_cg_param(self, admm_block, prefix, max_value):
         suffixes = ["x"]

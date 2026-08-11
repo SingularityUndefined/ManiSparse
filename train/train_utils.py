@@ -13,6 +13,7 @@ import os
 import sys
 import warnings
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 
 import torch
@@ -53,6 +54,7 @@ MODEL_CONFIG_PATHS = {
     "deflation_CG_iters": ("deflation", "CG_iters"),
     "deflation_tol": ("deflation", "tol"),
     "deflation_allow_backward": ("deflation", "allow_backward"),
+    "deflation_per_timestep": ("deflation", "per_timestep"),
     "glasso_backend": ("theta", "glasso", "backend"),
     "glasso_alpha": ("theta", "glasso", "alpha"),
     "glasso_rho": ("theta", "glasso", "rho"),
@@ -83,6 +85,7 @@ MODEL_DEFAULTS = {
     "deflation_samples": 5,
     "deflation_tol": 1e-6,
     "deflation_allow_backward": False,
+    "deflation_per_timestep": False,
     "theta_method": "glasso",
     "glasso_backend": "admm",
     "glasso_alpha": 0.2,
@@ -121,6 +124,7 @@ class TrainingPaths:
     plot_dir: str
     plot_path: str
     theta_plot_path: str
+    spatial_penalty_plot_path: str
     train_state_path: str
 
 
@@ -214,6 +218,12 @@ def parse_args(argv=None):
     parser.add_argument("--cuda", help="CUDA device", default=-1, type=int)
     parser.add_argument("--dataset", help="dataset name", type=str, required=True)
     parser.add_argument("--batchsize", help="batch size", type=int, required=True)
+    parser.add_argument(
+        "--logs-dir",
+        default=f"logs_{datetime.now().strftime('%m%d')}",
+        type=str,
+        help="root directory used for logs, models, plots, and TensorBoard data (default: logs_MMDD for today)",
+    )
     parser.add_argument("--mode", help="normalization mode", default="standardize", type=str)
 
     parser.add_argument("--neighbors", help="temporary override for model.graph.kNN", default=None, type=int)
@@ -230,6 +240,18 @@ def parse_args(argv=None):
     parser.set_defaults(use_stepLR=False)
     parser.add_argument("--stepsize", help="stepLR stepsize", default=8, type=int)
     parser.add_argument("--gamma", help="stepLR gamma", default=0.2, type=float)
+    _add_bool_override(
+        parser,
+        "project-admm-penalties",
+        "project_admm_penalties",
+        "project mu_d*/rho* to their positive domain after each optimizer step",
+    )
+    _add_bool_override(
+        parser,
+        "couple-spatial-penalties",
+        "couple_spatial_penalties",
+        "parameterize mu_u/lambda_theta as a positive shared total and sigmoid split",
+    )
 
     _add_bool_override(parser, "sharedM", "sharedM", "temporary override for model.graph_learning.sharedM")
     _add_bool_override(parser, "sharedQ", "sharedQ", "temporary override for model.graph_learning.sharedQ")
@@ -275,6 +297,12 @@ def parse_args(argv=None):
         "deflation_allow_backward",
         "temporary override for model.deflation.allow_backward",
     )
+    _add_bool_override(
+        parser,
+        "deflation-per-timestep",
+        "deflation_per_timestep",
+        "temporary override for model.deflation.per_timestep",
+    )
     parser.add_argument("--theta-method", help="temporary override for model.theta.method", default=None, type=str, choices=["glasso", "kalofolias"])
     parser.add_argument("--glasso-backend", help="temporary override for model.theta.glasso.backend", default=None, type=str, choices=["admm", "quic", "sklearn"])
     parser.add_argument("--glasso-alpha", help="temporary override for model.theta.glasso.alpha", default=None, type=float)
@@ -313,6 +341,12 @@ def parse_args(argv=None):
 
 def apply_args_to_config(config, args):
     """Apply CLI overrides to the loaded config in-place."""
+    if args.project_admm_penalties is not None:
+        config["project_admm_penalties"] = args.project_admm_penalties
+    config.setdefault("project_admm_penalties", True)
+    if args.couple_spatial_penalties is not None:
+        config["couple_spatial_penalties"] = args.couple_spatial_penalties
+    config.setdefault("couple_spatial_penalties", True)
     model_config = _flatten_model_config(config["model"])
     arg_to_config_key = {
         "neighbors": "kNN",
@@ -331,6 +365,7 @@ def apply_args_to_config(config, args):
         "deflation_CGiters": "deflation_CG_iters",
         "deflation_tol": "deflation_tol",
         "deflation_allow_backward": "deflation_allow_backward",
+        "deflation_per_timestep": "deflation_per_timestep",
         "deflation": "use_deflation",
         "theta_method": "theta_method",
         "glasso_backend": "glasso_backend",
@@ -420,7 +455,7 @@ def build_experiment_names(config, args):
     """Create log/model directory names without touching the filesystem."""
     learning_rate = config["learning_rate"]
     model_config = get_model_config(config)
-    logs_dir = "logs_learnable_emb" if model_config["le_emb"] else "dense_logs_new"
+    logs_dir = args.logs_dir
 
     dataset_name = args.dataset
     theta_method = model_config.get("theta_method", "glasso")
@@ -437,19 +472,25 @@ def build_experiment_names(config, args):
     feature_channels = model_config["feature_channels"]
     loss_name = config["loss_function"]
 
-    name = (
-        f"s{config['data_stride']}_{num_blocks}b{num_layers}_{num_heads}h_"
-        f"{feature_channels}f_{args.FElayers}FE_"
-        f"k{model_config['kNN']}_thetaK{model_config['theta_kNN']}_int{interval}"
+    # Keep the architecture-defining settings as a directory level.  The
+    # remaining run name contains only the ablations and training variants.
+    architecture_dir = (
+        f"thetaK{model_config['theta_kNN']}_k{model_config['kNN']}_"
+        f"{num_blocks}b_{num_layers}l_{num_heads}h_{feature_channels}f_"
+        f"s{config['data_stride']}_int{interval}_{args.FElayers}FE"
     )
+    name = "normed_loss" if config["normed_loss"] else "true_loss"
     if args.pred_only:
         name = "predOnly_" + name
     if model_config.get("use_deflation", False):
         name = f"deflate{model_config['deflation_samples']}_" + name
+        if model_config["deflation_per_timestep"]:
+            name = "deflatePerT_" + name
     name = (
         f"kaloBW{int(model_config['kalofolias_allow_backward'])}_"
         f"deflateBW{int(model_config['deflation_allow_backward'])}_" + name
     )
+    name = f"spatialCoupled{int(config.get('couple_spatial_penalties', True))}_" + name
     if args.trunc:
         name = "trunc_" + name
     if args.ablation != "None":
@@ -458,15 +499,7 @@ def build_experiment_names(config, args):
         name = "LR_" + name
     if not model_config["use_one_channel"]:
         name = "AllChannel_" + name
-    if model_config["sharedM"]:
-        name = "shareM_" + name
-    if model_config["sharedQ"]:
-        name = "shareQ_" + name
-    if model_config["diff_interval"]:
-        name = "diffV_" + name
-    name += "_normed_loss" if config["normed_loss"] else "_true_loss"
-
-    experiment_dir = os.path.join(theta_family, dataset_name, lr_seed_dir)
+    experiment_dir = os.path.join(theta_family, dataset_name, lr_seed_dir, architecture_dir)
     experiment_name = os.path.join(experiment_dir, name)
     log_filename = f"{loss_name}.log"
     return ExperimentNames(logs_dir, experiment_dir, experiment_name, log_filename)
@@ -483,6 +516,7 @@ def create_training_paths(names):
     plot_dir = f"./{names.logs_dir}/loss_curves/{names.experiment_name}"
     plot_path = os.path.join(plot_dir, f"{run_id}.png")
     theta_plot_path = os.path.join(plot_dir, f"{run_id}_theta_metrics.png")
+    spatial_penalty_plot_path = os.path.join(plot_dir, f"{run_id}_spatial_penalties.png")
     train_state_path = os.path.join(model_dir, "last_train_state.pth")
 
     for path in [tensorboard_logdir, log_dir, model_dir, plot_dir, os.path.dirname(debug_model_path)]:
@@ -496,6 +530,7 @@ def create_training_paths(names):
         plot_dir,
         plot_path,
         theta_plot_path,
+        spatial_penalty_plot_path,
         train_state_path,
     )
 
@@ -571,6 +606,8 @@ def build_admm_info(config):
         "deflation_CG_iters": model_config["deflation_CG_iters"],
         "deflation_tol": model_config["deflation_tol"],
         "deflation_allow_backward": model_config["deflation_allow_backward"],
+        "deflation_per_timestep": model_config["deflation_per_timestep"],
+        "couple_spatial_penalties": config["couple_spatial_penalties"],
     }
 
 
@@ -701,10 +738,41 @@ def collect_theta_support_deltas(model):
                 "numel": numel,
                 "shape": tuple(theta.shape),
                 "support_delta": support_delta,
+                "value_distribution": _theta_value_distribution(admm_block, theta),
                 "spatial_balance": spatial_balance,
             }
         )
     return stats
+
+
+def _theta_value_distribution(admm_block, theta):
+    """Summarize the magnitude distribution of learned nonzero Theta edges.
+
+    Dense Theta matrices include a diagonal that represents self/degree terms,
+    not pairwise learned edges, so it is excluded.  Local Kalofolias Theta has
+    only candidate-edge slots and is used directly.  Absolute values make the
+    statistic comparable across precision and Laplacian-style Theta outputs.
+    """
+    if admm_block._is_local_theta(theta):
+        edge_values = theta.reshape(-1)
+    elif theta.ndim == 2:
+        edge_values = theta[~torch.eye(theta.size(0), dtype=torch.bool, device=theta.device)]
+    elif theta.ndim == 3:
+        diagonal = torch.eye(theta.size(-1), dtype=torch.bool, device=theta.device).unsqueeze(0)
+        edge_values = theta[~diagonal.expand_as(theta)]
+    else:
+        return None
+
+    magnitudes = edge_values.abs()
+    magnitudes = magnitudes[magnitudes > 0]
+    if magnitudes.numel() == 0:
+        return None
+    quantiles = torch.quantile(magnitudes.to(torch.float32), torch.tensor([0.1, 0.5, 0.9], device=magnitudes.device))
+    return {
+        "abs_q10": float(quantiles[0]),
+        "abs_q50": float(quantiles[1]),
+        "abs_q90": float(quantiles[2]),
+    }
 
 
 def _knn_baseline_mask(model, candidate_nodes, device):
@@ -880,6 +948,30 @@ def _summarize_spatial_balance(admm_block):
     }
 
 
+def collect_spatial_penalty_vectors(model):
+    """Return full per-ADMM-iteration spatial penalty vectors by block."""
+    vectors = []
+    for block_idx, block in enumerate(model.model_blocks):
+        # Block 0 has no Theta estimate, so lambda_theta is not active there.
+        if block_idx == 0:
+            continue
+        admm_block = block["ADMM_block"]
+        try:
+            mu_u = torch.as_tensor(admm_block.mu_u).detach().to(torch.float32).reshape(-1).cpu().tolist()
+            lambda_theta = torch.as_tensor(admm_block.lambda_theta).detach().to(torch.float32).reshape(-1).cpu().tolist()
+        except AttributeError:
+            # Theta ablation does not define an active lambda_theta branch.
+            continue
+        vectors.append(
+            {
+                "block_idx": block_idx,
+                "mu_u": mu_u,
+                "lambda_theta": lambda_theta,
+            }
+        )
+    return vectors
+
+
 def _format_coefficient(stats):
     """Format one coefficient summary for the sampled training output."""
     kind = stats["kind"]
@@ -977,6 +1069,9 @@ def summarize_theta_metric_samples(theta_samples):
                     "sparsity": [],
                     "recall": [],
                     "precision": [],
+                    "theta_abs_q10": [],
+                    "theta_abs_q50": [],
+                    "theta_abs_q90": [],
                     "mu_u": [],
                     "lambda_theta": [],
                     "total": [],
@@ -992,6 +1087,10 @@ def summarize_theta_metric_samples(theta_samples):
                 value = graph_metrics.get("precision")
                 if value is not None:
                     item["precision"].append(float(value))
+            value_distribution = stat.get("value_distribution")
+            if value_distribution is not None:
+                for quantile in ("abs_q10", "abs_q50", "abs_q90"):
+                    item[f"theta_{quantile}"].append(float(value_distribution[quantile]))
             for name, coefficient in stat["spatial_balance"].items():
                 if coefficient["kind"] == "scalar":
                     item[name].append(float(coefficient["value"]))
@@ -1003,20 +1102,24 @@ def summarize_theta_metric_samples(theta_samples):
     summary = []
     for block_idx in sorted(grouped):
         item = grouped[block_idx]
-        summary.append(
-            {
-                "block_idx": block_idx,
-                "kind": item["kind"],
-                "sample_count": item["sample_count"],
-                "sparsity": sum(item["sparsity"]) / len(item["sparsity"]) if item["sparsity"] else None,
-                "recall": sum(item["recall"]) / len(item["recall"]) if item["recall"] else None,
-                "precision": sum(item["precision"]) / len(item["precision"]) if item["precision"] else None,
-                "mu_u": sum(item["mu_u"]) / len(item["mu_u"]) if item["mu_u"] else None,
-                "lambda_theta": sum(item["lambda_theta"]) / len(item["lambda_theta"]) if item["lambda_theta"] else None,
-                "total": sum(item["total"]) / len(item["total"]) if item["total"] else None,
-                "mu_share": sum(item["mu_share"]) / len(item["mu_share"]) if item["mu_share"] else None,
-            }
-        )
+        block_summary = {
+            "block_idx": block_idx,
+            "kind": item["kind"],
+            "sample_count": item["sample_count"],
+            "mu_u": sum(item["mu_u"]) / len(item["mu_u"]) if item["mu_u"] else None,
+            "lambda_theta": sum(item["lambda_theta"]) / len(item["lambda_theta"]) if item["lambda_theta"] else None,
+            "total": sum(item["total"]) / len(item["total"]) if item["total"] else None,
+            "mu_share": sum(item["mu_share"]) / len(item["mu_share"]) if item["mu_share"] else None,
+        }
+        for metric_key in ("sparsity", "recall", "precision"):
+            values = item[metric_key]
+            block_summary[metric_key] = sum(values) / len(values) if values else None
+            block_summary[f"{metric_key}_q25"] = float(torch.quantile(torch.tensor(values), 0.25)) if values else None
+            block_summary[f"{metric_key}_q75"] = float(torch.quantile(torch.tensor(values), 0.75)) if values else None
+        for metric_key in ("theta_abs_q10", "theta_abs_q50", "theta_abs_q90"):
+            values = item[metric_key]
+            block_summary[metric_key] = sum(values) / len(values) if values else None
+        summary.append(block_summary)
     return summary
 
 
@@ -1047,11 +1150,13 @@ def format_theta_epoch_summary(theta_summary, epoch):
 
 
 def plot_theta_metric_history(theta_history, save_path):
-    """Plot per-epoch sampled Theta sparsity/recall/precision by block.
+    """Plot per-epoch Theta support metrics and representative edge magnitudes.
 
     ``theta_history`` contains one entry per epoch with ``epoch`` and the
-    summary returned by :func:`summarize_theta_metric_samples`. Dense blocks do
-    not have a precision series and are omitted from that panel.
+    summary returned by :func:`summarize_theta_metric_samples`. Support-metric
+    lines are per-epoch means; their shaded bands show the 25th--75th
+    percentile across the every-20-batch samples.  The final panel shows the
+    10th/50th/90th percentiles of nonzero absolute Theta edge values.
     """
     if not theta_history:
         return
@@ -1068,19 +1173,27 @@ def plot_theta_metric_history(theta_history, save_path):
     if not block_ids:
         return
 
-    figure, axes = plt.subplots(len(metrics), 1, sharex=True, figsize=(9, 9))
+    figure, axes = plt.subplots(len(metrics) + 1, 1, sharex=True, figsize=(9, 12))
     for axis, (metric_key, title) in zip(axes, metrics):
         has_series = False
         for block_idx in block_ids:
             epochs, values = [], []
+            band_epochs, lower, upper = [], [], []
             for epoch_data in theta_history:
                 item = next((entry for entry in epoch_data["summary"] if entry["block_idx"] == block_idx), None)
                 if item is None or item[metric_key] is None:
                     continue
                 epochs.append(epoch_data["epoch"])
                 values.append(item[metric_key])
+                q25, q75 = item.get(f"{metric_key}_q25"), item.get(f"{metric_key}_q75")
+                if q25 is not None and q75 is not None:
+                    band_epochs.append(epoch_data["epoch"])
+                    lower.append(q25)
+                    upper.append(q75)
             if values:
-                axis.plot(epochs, values, marker="o", label=f"block_{block_idx}")
+                line = axis.plot(epochs, values, marker="o", label=f"block_{block_idx}")[0]
+                if band_epochs:
+                    axis.fill_between(band_epochs, lower, upper, color=line.get_color(), alpha=0.18)
                 has_series = True
         axis.set_title(title)
         axis.set_ylabel("ratio")
@@ -1091,8 +1204,95 @@ def plot_theta_metric_history(theta_history, save_path):
             axis.legend()
         else:
             axis.text(0.5, 0.5, "no sampled values", transform=axis.transAxes, ha="center", va="center")
+
+    value_axis = axes[-1]
+    has_value_series = False
+    for block_idx in block_ids:
+        epochs, q10_values, q50_values, q90_values = [], [], [], []
+        for epoch_data in theta_history:
+            item = next((entry for entry in epoch_data["summary"] if entry["block_idx"] == block_idx), None)
+            if item is None or any(item.get(key) is None for key in ("theta_abs_q10", "theta_abs_q50", "theta_abs_q90")):
+                continue
+            epochs.append(epoch_data["epoch"])
+            q10_values.append(item["theta_abs_q10"])
+            q50_values.append(item["theta_abs_q50"])
+            q90_values.append(item["theta_abs_q90"])
+        if q50_values:
+            line = value_axis.plot(epochs, q50_values, marker="o", label=f"block_{block_idx} median")[0]
+            value_axis.fill_between(epochs, q10_values, q90_values, color=line.get_color(), alpha=0.18)
+            has_value_series = True
+    value_axis.set_title("Nonzero |Theta edge value| distribution (10--90% band)")
+    value_axis.set_ylabel("absolute weight")
+    value_axis.grid(True, alpha=0.3)
+    if has_value_series:
+        value_axis.legend()
+    else:
+        value_axis.text(0.5, 0.5, "no nonzero Theta edge values", transform=value_axis.transAxes, ha="center", va="center")
     axes[-1].set_xlabel("epoch")
     figure.tight_layout()
+    figure.savefig(save_path)
+    plt.close(figure)
+
+
+def plot_spatial_penalty_history(theta_history, save_path):
+    """Plot per-block distributions of mu_u/lambda_theta over ADMM iterations.
+
+    Each epoch is summarized over a block's ADMM-iteration vector: median as
+    a line, 25th--75th percentile as the dark band, and 10th--90th percentile
+    as the light band.  This remains readable for deep (e.g. 25-layer) blocks.
+    """
+    block_ids = sorted(
+        {
+            item["block_idx"]
+            for epoch_data in theta_history
+            for item in epoch_data.get("spatial_penalties", [])
+        }
+    )
+    if not block_ids:
+        return
+
+    import matplotlib.pyplot as plt
+    figure, axes = plt.subplots(
+        len(block_ids),
+        2,
+        sharex=True,
+        squeeze=False,
+        figsize=(14, 3.3 * len(block_ids)),
+        constrained_layout=True,
+    )
+
+    for row, block_idx in enumerate(block_ids):
+        for column, (coefficient, label) in enumerate((("mu_u", r"$\mu_u$"), ("lambda_theta", r"$\lambda_\theta$"))):
+            axis = axes[row, column]
+            epochs, q10_values, q25_values, q50_values, q75_values, q90_values = [], [], [], [], [], []
+            for epoch_data in theta_history:
+                item = next(
+                    (entry for entry in epoch_data.get("spatial_penalties", []) if entry["block_idx"] == block_idx),
+                    None,
+                )
+                if item is None or not item[coefficient]:
+                    continue
+                values = torch.tensor(item[coefficient], dtype=torch.float32)
+                quantiles = torch.quantile(values, torch.tensor([0.1, 0.25, 0.5, 0.75, 0.9]))
+                epochs.append(epoch_data["epoch"])
+                q10_values.append(float(quantiles[0]))
+                q25_values.append(float(quantiles[1]))
+                q50_values.append(float(quantiles[2]))
+                q75_values.append(float(quantiles[3]))
+                q90_values.append(float(quantiles[4]))
+            if q50_values:
+                axis.fill_between(epochs, q10_values, q90_values, color="tab:blue", alpha=0.14, label="10--90%")
+                axis.fill_between(epochs, q25_values, q75_values, color="tab:blue", alpha=0.30, label="25--75%")
+                axis.plot(epochs, q50_values, color="tab:blue", linewidth=1.8, label="median")
+            axis.axhline(0.0, color="black", linewidth=0.8, alpha=0.45)
+            axis.set_title(f"block_{block_idx}: {label}")
+            axis.set_ylabel("value")
+            axis.grid(True, alpha=0.3)
+            if row == 0 and column == 0 and q50_values:
+                axis.legend(loc="best")
+
+    for axis in axes[-1]:
+        axis.set_xlabel("epoch")
     figure.savefig(save_path)
     plt.close(figure)
 
@@ -1140,6 +1340,9 @@ def _log_cli_arguments(logger, args):
         "deflation_CGiters",
         "deflation_tol",
         "deflation_allow_backward",
+        "deflation_per_timestep",
+        "project_admm_penalties",
+        "couple_spatial_penalties",
         "theta_method",
         "glasso_backend",
         "glasso_alpha",
@@ -1178,11 +1381,12 @@ def _log_effective_model_flags(logger, config, model):
         model_config["use_stable_graph_learning"],
     )
     logger.info(
-        "Effective deflation flags from config: enabled=%s, samples=%s, CG_iters=%s, allow_backward=%s",
+        "Effective deflation flags from config: enabled=%s, samples=%s, CG_iters=%s, allow_backward=%s, per_timestep=%s",
         model_config["use_deflation"],
         model_config["deflation_samples"],
         model_config["deflation_CG_iters"],
         model_config["deflation_allow_backward"],
+        model_config["deflation_per_timestep"],
     )
     logger.info(
         "Effective Theta graph settings: theta_method=%s, glasso_backend=%s, kalofolias_graph=%s, kNN=%s, theta_local_kNN(requested/width; valid-per-node min-max)=%s/%s; %s-%s, kalofolias_output_mode=%s, kalofolias_allow_backward=%s",

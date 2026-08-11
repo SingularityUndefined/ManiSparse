@@ -23,6 +23,7 @@ from train.train_utils import (
     build_experiment_names,
     build_loss_fn,
     collect_theta_support_deltas,
+    collect_spatial_penalty_vectors,
     create_data,
     create_loggers,
     create_model,
@@ -36,6 +37,7 @@ from train.train_utils import (
     log_run_header,
     parse_args,
     plot_theta_metric_history,
+    plot_spatial_penalty_history,
     prepare_runtime,
     summarize_theta_metric_samples,
 )
@@ -545,9 +547,12 @@ def train_one_epoch(
             log_gradients(epoch, num_epochs, iteration_count, train_loader, model, grad_logger, args)
 
         if config["clamp"] > 0:
-            model.clamp_param(config["clamp"])
+            model.clamp_param(
+                config["clamp"],
+                project_admm_penalties=config["project_admm_penalties"],
+            )
         elif config["clamp"] == 0:
-            model.clamp_param()
+            model.clamp_param(project_admm_penalties=config["project_admm_penalties"])
         if args.debug:
             torch.save(model.state_dict(), paths.debug_model_path)
 
@@ -657,9 +662,9 @@ def log_eval_metrics(logger, prefix, epoch_text, loss, metrics, metrics_d, signa
 
 
 def maybe_periodic_test(model, test_loader, data_normalization, masked_flag, config, device, signal_channels, loss_fn, logger, model_dir, best_epoch, epoch, num_epochs):
-    """Every 10 epochs, evaluate the saved best checkpoint when it is recent."""
+    """Evaluate a recent validation-best checkpoint and return its sparse loss point."""
     if (epoch + 1) % 10 != 0 or best_epoch <= epoch + 1 - 10:
-        return
+        return None
 
     gc.collect()
     torch.cuda.empty_cache()
@@ -673,7 +678,10 @@ def maybe_periodic_test(model, test_loader, data_normalization, masked_flag, con
     # Older checkpoints may predate the non-negative Theta-regularizer
     # projection.  Apply the same constraints used after every optimizer step
     # before evaluating them.
-    best_model.clamp_param(config["clamp"] if config["clamp"] > 0 else None)
+    best_model.clamp_param(
+        config["clamp"] if config["clamp"] > 0 else None,
+        project_admm_penalties=config["project_admm_penalties"],
+    )
     best_model.zero_grad()
 
     test_loss, test_metrics, test_metrics_d = evaluate(
@@ -691,6 +699,7 @@ def maybe_periodic_test(model, test_loader, data_normalization, masked_flag, con
     gc.collect()
     torch.cuda.empty_cache()
     del best_model
+    return {"epoch": epoch + 1, "checkpoint_epoch": best_epoch, "loss": float(test_loss)}
 
 
 def _capture_rng_state():
@@ -730,10 +739,10 @@ def _load_training_state(path, model, optimizer, scheduler, device):
     return state
 
 
-def _save_training_state(path, model, optimizer, scheduler, next_epoch, best_val_loss, best_epoch, train_loss_list, val_loss_list, theta_metric_history):
+def _save_training_state(path, model, optimizer, scheduler, next_epoch, best_val_loss, best_epoch, train_loss_list, val_loss_list, test_loss_history, theta_metric_history):
     """Atomically save all state required to resume at the next epoch."""
     state = {
-        "format_version": 1,
+        "format_version": 2,
         "next_epoch": next_epoch,
         "model": model.state_dict(),
         "optimizer": optimizer.state_dict(),
@@ -742,6 +751,7 @@ def _save_training_state(path, model, optimizer, scheduler, next_epoch, best_val
         "best_epoch": best_epoch,
         "train_loss_list": train_loss_list,
         "val_loss_list": val_loss_list,
+        "test_loss_history": test_loss_history,
         "theta_metric_history": theta_metric_history,
         "rng": _capture_rng_state(),
     }
@@ -775,6 +785,7 @@ def main(argv=None):
     best_epoch = args.start_epochs
     train_loss_list = []
     val_loss_list = []
+    test_loss_history = []
     theta_metric_history = []
     start_epoch = args.start_epochs
     model_pretrained_path = None
@@ -789,6 +800,7 @@ def main(argv=None):
         best_epoch = state["best_epoch"]
         train_loss_list = state.get("train_loss_list", [])
         val_loss_list = state.get("val_loss_list", [])
+        test_loss_history = state.get("test_loss_history", [])
         theta_metric_history = state.get("theta_metric_history", [])
         model_pretrained_path = resume_path
         logger.info("Resumed full training state from %s at epoch %d", resume_path, start_epoch + 1)
@@ -841,7 +853,13 @@ def main(argv=None):
                 )
 
             train_loss_list.append(train_metrics["loss"])
-            theta_metric_history.append({"epoch": epoch + 1, "summary": train_metrics["theta_summary"]})
+            theta_metric_history.append(
+                {
+                    "epoch": epoch + 1,
+                    "summary": train_metrics["theta_summary"],
+                    "spatial_penalties": collect_spatial_penalty_vectors(model),
+                }
+            )
             logger.info(
                 "Training: Epoch [%d/%d], LR:%.2e, Loss:%.4f, rec_RMSE: %.4f, "
                 "RMSE_next:%.4f, RMSE:%.4f, MAE:%.4f, MAPE(%%):%.4f",
@@ -879,7 +897,7 @@ def main(argv=None):
                 scheduler.step(val_loss)
                 logger.info("Current Learning Rate: %.2e", optimizer.param_groups[0]["lr"])
 
-            maybe_periodic_test(
+            test_point = maybe_periodic_test(
                 model,
                 test_loader,
                 data_normalization,
@@ -894,6 +912,8 @@ def main(argv=None):
                 epoch,
                 num_epochs,
             )
+            if test_point is not None:
+                test_loss_history.append(test_point)
             _save_training_state(
                 paths.train_state_path,
                 model,
@@ -904,12 +924,14 @@ def main(argv=None):
                 best_epoch,
                 train_loss_list,
                 val_loss_list,
+                test_loss_history,
                 theta_metric_history,
             )
             logger.info("Saved resumable training state: %s (next epoch %d)", paths.train_state_path, epoch + 2)
     finally:
-        plot_loss_curve(train_loss_list, val_loss_list, paths.plot_path)
+        plot_loss_curve(train_loss_list, val_loss_list, paths.plot_path, test_loss_history=test_loss_history)
         plot_theta_metric_history(theta_metric_history, paths.theta_plot_path)
+        plot_spatial_penalty_history(theta_metric_history, paths.spatial_penalty_plot_path)
         writer.close()
 
 

@@ -94,19 +94,32 @@ class DeflationCGSolver(nn.Module):
         self.tol = tol
         self.allow_backward = allow_backward
 
-    def solve(self, A_func, b, x0=None):
-        if self.allow_backward:
-            return self._solve(A_func, b, x0, early_stop=False)
-        with torch.no_grad():
-            return self._solve(A_func, b.detach(), None if x0 is None else x0.detach(), early_stop=True)
+    def solve(self, A_func, b, x0=None, reduce_dims=None):
+        """Solve ``A x = b`` with reductions over ``reduce_dims``.
 
-    def _solve(self, A_func, b, x0=None, early_stop=True):
+        The default reduces every non-batch dimension, i.e. one CG problem per
+        batch item.  Deflation can instead retain the time dimension and solve
+        one independent CG problem for every ``(batch, time)`` pair.
+        """
+        if self.allow_backward:
+            return self._solve(A_func, b, x0, early_stop=False, reduce_dims=reduce_dims)
+        with torch.no_grad():
+            return self._solve(
+                A_func,
+                b.detach(),
+                None if x0 is None else x0.detach(),
+                early_stop=True,
+                reduce_dims=reduce_dims,
+            )
+
+    def _solve(self, A_func, b, x0=None, early_stop=True, reduce_dims=None):
         if x0 is None:
             x = torch.zeros_like(b)
         else:
             x = x0.clone()
 
-        reduce_dims = tuple(range(1, b.ndim))
+        if reduce_dims is None:
+            reduce_dims = tuple(range(1, b.ndim))
         r = b - A_func(x)
         p = r.clone()
         rsold = (r * r).sum(dim=reduce_dims)
@@ -121,7 +134,7 @@ class DeflationCGSolver(nn.Module):
             valid_denom = torch.abs(denom) > eps
             denom_safe = torch.where(valid_denom, denom, torch.ones_like(denom))
             alpha = torch.where(valid_denom, rsold / denom_safe, torch.zeros_like(rsold))
-            view_shape = (b.size(0),) + (1,) * (b.ndim - 1)
+            view_shape = tuple(alpha.shape) + (1,) * (b.ndim - alpha.ndim)
 
             x = x + alpha.view(view_shape) * p
             r = r - alpha.view(view_shape) * Ap
@@ -213,6 +226,8 @@ class ADMMBlock(nn.Module):
         self.deflation_CG_iters = ADMM_info.get("deflation_CG_iters", self.CG_iters)
         self.deflation_tol = ADMM_info.get("deflation_tol", 1e-6)
         self.deflation_allow_backward = ADMM_info.get("deflation_allow_backward", False)
+        self.deflation_per_timestep = ADMM_info.get("deflation_per_timestep", False)
+        self.couple_spatial_penalties = ADMM_info.get("couple_spatial_penalties", True)
 
         self.mu_u_init = ADMM_info["mu_u_init"]
         self.mu_d1_init = ADMM_info["mu_d1_init"]
@@ -266,11 +281,13 @@ class ADMMBlock(nn.Module):
 
     @property
     def mu_u(self):
-        """Spatial-graph weight, balanced with ``lambda_theta`` when present.
+        """Spatial-graph weight, optionally balanced with ``lambda_theta``.
 
-        The two spatial regularizers share one positive total strength.  A
-        sigmoid gate chooses the fraction assigned to the learned graph
-        Laplacian, while the remainder weights the local-Theta Laplacian.
+        In the default coupled parameterization, the two spatial regularizers
+        share one positive total strength. A sigmoid gate chooses the fraction
+        assigned to the learned graph Laplacian, while the remainder weights
+        the local-Theta Laplacian. The ablation path returns an independent,
+        unconstrained parameter instead.
         """
         if self._couple_mu_theta:
             total = torch.nn.functional.softplus(self.mu_theta_total_raw)
@@ -280,13 +297,15 @@ class ADMMBlock(nn.Module):
     @property
     def lambda_theta(self):
         """Learned-Theta weight complementary to :attr:`mu_u`."""
-        if not self._couple_mu_theta:
+        if not self._uses_theta_regularizer():
             raise AttributeError("lambda_theta is unavailable when Theta is ablated")
+        if not self._couple_mu_theta:
+            return self._lambda_theta
         total = torch.nn.functional.softplus(self.mu_theta_total_raw)
         return total * (1.0 - torch.sigmoid(self.mu_theta_gate_logits))
 
     def _init_admm_parameters(self):
-        self._couple_mu_theta = self._uses_theta_regularizer()
+        self._couple_mu_theta = self._uses_theta_regularizer() and self.couple_spatial_penalties
         if self._couple_mu_theta:
             # Parameterize mu_u + lambda_theta as a positive total and split
             # it between the two spatial Laplacians with a sigmoid gate.
@@ -302,6 +321,8 @@ class ADMMBlock(nn.Module):
             self.mu_theta_gate_logits = self._vector_parameter(gate_raw_init)
         else:
             self._mu_u = self._vector_parameter(self.mu_u_init)
+            if self._uses_theta_regularizer():
+                self._lambda_theta = self._vector_parameter(self.lambda_init)
 
         if self.ablation != "DGTV":
             self.mu_d1 = self._vector_parameter(self.mu_d1_init)
@@ -728,10 +749,19 @@ class ADMMBlock(nn.Module):
             output = output + self.lambda_theta[iteration] * self._apply_deflation_Theta(x)
         return output
 
-    @staticmethod
-    def _mode_inner(x, y):
-        """Batchwise inner product over all non-batch dimensions."""
-        return (x * y).sum(dim=tuple(range(1, x.ndim)), keepdim=True)
+    def _deflation_reduce_dims(self, x):
+        """Return dimensions reduced by deflation inner products and CG.
+
+        In the default sequence-level mode we solve one problem per batch item.
+        With ``deflation_per_timestep=True``, time is retained, so every
+        (batch, time) pair solves its own N-dimensional spatial problem.
+        """
+        start_dim = 2 if self.deflation_per_timestep else 1
+        return tuple(range(start_dim, x.ndim))
+
+    def _mode_inner(self, x, y):
+        """Deflation inner product, globally or independently per time step."""
+        return (x * y).sum(dim=self._deflation_reduce_dims(x), keepdim=True)
 
     def _normalize_mode(self, x):
         norm = torch.sqrt(self._mode_inner(x, x))
@@ -792,7 +822,11 @@ class ADMMBlock(nn.Module):
                 Apv = self._deflation_lhs(pv, iteration)
                 return self._project_orthogonal(Apv, current_basis, current_mode)
 
-            z = self.deflation_solver.solve(projected_A_func, projected_rhs)
+            z = self.deflation_solver.solve(
+                projected_A_func,
+                projected_rhs,
+                reduce_dims=self._deflation_reduce_dims(projected_rhs),
+            )
             x_k = self._project_orthogonal(z, basis, mode_idx)
             q_k = self._normalize_mode(x_k)
             if self.deflation_allow_backward:

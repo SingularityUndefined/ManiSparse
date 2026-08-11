@@ -58,19 +58,36 @@ class WeightedMSELoss(nn.Module):
         return rec_loss * self.weights + pred_loss
 
 
-def plot_loss_curve(train_loss, val_loss, save_path, val_freq=1, use_log=False):
-    """保存训练/验证 loss 曲线，验证 loss 的横轴按 `val_freq` 对齐。"""
+def plot_loss_curve(train_loss, val_loss, save_path, val_freq=1, use_log=False, test_loss_history=None):
+    """Save loss curves with sparse test points aligned to their trigger epochs.
+
+    ``test_loss_history`` contains dictionaries with ``epoch`` (the training
+    epoch at which periodic test was triggered) and ``loss``. Test evaluates a
+    validation-best checkpoint, so points are intentionally sparse and drawn
+    with markers rather than being interpolated over every epoch.
+    """
     import matplotlib.pyplot as plt
 
     train_len, val_len = len(train_loss), len(val_loss)
+    test_loss_history = test_loss_history or []
     if train_len > 1:
         plt.figure()
         plt.plot(list(range(1, train_len + 1)), train_loss, label='train')
     if val_len != 0:
         plt.plot(list(range(val_freq, val_len * val_freq + 1, val_freq)), val_loss, label='val')
+    if test_loss_history:
+        test_epochs = [item["epoch"] for item in test_loss_history]
+        test_losses = [item["loss"] for item in test_loss_history]
+        plt.plot(
+            test_epochs,
+            test_losses,
+            label='test (best-val checkpoint)',
+            marker='o',
+            linestyle='--',
+        )
     if use_log:
         plt.yscale('log')
-    if train_len > 1:
+    if train_len > 1 or val_len or test_loss_history:
         plt.legend()
         plt.savefig(save_path)
         plt.close()

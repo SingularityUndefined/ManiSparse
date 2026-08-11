@@ -1,8 +1,14 @@
 num_workers: 4
 learning_rate: 0.0005
-optim: adam
+optim: adamw
 weight_decay: 0.01
 clamp: 1.2 # 0.8
+# Keep ADMM penalties positive after each optimizer step.  This is separate
+# from the CG alpha/beta clamp controlled by `clamp` above.
+project_admm_penalties: true
+# Keep mu_u and lambda_theta as a positive shared total with a sigmoid split.
+# Disable only for the explicit independent-coefficient ablation.
+couple_spatial_penalties: False
 loss_function: Huber # MSE
 normed_loss: False
 
@@ -34,7 +40,10 @@ model:
     tol: 1.0e-6
     # Experimental: retain the full multi-mode deflation computation graph.
     # This is substantially more memory-intensive than detached deflation.
-    allow_backward: False
+    allow_backward: True
+    # If true, perform one N-node deflation solve for each (batch, time)
+    # signal.  If false, modes are orthogonal over the full sequence.
+    per_timestep: True
 
   theta:
     # method: glasso or kalofolias
@@ -75,10 +84,10 @@ model:
     diff_interval: True
 
 ADMM_params:
-  mu_u: 2
+  mu_u: 3
   mu_d1: 3
   mu_d2: 3
-  lambda_theta: 1
+  lambda_theta: 0
 
 st_emb_info:
   spatial_dim: 5
