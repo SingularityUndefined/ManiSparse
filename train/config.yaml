@@ -1,6 +1,6 @@
 num_workers: 4
 learning_rate: 0.0005
-optim: adamw
+optim: adam
 weight_decay: 0.01
 clamp: 1.2 # 0.8
 # Keep ADMM penalties positive after each optimizer step.  This is separate

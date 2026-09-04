@@ -205,6 +205,8 @@ Kalofolias 配置位于 `model.theta.kalofolias`，其中 `graph: dense|local` �
 
 默认设置在 `train/config.yaml` 中。请从仓库根目录运行命令。
 
+优化器可以通过 `--optim adam` 或 `--optim adamw` 临时选择；不传该参数时沿用 `train/config.yaml` 中的 `optim`。`--optimizer` 是同义写法。
+
 **示例 1**：在 PEMS03 上运行主实验：
 
 ```bash

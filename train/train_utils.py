@@ -332,6 +332,14 @@ def parse_args(argv=None):
     )
     parser.add_argument("--stride", help="temporary override for data_stride", default=None, type=int)
     parser.add_argument("--lr", help="temporary override for learning_rate", default=None, type=float)
+    parser.add_argument(
+        "--optim",
+        "--optimizer",
+        dest="optim",
+        help="temporary override for optimizer",
+        default=None,
+        choices=["adam", "adamw"],
+    )
     parser.add_argument("--predonly", dest="pred_only", action="store_true")
     parser.set_defaults(pred_only=False)
 
@@ -416,6 +424,8 @@ def apply_args_to_config(config, args):
         config["data_stride"] = args.stride
     if args.lr is not None:
         config["learning_rate"] = args.lr
+    if args.optim is not None:
+        config["optim"] = args.optim
     return config
 
 
@@ -479,6 +489,10 @@ def build_experiment_names(config, args):
         f"{num_blocks}b_{num_layers}l_{num_heads}h_{feature_channels}f_"
         f"s{config['data_stride']}_int{interval}_{args.FElayers}FE"
     )
+    spatial_init_dir = (
+        f"muU{config['ADMM_params']['mu_u']:g}_"
+        f"lambdaTheta{config['ADMM_params']['lambda_theta']:g}"
+    )
     name = "normed_loss" if config["normed_loss"] else "true_loss"
     if args.pred_only:
         name = "predOnly_" + name
@@ -499,7 +513,7 @@ def build_experiment_names(config, args):
         name = "LR_" + name
     if not model_config["use_one_channel"]:
         name = "AllChannel_" + name
-    experiment_dir = os.path.join(theta_family, dataset_name, lr_seed_dir, architecture_dir)
+    experiment_dir = os.path.join(theta_family, dataset_name, lr_seed_dir, architecture_dir, spatial_init_dir)
     experiment_name = os.path.join(experiment_dir, name)
     log_filename = f"{loss_name}.log"
     return ExperimentNames(logs_dir, experiment_dir, experiment_name, log_filename)
@@ -1362,6 +1376,7 @@ def _log_cli_arguments(logger, args):
         "kalofolias_allow_backward",
         "stride",
         "lr",
+        "optim",
     }
     logger.info("RUNTIME ARGUMENTS AND CLI OVERRIDES:")
     for arg, value in vars(args).items():

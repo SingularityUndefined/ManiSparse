@@ -154,6 +154,8 @@ Training artifacts are grouped by method first, then dataset, then learning-rate
 
 The default settings are in `train/config.yaml`. We provide multiple parsers to change the configurations. Run the commands from the repository root.
 
+Use `--optim adam` or `--optim adamw` to override the configured optimizer for one run. `--optimizer` is an alias.
+
 **Example 1**: running main experiment on PEMS03 dataset:
 ```
 python -m train.train_traffic --dataset PEMS03 --cuda 0 --batchsize 12 --neighbors 4
