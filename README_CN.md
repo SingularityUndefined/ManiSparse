@@ -160,9 +160,9 @@ lambda_theta  = total * (1 - gate)
 
 ### 可微 multi-mode deflation 与 local Kalofolias 分支
 
-默认配置下，deflation 是辅助图估计步骤：`multi_x`、deflation CG 和 local Kalofolias 均在 no-grad/detach 路径中运行。这样最省显存、数值最稳，但 loss 不会经由 `Theta -> multi_x` 回传到前一个 block。
+默认配置使用 local Kalofolias，并同时保留 local Kalofolias 与 deflation 的计算图，因此 loss 可以经由 `Theta -> multi_x` 回传到前一个 block。关闭任一反向开关可用于 detached 消融；这种模式显存更低，但会截断对应路径的梯度。
 
-若需要端到端经过 multi-mode Theta 估计反传，必须同时开启下面两个开关：
+默认端到端 multi-mode Theta 估计对应下面两个开关：
 
 ```yaml
 model:
@@ -225,7 +225,7 @@ python -m train.train_traffic --dataset METR-LA --cuda 1 --ablation DGLR --batch
 python -m train.train_traffic --dataset PEMS-BAY --cuda 0 --ablation UT --batchsize 64 --le-emb
 ```
 
-**示例 4**：在 PEMS03 上运行 local Kalofolias，并允许完整 multi-mode deflation 与 Theta 反传：
+**示例 4**：在 PEMS03 上使用默认的 local Kalofolias 和完整反向传播：
 
 ```bash
 python -m train.train_traffic \
@@ -233,13 +233,10 @@ python -m train.train_traffic \
   --cuda 1 \
   --batchsize 1 \
   --neighbors 4 \
-  --theta-method kalofolias \
-  --kalofolias-graph local \
-  --theta-neighbors 10 \
-  --kalofolias-allow-backward
+  --theta-neighbors 10
 ```
 
-最后一个开关会自动开启 `deflation.allow_backward`。若希望命令完全显式，也可额外传 `--deflation-allow-backward`。batch size 应根据显存调整；上例的 batch=1 是可微分支的保守起点。
+`kalofolias/local`、Kalofolias 反传和 deflation 反传均由默认配置提供，无需在命令行重复。batch size 应根据显存调整；上例的 batch=1 是可微分支的保守起点。
 
 ### 实验目录、日志与自动断点续训
 
@@ -250,10 +247,10 @@ logs_learnable_emb/
 └── kalofolias_local/
     └── PEMS03/
         └── lr_5e-04_seed_3407/
-            └── diffV_shareQ_kaloBW1_deflateBW1_deflate5_.../
+            └── ..._deflate5_.../
 ```
 
-目录名中的 `kaloBW0/1` 表示 `kalofolias.allow_backward` 是否关闭/开启，`deflateBW0/1` 对应 `deflation.allow_backward`。这样不会把可微分支与默认 detached 分支的 checkpoint、日志混在同一个目录。
+完整反向传播和 per-timestep deflation 都是默认设置，因此目录名不再写 `kaloBW1`、`deflateBW1` 或 `deflatePerT`。只有关闭对应设置做消融时，目录名才加入 `kaloBW0`、`deflateBW0` 或 `deflatePerT0`，避免消融 checkpoint 与默认实验混用。
 
 模型目录中有两类 checkpoint：
 

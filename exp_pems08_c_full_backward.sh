@@ -33,10 +33,6 @@ python -m train.train_traffic \
   --epochs "$EPOCHS" \
   --seed "$SEED" \
   --neighbors 4 \
-  --theta-method kalofolias \
-  --kalofolias-graph local \
   --theta-neighbors "$THETA_NEIGHBORS" \
-  --kalofolias-allow-backward \
-  --deflation-allow-backward \
   --project-admm-penalties \
   "$SPATIAL_PENALTY_FLAG"

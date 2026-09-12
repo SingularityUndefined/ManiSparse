@@ -70,6 +70,7 @@ MODEL_CONFIG_PATHS = {
     "kalofolias_threshold": ("theta", "kalofolias", "threshold"),
     "kalofolias_output_mode": ("theta", "kalofolias", "output_mode"),
     "kalofolias_normalize_distances": ("theta", "kalofolias", "normalize_distances"),
+    "kalofolias_learnable_alpha_beta": ("theta", "kalofolias", "learnable_alpha_beta"),
     "kalofolias_allow_backward": ("theta", "kalofolias", "allow_backward"),
     "use_stable_graph_learning": ("graph_learning", "use_stable_graph_learning"),
     "sharedM": ("graph_learning", "sharedM"),
@@ -84,9 +85,9 @@ MODEL_DEFAULTS = {
     "use_stable_graph_learning": False,
     "deflation_samples": 5,
     "deflation_tol": 1e-6,
-    "deflation_allow_backward": False,
-    "deflation_per_timestep": False,
-    "theta_method": "glasso",
+    "deflation_allow_backward": True,
+    "deflation_per_timestep": True,
+    "theta_method": "kalofolias",
     "glasso_backend": "admm",
     "glasso_alpha": 0.2,
     "glasso_rho": 1.0,
@@ -96,13 +97,14 @@ MODEL_DEFAULTS = {
     "glasso_fallback": True,
     "kalofolias_alpha": 0.3,
     "kalofolias_beta": 1.0,
-    "kalofolias_graph": "dense",
+    "kalofolias_graph": "local",
     "kalofolias_max_iter": 200,
     "kalofolias_tol": 1e-4,
     "kalofolias_threshold": 1e-4,
     "kalofolias_output_mode": "laplacian",
     "kalofolias_normalize_distances": True,
-    "kalofolias_allow_backward": False,
+    "kalofolias_learnable_alpha_beta": False,
+    "kalofolias_allow_backward": True,
 }
 
 
@@ -193,6 +195,15 @@ def _validate_model_config(model_config):
     if model_config["theta_method"] == "kalofolias" and model_config["kalofolias_graph"] == "local":
         if model_config["theta_kNN"] <= model_config["kNN"]:
             raise ValueError("model.theta.local_kNN must be larger than model.graph.kNN for local Kalofolias")
+    if model_config["kalofolias_learnable_alpha_beta"] and not (
+        model_config["theta_method"] == "kalofolias" and model_config["kalofolias_graph"] == "local"
+    ):
+        raise ValueError("learnable Kalofolias alpha/beta requires theta.method=kalofolias and kalofolias.graph=local")
+    if model_config["kalofolias_learnable_alpha_beta"]:
+        if not 0.1 <= model_config["kalofolias_alpha"] <= 2.0:
+            raise ValueError("learnable Kalofolias alpha must initialize in [0.1, 2.0]")
+        if not 0.5 <= model_config["kalofolias_beta"] <= 1.5:
+            raise ValueError("learnable Kalofolias beta must initialize in [0.5, 1.5]")
 
 
 def _add_bool_override(parser, name, dest, help_text):
@@ -326,6 +337,12 @@ def parse_args(argv=None):
     )
     _add_bool_override(
         parser,
+        "kalofolias-learnable-alpha-beta",
+        "kalofolias_learnable_alpha_beta",
+        "learn one bounded alpha/beta pair per 10 local Kalofolias iterations",
+    )
+    _add_bool_override(
+        parser,
         "kalofolias-allow-backward",
         "kalofolias_allow_backward",
         "temporary override for model.theta.kalofolias.allow_backward",
@@ -391,6 +408,7 @@ def apply_args_to_config(config, args):
         "kalofolias_threshold": "kalofolias_threshold",
         "kalofolias_output_mode": "kalofolias_output_mode",
         "kalofolias_normalize_distances": "kalofolias_normalize_distances",
+        "kalofolias_learnable_alpha_beta": "kalofolias_learnable_alpha_beta",
         "kalofolias_allow_backward": "kalofolias_allow_backward",
     }
     for arg_name, config_key in arg_to_config_key.items():
@@ -498,12 +516,15 @@ def build_experiment_names(config, args):
         name = "predOnly_" + name
     if model_config.get("use_deflation", False):
         name = f"deflate{model_config['deflation_samples']}_" + name
-        if model_config["deflation_per_timestep"]:
-            name = "deflatePerT_" + name
-    name = (
-        f"kaloBW{int(model_config['kalofolias_allow_backward'])}_"
-        f"deflateBW{int(model_config['deflation_allow_backward'])}_" + name
-    )
+        if not model_config["deflation_per_timestep"]:
+            name = "deflatePerT0_" + name
+    name = f"kaloAB{int(model_config['kalofolias_learnable_alpha_beta'])}_" + name
+    # Full backward is the default experiment, so only detached ablations need
+    # an explicit marker in the run name.
+    if theta_method == "kalofolias" and not model_config["kalofolias_allow_backward"]:
+        name = "kaloBW0_" + name
+    if model_config.get("use_deflation", False) and not model_config["deflation_allow_backward"]:
+        name = "deflateBW0_" + name
     name = f"spatialCoupled{int(config.get('couple_spatial_penalties', True))}_" + name
     if args.trunc:
         name = "trunc_" + name
@@ -675,6 +696,7 @@ def create_model(config, args, train_set, device):
         kalofolias_threshold=model_config["kalofolias_threshold"],
         kalofolias_output_mode=model_config["kalofolias_output_mode"],
         kalofolias_normalize_distances=model_config["kalofolias_normalize_distances"],
+        kalofolias_learnable_alpha_beta=model_config["kalofolias_learnable_alpha_beta"],
         kalofolias_allow_backward=model_config["kalofolias_allow_backward"],
     ).to(device)
     return model, admm_info
@@ -1373,6 +1395,7 @@ def _log_cli_arguments(logger, args):
         "kalofolias_threshold",
         "kalofolias_output_mode",
         "kalofolias_normalize_distances",
+        "kalofolias_learnable_alpha_beta",
         "kalofolias_allow_backward",
         "stride",
         "lr",
@@ -1404,7 +1427,7 @@ def _log_effective_model_flags(logger, config, model):
         model_config["deflation_per_timestep"],
     )
     logger.info(
-        "Effective Theta graph settings: theta_method=%s, glasso_backend=%s, kalofolias_graph=%s, kNN=%s, theta_local_kNN(requested/width; valid-per-node min-max)=%s/%s; %s-%s, kalofolias_output_mode=%s, kalofolias_allow_backward=%s",
+        "Effective Theta graph settings: theta_method=%s, glasso_backend=%s, kalofolias_graph=%s, kNN=%s, theta_local_kNN(requested/width; valid-per-node min-max)=%s/%s; %s-%s, kalofolias_output_mode=%s, kalofolias_learnable_alpha_beta=%s, kalofolias_allow_backward=%s",
         model_config["theta_method"],
         model_config["glasso_backend"],
         model_config["kalofolias_graph"],
@@ -1414,6 +1437,7 @@ def _log_effective_model_flags(logger, config, model):
         getattr(model, "theta_valid_k_min", model_config["theta_kNN"]),
         getattr(model, "theta_valid_k_max", model_config["theta_kNN"]),
         model_config["kalofolias_output_mode"],
+        model_config["kalofolias_learnable_alpha_beta"],
         model_config["kalofolias_allow_backward"],
     )
     if len(model.model_blocks) == 0:

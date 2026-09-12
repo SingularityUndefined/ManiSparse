@@ -430,7 +430,7 @@ class UnrollingModel(nn.Module):
         use_stable_graph_learning=False,
         predict_only=False,
         le_emb=False,
-        theta_method="glasso",
+        theta_method="kalofolias",
         glasso_backend="admm",
         glasso_alpha=0.2,
         glasso_rho=1.0,
@@ -443,13 +443,14 @@ class UnrollingModel(nn.Module):
         glasso_allow_backward=False,
         kalofolias_alpha=0.3,
         kalofolias_beta=1.0,
-        kalofolias_graph="dense",
+        kalofolias_graph="local",
         kalofolias_max_iter=200,
         kalofolias_tol=1e-4,
         kalofolias_threshold=1e-4,
         kalofolias_output_mode="laplacian",
         kalofolias_normalize_distances=True,
-        kalofolias_allow_backward=False,
+        kalofolias_learnable_alpha_beta=False,
+        kalofolias_allow_backward=True,
         use_deflation=True,
         deflation_samples=None,
     ):
@@ -496,6 +497,7 @@ class UnrollingModel(nn.Module):
         self.kalofolias_threshold = kalofolias_threshold
         self.kalofolias_output_mode = kalofolias_output_mode
         self.kalofolias_normalize_distances = kalofolias_normalize_distances
+        self.kalofolias_learnable_alpha_beta = kalofolias_learnable_alpha_beta
         self.kalofolias_allow_backward = kalofolias_allow_backward
         self.kalofolias_graph_estimator = KalofoliasGraphLearningModule(
             alpha=kalofolias_alpha,
@@ -546,6 +548,7 @@ class UnrollingModel(nn.Module):
             threshold=kalofolias_threshold,
             normalize_distances=kalofolias_normalize_distances,
             allow_backward=kalofolias_allow_backward,
+            learnable_alpha_beta=kalofolias_learnable_alpha_beta,
         )
         self.connect_list = connect_list(graph_info["n_nodes"], graph_info["u_edges"], self.device)
 

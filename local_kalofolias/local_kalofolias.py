@@ -13,6 +13,7 @@ unrolled model more closely than a dense ``(N, N)`` matrix.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import List, Optional, Union
 
@@ -33,8 +34,8 @@ class LocalKalofoliasResult:
     relative_change_history: List[float]
     objective_history: List[float]
     nnz_ratio_history: List[float]
-    alpha: float
-    beta: float
+    alpha: Union[float, List[float]]
+    beta: Union[float, List[float]]
     step_size: float
 
 
@@ -153,35 +154,66 @@ def _local_pairwise_squared_distances(
     return dist
 
 
-def _default_step_size(k_neighbors: int, beta: float, safety: float) -> float:
+def _default_step_size(k_neighbors: int, beta: Union[float, torch.Tensor], safety: float):
     """Conservative primal-dual step for the local row-sum degree operator."""
     operator_norm = k_neighbors ** 0.5
     lipschitz = 2.0 * beta
-    return float(safety / (lipschitz + operator_norm + 1.0))
+    return safety / (lipschitz + operator_norm + 1.0)
 
 
-def _local_objective(w: torch.Tensor, z: torch.Tensor, degree: torch.Tensor, alpha: float, beta: float) -> torch.Tensor:
+def _local_objective(
+    w: torch.Tensor,
+    z: torch.Tensor,
+    degree: torch.Tensor,
+    alpha: Union[float, torch.Tensor],
+    beta: Union[float, torch.Tensor],
+) -> torch.Tensor:
     """Evaluate local smooth-graph objective."""
     eps = torch.finfo(w.dtype).tiny
     return 2.0 * (z * w).sum() - alpha * torch.log(degree.clamp_min(eps)).sum() + beta * (w * w).sum()
+
+
+def _iteration_parameter(value, iteration: int, share_interval: int):
+    """Select the scalar used by one solver iteration from a shared schedule."""
+    if not torch.is_tensor(value) or value.ndim == 0:
+        return value
+    if value.ndim != 1:
+        raise ValueError("solver parameter schedules must be one-dimensional")
+    index = (iteration - 1) // share_interval
+    if index >= value.numel():
+        raise ValueError("solver parameter schedule is shorter than max_iter requires")
+    return value[index]
+
+
+def _parameter_snapshot(value) -> Union[float, List[float]]:
+    """Convert a scalar or schedule to detached result metadata."""
+    if torch.is_tensor(value):
+        detached = value.detach().cpu().reshape(-1)
+        if detached.numel() == 1:
+            return float(detached[0])
+        return detached.tolist()
+    return float(value)
 
 
 def _solve_local(
     distances: torch.Tensor,
     neighbor_list: torch.Tensor,
     neighbor_mask: torch.Tensor,
-    alpha: float,
-    beta: float,
+    alpha: Union[float, torch.Tensor],
+    beta: Union[float, torch.Tensor],
     max_iter: int,
     tol: float,
     step_size: Optional[float],
     step_safety: float,
     threshold: float,
+    parameter_share_interval: int,
+    early_stopping: bool,
 ) -> LocalKalofoliasResult:
     """Run local primal-dual updates on a distance tensor."""
     k_neighbors = distances.size(-1)
-    gamma = _default_step_size(k_neighbors, beta, step_safety) if step_size is None else float(step_size)
-    if gamma <= 0:
+    if parameter_share_interval <= 0:
+        raise ValueError("parameter_share_interval must be positive")
+    if step_size is not None and step_size <= 0:
         raise ValueError("step_size must be positive")
 
     neighbor_mask = neighbor_mask.to(device=distances.device, dtype=torch.bool)
@@ -201,26 +233,29 @@ def _solve_local(
     relative_change = float("inf")
 
     for iteration in range(1, max_iter + 1):
+        alpha_iter = _iteration_parameter(alpha, iteration, parameter_share_interval)
+        beta_iter = _iteration_parameter(beta, iteration, parameter_share_interval)
+        gamma = _default_step_size(k_neighbors, beta_iter, step_safety) if step_size is None else float(step_size)
         w_prev = w
 
         # Local degree operator:
         #   S w = row_sum(w), shape (..., N)
         #   S^T d = d[..., i] broadcast to every candidate edge of node i.
         st_d = d.unsqueeze(-1)
-        y = (w - gamma * (2.0 * beta * w + st_d)) * mask
+        y = (w - gamma * (2.0 * beta_iter * w + st_d)) * mask
         y_bar = d + gamma * w.sum(dim=-1)
 
         p = torch.clamp(y - 2.0 * gamma * distances, min=0.0) * mask
-        p_bar = 0.5 * (y_bar - torch.sqrt(y_bar.square() + 4.0 * alpha * gamma))
+        p_bar = 0.5 * (y_bar - torch.sqrt(y_bar.square() + 4.0 * alpha_iter * gamma))
 
-        q = (p - gamma * (2.0 * beta * p + p_bar.unsqueeze(-1))) * mask
+        q = (p - gamma * (2.0 * beta_iter * p + p_bar.unsqueeze(-1))) * mask
         q_bar = p_bar + gamma * p.sum(dim=-1)
 
         w = (w - y + q) * mask
         d = d - y_bar + q_bar
 
         degree = w.sum(dim=-1)
-        objective = _local_objective(w, distances, degree, alpha, beta)
+        objective = _local_objective(w, distances, degree, alpha_iter, beta_iter)
         relative_change_tensor = torch.linalg.vector_norm(w - w_prev) / torch.linalg.vector_norm(w_prev).clamp_min(
             torch.finfo(w.dtype).eps
         )
@@ -229,10 +264,12 @@ def _solve_local(
         relative_change_history.append(relative_change)
         active_slots = neighbor_mask.sum().to(torch.float64)
         nnz_ratio_history.append(float(((w > threshold).sum().to(torch.float64) / (active_slots * (1 if w.ndim == 2 else w.size(0)))).detach().cpu()))
-        if relative_change <= tol:
+        if early_stopping and relative_change <= tol:
             converged = True
             break
 
+    if not early_stopping:
+        converged = relative_change <= tol
     w = torch.clamp(w, min=0.0)
     return LocalKalofoliasResult(
         local_weights=w,
@@ -244,9 +281,9 @@ def _solve_local(
         relative_change_history=relative_change_history,
         objective_history=objective_history,
         nnz_ratio_history=nnz_ratio_history,
-        alpha=float(alpha),
-        beta=float(beta),
-        step_size=float(gamma),
+        alpha=_parameter_snapshot(alpha),
+        beta=_parameter_snapshot(beta),
+        step_size=float(torch.as_tensor(gamma).detach().cpu()),
     )
 
 
@@ -255,14 +292,16 @@ def learn_local_graph_from_smooth_signals(
     neighbor_list: Union[torch.Tensor, object],
     *,
     neighbor_mask: Optional[Union[torch.Tensor, object]] = None,
-    alpha: float = 0.3,
-    beta: float = 1.0,
+    alpha: Union[float, torch.Tensor] = 0.3,
+    beta: Union[float, torch.Tensor] = 1.0,
     max_iter: int = 200,
     tol: float = 1e-4,
     step_size: Optional[float] = None,
     step_safety: float = 0.9,
     normalize_distances: bool = True,
     threshold: float = 1e-4,
+    parameter_share_interval: int = 10,
+    early_stopping: bool = True,
     return_info: bool = False,
 ) -> Union[torch.Tensor, LocalKalofoliasResult]:
     """Learn local sparse graph weights from smooth node signals.
@@ -273,13 +312,19 @@ def learn_local_graph_from_smooth_signals(
             slots may safely point to the row's own node when `neighbor_mask`
             marks them false.
         neighbor_mask: optional boolean valid-candidate mask, shape ``(N, K)``.
+        parameter_share_interval: Number of consecutive solver iterations that
+            share one entry when alpha/beta are one-dimensional schedules.
+        early_stopping: Stop when relative change reaches ``tol``. Learnable
+            schedules disable this so every parameter group participates.
 
     Returns:
         Local weights with shape ``(N, K)`` or ``(B, N, K)`` by default.
     """
-    if alpha <= 0:
-        raise ValueError("alpha must be positive")
-    if beta < 0:
+    alpha_values = torch.as_tensor(alpha).detach()
+    beta_values = torch.as_tensor(beta).detach()
+    if torch.any(alpha_values < 0):
+        raise ValueError("alpha must be non-negative")
+    if torch.any(beta_values < 0):
         raise ValueError("beta must be non-negative")
     if max_iter <= 0:
         raise ValueError("max_iter must be positive")
@@ -307,6 +352,8 @@ def learn_local_graph_from_smooth_signals(
         step_size,
         step_safety,
         threshold,
+        parameter_share_interval,
+        early_stopping,
     )
     return result if return_info else result.local_weights
 
@@ -317,6 +364,12 @@ class LocalKalofoliasGraphLearning(nn.Module):
     The default output is a local sparse matrix with shape ``(N, K)`` or
     ``(B, N, K)``. Autograd through the solver is disabled by default.
     """
+
+    alpha_min = 0.1
+    alpha_max = 2.0
+    beta_min = 0.5
+    beta_max = 1.5
+    parameter_share_interval = 10
 
     def __init__(
         self,
@@ -331,14 +384,16 @@ class LocalKalofoliasGraphLearning(nn.Module):
         normalize_distances: bool = True,
         threshold: float = 1e-4,
         allow_backward: bool = False,
+        learnable_alpha_beta: bool = False,
     ):
         super().__init__()
         self.register_buffer("neighbor_list", torch.as_tensor(neighbor_list, dtype=torch.long))
         if neighbor_mask is None:
             neighbor_mask = torch.ones_like(self.neighbor_list, dtype=torch.bool)
         self.register_buffer("neighbor_mask", torch.as_tensor(neighbor_mask, dtype=torch.bool))
-        self.alpha = alpha
-        self.beta = beta
+        self.learnable_alpha_beta = learnable_alpha_beta
+        self._fixed_alpha = float(alpha)
+        self._fixed_beta = float(beta)
         self.max_iter = max_iter
         self.tol = tol
         self.step_size = step_size
@@ -347,11 +402,48 @@ class LocalKalofoliasGraphLearning(nn.Module):
         self.threshold = threshold
         self.allow_backward = allow_backward
 
+        if self.learnable_alpha_beta:
+            if not self.alpha_min <= alpha <= self.alpha_max:
+                raise ValueError(f"learnable alpha initialization must be in [{self.alpha_min}, {self.alpha_max}]")
+            if not self.beta_min <= beta <= self.beta_max:
+                raise ValueError(f"learnable beta initialization must be in [{self.beta_min}, {self.beta_max}]")
+            n_parameter_groups = math.ceil(max_iter / self.parameter_share_interval)
+            self.n_parameter_groups = n_parameter_groups
+            alpha_ratio = (alpha - self.alpha_min) / (self.alpha_max - self.alpha_min)
+            beta_ratio = (beta - self.beta_min) / (self.beta_max - self.beta_min)
+            eps = torch.finfo(torch.float32).eps
+            alpha_ratio = min(max(alpha_ratio, eps), 1.0 - eps)
+            beta_ratio = min(max(beta_ratio, eps), 1.0 - eps)
+            alpha_logit = math.log(alpha_ratio / (1.0 - alpha_ratio))
+            beta_logit = math.log(beta_ratio / (1.0 - beta_ratio))
+            self.alpha_logits = nn.Parameter(torch.full((n_parameter_groups,), alpha_logit))
+            self.beta_logits = nn.Parameter(torch.full((n_parameter_groups,), beta_logit))
+        else:
+            self.n_parameter_groups = 0
+
+    @property
+    def alpha(self):
+        """Current alpha scalar or per-10-iteration constrained schedule."""
+        if not self.learnable_alpha_beta:
+            return self._fixed_alpha
+        return self.alpha_min + (self.alpha_max - self.alpha_min) * torch.sigmoid(self.alpha_logits)
+
+    @property
+    def beta(self):
+        """Current beta scalar or per-10-iteration constrained schedule."""
+        if not self.learnable_alpha_beta:
+            return self._fixed_beta
+        return self.beta_min + (self.beta_max - self.beta_min) * torch.sigmoid(self.beta_logits)
+
     def forward(self, signals: torch.Tensor) -> torch.Tensor:
         """Return local graph weights with shape ``(N, K)`` or ``(B, N, K)``."""
-        if self.allow_backward:
+        solver_signals = signals if self.allow_backward else signals.detach()
+        if self.allow_backward or self.learnable_alpha_beta:
+            # Parameter learning needs the solver graph even when gradients to
+            # its input signals are intentionally disabled. Run all iterations
+            # so every 10-iteration parameter group is used on every forward.
             return learn_local_graph_from_smooth_signals(
-                signals,
+                solver_signals,
                 self.neighbor_list,
                 neighbor_mask=self.neighbor_mask,
                 alpha=self.alpha,
@@ -362,11 +454,13 @@ class LocalKalofoliasGraphLearning(nn.Module):
                 step_safety=self.step_safety,
                 normalize_distances=self.normalize_distances,
                 threshold=self.threshold,
+                parameter_share_interval=self.parameter_share_interval,
+                early_stopping=not self.learnable_alpha_beta,
                 return_info=False,
             )
         with torch.no_grad():
             return learn_local_graph_from_smooth_signals(
-                signals.detach(),
+                solver_signals,
                 self.neighbor_list,
                 neighbor_mask=self.neighbor_mask,
                 alpha=self.alpha,
@@ -377,5 +471,6 @@ class LocalKalofoliasGraphLearning(nn.Module):
                 step_safety=self.step_safety,
                 normalize_distances=self.normalize_distances,
                 threshold=self.threshold,
+                parameter_share_interval=self.parameter_share_interval,
                 return_info=False,
             )

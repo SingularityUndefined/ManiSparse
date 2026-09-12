@@ -1,0 +1,55 @@
+#!/usr/bin/env bash
+# Sweep Local Kalofolias solver iterations and deflation mode counts on PEMS08.
+#
+# Required environment variables:
+#   CUDA_DEVICE, BATCH_SIZE, KNN, THETA_KNN, INTERVAL
+#
+# Example:
+#   CUDA_DEVICE=0 BATCH_SIZE=8 KNN=4 THETA_KNN=8 INTERVAL=6 \
+#     bash exp_pems08_kalofolias_iter_modes_sweep.sh
+
+set -euo pipefail
+
+cd "$(dirname "$0")"
+
+: "${CUDA_DEVICE:?Set CUDA_DEVICE, for example CUDA_DEVICE=0}"
+: "${BATCH_SIZE:?Set BATCH_SIZE, for example BATCH_SIZE=8}"
+: "${KNN:?Set KNN, for example KNN=4}"
+: "${THETA_KNN:?Set THETA_KNN, for example THETA_KNN=8}"
+: "${INTERVAL:?Set INTERVAL, for example INTERVAL=6}"
+
+CONFIG_PATH="${CONFIG_PATH:-train/config.yaml}"
+LOGS_DIR="${LOGS_DIR:-logs_pems08_kalofolias_iter_modes_sweep}"
+
+if (( THETA_KNN <= KNN )); then
+  echo "THETA_KNN must be larger than KNN for Local Kalofolias." >&2
+  exit 2
+fi
+
+KALOFOLIAS_ITERS=(100 150 200)
+DEFLATION_MODES=(3 5 10)
+
+for max_iter in "${KALOFOLIAS_ITERS[@]}"; do
+  for deflation_modes in "${DEFLATION_MODES[@]}"; do
+    echo "Running PEMS08: max_iter=${max_iter}, deflation_modes=${deflation_modes}"
+
+    # max_iter is separated at the log-root level because the common
+    # experiment-name builder does not include this solver setting.
+    run_logs_dir="${LOGS_DIR}/max_iter_${max_iter}"
+
+    python -m train.train_traffic \
+      --config "$CONFIG_PATH" \
+      --logs-dir "$run_logs_dir" \
+      --dataset PEMS08 \
+      --cuda "$CUDA_DEVICE" \
+      --batchsize "$BATCH_SIZE" \
+      --neighbors "$KNN" \
+      --theta-neighbors "$THETA_KNN" \
+      --interval "$INTERVAL" \
+      --kalofolias-alpha 0.3 \
+      --kalofolias-beta 1.0 \
+      --no-kalofolias-learnable-alpha-beta \
+      --kalofolias-max-iter "$max_iter" \
+      --deflation-samples "$deflation_modes"
+  done
+done

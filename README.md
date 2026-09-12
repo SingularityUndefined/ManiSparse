@@ -68,7 +68,7 @@ If spatial-temporal embedding is enabled, `SpatialTemporalEmbedding(t_list)` is 
 | 3. Learn graph weights | `u_ew, d_ew = GraphLearningModule(features)`. | `u_ew: (B, T, N, K, H)` for spatial neighbors; `d_ew: (B, T - 1, interval, N, H)` for temporal directed edges. These are assigned to the current `ADMMBlock`. |
 | 4. Estimate Theta | For block `0` or `ablation="Theta"`, set `Theta=None`. Otherwise estimate Theta from `output[..., 0:1]`, or from the previous deflated `multi_x[..., 0:1]` when available. `theta.method="glasso"` uses centered node covariance and a GLASSO backend. `theta.method="kalofolias"` uses the smooth signal directly. | Dense GLASSO and dense Kalofolias give `Theta: (N, N)` or batched `(B, N, N)`. Local Kalofolias gives local candidate weights `(N, K_theta)` or `(B, N, K_theta)` over `model.theta.local_kNN` neighbors. |
 | 5. ADMM update | Run `ADMMBlock` on signal channels only. With `use_one_channel=True`, the ADMM input is `output[..., 0:1]`; otherwise it is `output`. | Returns `output_new: (B, T, N, C_admm)`. If `predict_only=True`, the observed prefix is copied back before ADMM. |
-| 6. Optional deflation | Deflation runs only when `model.deflation.enabled=True`, this is not the final block, and `ablation!="Theta"`. | ADMM returns `(output_new, multi_x)`. `multi_x` is stored in `last_deflation_multi_x` and can feed the next block's Theta estimation. The final block skips deflation and returns only `output_new`. By default this auxiliary path is detached; see [Differentiable multi-mode Theta path](#differentiable-multi-mode-theta-path). |
+| 6. Optional deflation | Deflation runs only when `model.deflation.enabled=True`, this is not the final block, and `ablation!="Theta"`. | ADMM returns `(output_new, multi_x)`. `multi_x` is stored in `last_deflation_multi_x` and can feed the next block's Theta estimation. The final block skips deflation and returns only `output_new`. The default experiment retains this auxiliary computation graph. |
 | 7. Skip blend | `output = p_i * output_new + (1 - p_i) * output_old`, where `p_i = skip_connection_weights[i]`. | `output_old` is the previous block input; in the first one-channel block it uses `output[..., 0:1]` so channel shapes match. |
 
 When `output_graph=True`, the model also returns the stacked learned graph weights:
@@ -171,14 +171,13 @@ python -m train.train_traffic --dataset METR-LA --cuda 1 --ablation DGLR --batch
 python -m train.train_traffic --dataset PEMS-BAY --cuda 0 --ablation UT --batchsize 64
 ```
 
-**Example 4**: temporarily enable local Kalofolias Theta on PEMS03:
+**Example 4**: run the default local Kalofolias full-backward setup on PEMS03:
 ```
-python -m train.train_traffic --dataset PEMS03 --cuda 0 --batchsize 12 --theta-method kalofolias --kalofolias-graph local --theta-neighbors 10
+python -m train.train_traffic --dataset PEMS03 --cuda 0 --batchsize 12 --theta-neighbors 10
 ```
 
-For a persistent run setting, prefer editing `train/config.yaml`:
-`model.theta.method: kalofolias`, `model.theta.kalofolias.graph: local`, and
-`model.theta.local_kNN: 10`.
+The default configuration already selects local Kalofolias and retains both
+the Kalofolias and deflation backward paths.
 
 **Example 5**: temporarily enable GLASSO ADMM Theta on PEMS03:
 ```

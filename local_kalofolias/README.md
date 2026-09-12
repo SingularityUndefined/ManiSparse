@@ -79,6 +79,17 @@ signals = torch.randn(40, 200)
 local_weights = module(signals)  # (40, 10)
 ```
 
+Set `learnable_alpha_beta=True` to learn a separate bounded parameter pair for
+every 10 solver iterations. For the default `max_iter=200`, this creates 20
+shared pairs. Every pair starts from `alpha=0.3`, `beta=1.0`; sigmoid
+parameterization keeps alpha in `[0.1, 2.0]` and beta in `[0.5, 1.5]`. When enabled,
+the solver runs all `max_iter` iterations so every parameter group is used.
+
+In traffic training, use
+`model.theta.kalofolias.learnable_alpha_beta: True`, or the temporary CLI
+override `--kalofolias-learnable-alpha-beta`. This option applies only to the
+local Kalofolias graph.
+
 In `clean_lib.unrolling_model.UnrollingModel`, set
 `model.theta.method: kalofolias` and `model.theta.kalofolias.graph: local` to
 use this solver for Theta. The main graph-learning neighbor count remains

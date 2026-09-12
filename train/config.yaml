@@ -38,7 +38,7 @@ model:
     samples: 5
     CG_iters: 3
     tol: 1.0e-6
-    # Experimental: retain the full multi-mode deflation computation graph.
+    # Retain the full multi-mode deflation computation graph by default.
     # This is substantially more memory-intensive than detached deflation.
     allow_backward: True
     # If true, perform one N-node deflation solve for each (batch, time)
@@ -47,7 +47,7 @@ model:
 
   theta:
     # method: glasso or kalofolias
-    method: glasso
+    method: kalofolias
     # Candidate neighbor count used only when method=kalofolias and kalofolias.graph=local.
     # Default convention is graph.kNN + 4; with graph.kNN=6 this is 10.
     local_kNN: 10
@@ -64,7 +64,7 @@ model:
 
     kalofolias:
       # graph: dense or local
-      graph: dense
+      graph: local
       alpha: 0.3
       beta: 1.0
       max_iter: 200
@@ -72,10 +72,12 @@ model:
       threshold: 1.0e-4
       output_mode: laplacian
       normalize_distances: True
-      # Let gradients flow through the local Kalofolias solver.  This costs
-      # considerably more memory; leave disabled for the normal detached-Theta
-      # training path.
-      allow_backward: False
+      # Learn one bounded alpha/beta pair for every 10 local-solver iterations.
+      # All groups start from alpha=0.3 and beta=1.0.
+      learnable_alpha_beta: False
+      # Let gradients flow through the local Kalofolias solver. This is the
+      # default experiment; disable it only for detached-Theta ablations.
+      allow_backward: True
 
   graph_learning:
     use_stable_graph_learning: True
