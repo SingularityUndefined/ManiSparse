@@ -512,6 +512,8 @@ class UnrollingModel(nn.Module):
         self.use_deflation = use_deflation
         self.deflation_samples = deflation_samples
         self.last_deflation_multi_x = None
+        self.last_deflation_zero_mode_events = []
+        self._logged_deflation_zero_mode_signatures = set()
         self.last_glasso_events = []
         self.debug_numerics = False
         self.debug_context = ""
@@ -984,6 +986,7 @@ class UnrollingModel(nn.Module):
             directed_graph_list = []
             undirected_graph_list = []
         self.last_deflation_multi_x = [] if self.use_deflation else None
+        self.last_deflation_zero_mode_events = []
         self.last_glasso_events = []
         multi_x = None  # Used for deflation across blocks.
 
@@ -1092,6 +1095,10 @@ class UnrollingModel(nn.Module):
                     )
                 if run_deflation:
                     output_new, multi_x = admm_result
+                    for event in admm_block.last_deflation_zero_mode_events:
+                        event = dict(event)
+                        event["block"] = i
+                        self.last_deflation_zero_mode_events.append(event)
                     output_new = self._debug_tensor(f"block_{i}.admm_output", output_new)
                     multi_x = self._debug_tensor(f"block_{i}.multi_x", multi_x)
                     self.last_deflation_multi_x.append(multi_x)

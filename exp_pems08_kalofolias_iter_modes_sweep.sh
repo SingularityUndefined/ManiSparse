@@ -8,7 +8,7 @@
 #   CUDA_DEVICE=0 BATCH_SIZE=8 KNN=4 THETA_KNN=8 INTERVAL=6 \
 #     bash exp_pems08_kalofolias_iter_modes_sweep.sh
 
-set -euo pipefail
+set -uo pipefail
 
 cd "$(dirname "$0")"
 
@@ -28,6 +28,12 @@ fi
 
 KALOFOLIAS_ITERS=(100 150 200)
 DEFLATION_MODES=(3 5 10)
+STATUS_FILE="${LOGS_DIR}/sweep_status.tsv"
+failure_count=0
+success_count=0
+
+mkdir -p "$LOGS_DIR"
+printf 'max_iter\tdeflation_modes\tstatus\texit_code\treason\tlauncher_log\n' > "$STATUS_FILE"
 
 for max_iter in "${KALOFOLIAS_ITERS[@]}"; do
   for deflation_modes in "${DEFLATION_MODES[@]}"; do
@@ -36,6 +42,8 @@ for max_iter in "${KALOFOLIAS_ITERS[@]}"; do
     # max_iter is separated at the log-root level because the common
     # experiment-name builder does not include this solver setting.
     run_logs_dir="${LOGS_DIR}/max_iter_${max_iter}"
+    launcher_log="${run_logs_dir}/launcher_mode_${deflation_modes}.log"
+    mkdir -p "$run_logs_dir"
 
     python -m train.train_traffic \
       --config "$CONFIG_PATH" \
@@ -50,6 +58,43 @@ for max_iter in "${KALOFOLIAS_ITERS[@]}"; do
       --kalofolias-beta 1.0 \
       --no-kalofolias-learnable-alpha-beta \
       --kalofolias-max-iter "$max_iter" \
-      --deflation-samples "$deflation_modes"
+      --deflation-samples "$deflation_modes" \
+      2>&1 | tee "$launcher_log"
+    exit_code=${PIPESTATUS[0]}
+
+    if (( exit_code == 0 )); then
+      status="success"
+      reason="none"
+      ((success_count += 1))
+      echo "Completed: max_iter=${max_iter}, deflation_modes=${deflation_modes}"
+    else
+      status="failed"
+      if grep -Eqi 'CUDA out of memory|OutOfMemoryError|CUBLAS_STATUS_ALLOC_FAILED' "$launcher_log"; then
+        reason="cuda_oom"
+      elif grep -Eqi 'Numerical failure|gradient has NaN or Inf|SqrtBackward0.*nan' "$launcher_log"; then
+        reason="numerical_nan"
+      elif (( exit_code == 137 )); then
+        reason="killed_or_host_oom"
+      elif (( exit_code == 143 )); then
+        reason="terminated"
+      else
+        reason="process_error"
+      fi
+      ((failure_count += 1))
+      echo "Failed (${reason}, exit=${exit_code}): max_iter=${max_iter}, deflation_modes=${deflation_modes}" >&2
+      echo "See launcher log: ${launcher_log}" >&2
+      echo "Continuing with the next experiment." >&2
+    fi
+
+    printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
+      "$max_iter" "$deflation_modes" "$status" "$exit_code" "$reason" "$launcher_log" \
+      >> "$STATUS_FILE"
   done
 done
+
+echo "Sweep finished: ${success_count} succeeded, ${failure_count} failed."
+echo "Summary: ${STATUS_FILE}"
+
+if (( failure_count > 0 )); then
+  exit 1
+fi

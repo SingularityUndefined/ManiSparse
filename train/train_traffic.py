@@ -195,6 +195,59 @@ def _log_glasso_fallback_events(model, logger, epoch, num_epochs, iteration_coun
     )
 
 
+def _format_deflation_zero_mode_event(event):
+    """Format one protected zero/near-zero deflation-mode occurrence."""
+    event_kind = "exact_zero" if event.get("exact_zero", 0) > 0 else "near_zero"
+    return (
+        f"kind={event_kind}, block={event.get('block', '-')}, mode={event.get('mode', '-')}, "
+        f"below_eps={event.get('below_eps', '-')}/{event.get('total', '-')}, "
+        f"exact_zero={event.get('exact_zero', '-')}/{event.get('total', '-')}, "
+        f"squared_norm_range=[{event.get('min_squared_norm', float('nan')):.3e}, "
+        f"{event.get('max_squared_norm', float('nan')):.3e}], "
+        f"eps={event.get('eps', float('nan')):.3e}, "
+        f"per_timestep={event.get('per_timestep', '-')}"
+    )
+
+
+def _format_deflation_zero_mode_events(model, max_events=40):
+    """Return zero/near-zero deflation events from the latest forward."""
+    events = getattr(model, "last_deflation_zero_mode_events", None) or []
+    if not events:
+        return []
+    lines = [f"Deflation zero/near-zero modes in latest forward: count={len(events)}"]
+    lines.extend(_format_deflation_zero_mode_event(event) for event in events[:max_events])
+    if len(events) > max_events:
+        lines.append(f"... {len(events) - max_events} more deflation zero-mode events omitted")
+    return lines
+
+
+def _log_new_deflation_zero_mode_events(model, logger, epoch, num_epochs, iteration_count, train_loader):
+    """Log the first near-zero and exact-zero event per ``(block, mode)``."""
+    events = getattr(model, "last_deflation_zero_mode_events", None) or []
+    logged = getattr(model, "_logged_deflation_zero_mode_signatures", set())
+    new_events = []
+    for event in events:
+        event_kind = "exact_zero" if event.get("exact_zero", 0) > 0 else "near_zero"
+        signature = (
+            event.get("block"),
+            event.get("mode"),
+            event.get("per_timestep"),
+            event_kind,
+        )
+        if signature not in logged:
+            logged.add(signature)
+            new_events.append(event)
+    model._logged_deflation_zero_mode_signatures = logged
+    if not new_events:
+        return
+    logger.warning(
+        "%s\n%s",
+        f"Deflation zero-mode protection triggered at "
+        f"{_training_location(epoch, num_epochs, iteration_count, train_loader)}",
+        "\n".join(_format_deflation_zero_mode_event(event) for event in new_events),
+    )
+
+
 def _raise_training_numerical_error(reason, epoch, num_epochs, iteration_count, train_loader, tensors, logger, extra_lines=None):
     """Log and raise a readable numerical failure message."""
     lines = [
@@ -455,6 +508,7 @@ def train_one_epoch(
                 + _format_glasso_fallback_events(model),
             )
         _log_glasso_fallback_events(model, logger, epoch, num_epochs, iteration_count, train_loader)
+        _log_new_deflation_zero_mode_events(model, logger, epoch, num_epochs, iteration_count, train_loader)
         if iteration_count % 20 == 0:
             theta_stats = collect_theta_support_deltas(model)
             theta_samples.append(theta_stats)
@@ -515,6 +569,7 @@ def train_one_epoch(
                     f"use_one_channel={model_config['use_one_channel']}",
                 ]
                 + _format_glasso_fallback_events(model)
+                + _format_deflation_zero_mode_events(model)
                 + diagnostic_lines,
             )
 

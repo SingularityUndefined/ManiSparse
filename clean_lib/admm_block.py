@@ -219,6 +219,7 @@ class ADMMBlock(nn.Module):
         self.theta_neighbor_list = None
         self.theta_neighbor_mask = None
         self.theta_operator_mode = "matrix"
+        self.last_deflation_zero_mode_events = []
 
         self.ADMM_iters = ADMM_info["ADMM_iters"]
         self.CG_iters = ADMM_info["CG_iters"]
@@ -763,10 +764,31 @@ class ADMMBlock(nn.Module):
         """Deflation inner product, globally or independently per time step."""
         return (x * y).sum(dim=self._deflation_reduce_dims(x), keepdim=True)
 
-    def _normalize_mode(self, x):
-        norm = torch.sqrt(self._mode_inner(x, x))
+    def _normalize_mode(self, x, mode_idx):
+        squared_norm = self._mode_inner(x, x)
         eps = torch.finfo(x.dtype).eps
-        return torch.where(norm > 0, x / norm.clamp_min(eps), torch.zeros_like(x))
+        # Clamping after sqrt is insufficient for autograd: sqrt(0) has an
+        # infinite derivative, and the inactive torch.where branch can still
+        # produce 0 * inf = NaN during backward. Clamp the squared norm before
+        # sqrt and treat numerically exhausted higher modes as zero.
+        valid_norm = squared_norm > eps
+        if torch.any(~valid_norm):
+            detached_norm = squared_norm.detach()
+            self.last_deflation_zero_mode_events.append(
+                {
+                    "mode": int(mode_idx),
+                    "below_eps": int((detached_norm <= eps).sum().cpu()),
+                    "exact_zero": int((detached_norm == 0).sum().cpu()),
+                    "total": detached_norm.numel(),
+                    "min_squared_norm": float(detached_norm.min().cpu()),
+                    "max_squared_norm": float(detached_norm.max().cpu()),
+                    "eps": float(eps),
+                    "per_timestep": bool(self.deflation_per_timestep),
+                }
+            )
+        norm = torch.sqrt(squared_norm.clamp_min(eps))
+        normalized = x / norm
+        return torch.where(valid_norm, normalized, torch.zeros_like(x))
 
     def _remove_mode_projection(self, x, q):
         return x - self._mode_inner(x, q) * q
@@ -782,7 +804,7 @@ class ADMMBlock(nn.Module):
 
     def _initial_deflation_state(self, rhs, e_step_x, n_modes):
         """Initialize multi_x so mode 0 is exactly the original ADMM output."""
-        first_q = self._normalize_mode(e_step_x)
+        first_q = self._normalize_mode(e_step_x, mode_idx=0)
         projected_rhs = self._remove_mode_projection(rhs, first_q)
         if self.deflation_allow_backward:
             # Lists and torch.stack preserve the graph from every mode back to
@@ -828,7 +850,7 @@ class ADMMBlock(nn.Module):
                 reduce_dims=self._deflation_reduce_dims(projected_rhs),
             )
             x_k = self._project_orthogonal(z, basis, mode_idx)
-            q_k = self._normalize_mode(x_k)
+            q_k = self._normalize_mode(x_k, mode_idx=mode_idx)
             if self.deflation_allow_backward:
                 multi_x.append(x_k)
                 basis.append(q_k)
@@ -862,6 +884,7 @@ class ADMMBlock(nn.Module):
                 output, multi_x where multi_x is (B, K, T, N, C) and
                 multi_x[:, 0] is exactly output.
         """
+        self.last_deflation_zero_mode_events = []
         if mask is None:
             raise ValueError("ADMMBlock.forward requires mask=t_in for the observed prefix length")
         if y.size(1) != self.T:
