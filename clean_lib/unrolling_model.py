@@ -540,17 +540,25 @@ class UnrollingModel(nn.Module):
             device=self.device,
         )
         self.theta_neighbor_list = self._build_theta_neighbor_list(k_hop)
-        self.local_kalofolias_graph_estimator = LocalKalofoliasGraphLearning(
-            self.theta_neighbor_list,
-            neighbor_mask=self.theta_neighbor_mask,
-            alpha=kalofolias_alpha,
-            beta=kalofolias_beta,
-            max_iter=kalofolias_max_iter,
-            tol=kalofolias_tol,
-            threshold=kalofolias_threshold,
-            normalize_distances=kalofolias_normalize_distances,
-            allow_backward=kalofolias_allow_backward,
-            learnable_alpha_beta=kalofolias_learnable_alpha_beta,
+        # Block 0 never estimates Theta. Every later block owns a distinct
+        # estimator so its learnable alpha/beta schedule can specialize to the
+        # signal presented at that depth of the unrolled model.
+        self.local_kalofolias_graph_estimators = nn.ModuleList(
+            [
+                LocalKalofoliasGraphLearning(
+                    self.theta_neighbor_list,
+                    neighbor_mask=self.theta_neighbor_mask,
+                    alpha=kalofolias_alpha,
+                    beta=kalofolias_beta,
+                    max_iter=kalofolias_max_iter,
+                    tol=kalofolias_tol,
+                    threshold=kalofolias_threshold,
+                    normalize_distances=kalofolias_normalize_distances,
+                    allow_backward=kalofolias_allow_backward,
+                    learnable_alpha_beta=kalofolias_learnable_alpha_beta,
+                )
+                for _ in range(max(0, self.num_blocks - 1))
+            ]
         )
         self.connect_list = connect_list(graph_info["n_nodes"], graph_info["u_edges"], self.device)
 
@@ -905,6 +913,36 @@ class UnrollingModel(nn.Module):
         """Whether Theta is learned as a dense Kalofolias graph matrix."""
         return self.theta_method == "kalofolias" and self.kalofolias_graph == "dense"
 
+    def _load_from_state_dict(
+        self,
+        state_dict,
+        prefix,
+        local_metadata,
+        strict,
+        missing_keys,
+        unexpected_keys,
+        error_msgs,
+    ):
+        """Expand the former shared local-Kalofolias state into every block."""
+        old_prefix = prefix + "local_kalofolias_graph_estimator."
+        old_items = [(key, value) for key, value in state_dict.items() if key.startswith(old_prefix)]
+        if old_items:
+            for estimator_idx in range(len(self.local_kalofolias_graph_estimators)):
+                new_prefix = prefix + f"local_kalofolias_graph_estimators.{estimator_idx}."
+                for key, value in old_items:
+                    state_dict.setdefault(new_prefix + key[len(old_prefix) :], value)
+            for key, _ in old_items:
+                state_dict.pop(key)
+        super()._load_from_state_dict(
+            state_dict,
+            prefix,
+            local_metadata,
+            strict,
+            missing_keys,
+            unexpected_keys,
+            error_msgs,
+        )
+
     def _estimate_theta_for_block(self, block_idx, source, signal):
         """Estimate normalized Theta for one unrolled block.
 
@@ -925,7 +963,8 @@ class UnrollingModel(nn.Module):
         if self.theta_method == "kalofolias" and self._uses_local_kalofolias():
             signal_matrix = node_signal_matrix(signal[..., 0:1])
             signal_matrix = self._debug_tensor(f"block_{block_idx}.local_kalofolias_signal_matrix", signal_matrix)
-            theta = self.local_kalofolias_graph_estimator(signal_matrix)
+            estimator = self.local_kalofolias_graph_estimators[block_idx - 1]
+            theta = estimator(signal_matrix)
             return self._debug_tensor(f"block_{block_idx}.Theta_local", theta)
 
         if self.theta_method == "kalofolias" and self._uses_dense_kalofolias():

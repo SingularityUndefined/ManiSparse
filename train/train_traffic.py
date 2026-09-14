@@ -12,6 +12,7 @@ import gc
 import math
 import os
 import random
+import warnings
 
 import numpy as np
 import torch
@@ -22,6 +23,7 @@ from train.train_utils import (
     apply_args_to_config,
     build_experiment_names,
     build_loss_fn,
+    collect_kalofolias_parameter_vectors,
     collect_theta_support_deltas,
     collect_spatial_penalty_vectors,
     create_data,
@@ -36,6 +38,7 @@ from train.train_utils import (
     get_model_config,
     log_run_header,
     parse_args,
+    plot_kalofolias_parameter_history,
     plot_theta_metric_history,
     plot_spatial_penalty_history,
     prepare_runtime,
@@ -787,8 +790,17 @@ def _load_training_state(path, model, optimizer, scheduler, device):
     if missing:
         raise ValueError(f"{path} is not a resumable training-state checkpoint; missing {sorted(missing)}")
     model.load_state_dict(state["model"])
-    optimizer.load_state_dict(state["optimizer"])
-    if scheduler is not None and state.get("scheduler") is not None:
+    optimizer_restored = True
+    try:
+        optimizer.load_state_dict(state["optimizer"])
+    except ValueError as error:
+        optimizer_restored = False
+        warnings.warn(
+            "The checkpoint optimizer state does not match the current per-block "
+            "Kalofolias parameter layout; model parameters were restored, but the "
+            f"optimizer and scheduler will restart. Original error: {error}"
+        )
+    if optimizer_restored and scheduler is not None and state.get("scheduler") is not None:
         scheduler.load_state_dict(state["scheduler"])
     _restore_rng_state(state.get("rng"))
     return state
@@ -797,7 +809,7 @@ def _load_training_state(path, model, optimizer, scheduler, device):
 def _save_training_state(path, model, optimizer, scheduler, next_epoch, best_val_loss, best_epoch, train_loss_list, val_loss_list, test_loss_history, theta_metric_history):
     """Atomically save all state required to resume at the next epoch."""
     state = {
-        "format_version": 2,
+        "format_version": 3,
         "next_epoch": next_epoch,
         "model": model.state_dict(),
         "optimizer": optimizer.state_dict(),
@@ -913,6 +925,7 @@ def main(argv=None):
                     "epoch": epoch + 1,
                     "summary": train_metrics["theta_summary"],
                     "spatial_penalties": collect_spatial_penalty_vectors(model),
+                    "kalofolias_parameters": collect_kalofolias_parameter_vectors(model),
                 }
             )
             logger.info(
@@ -987,6 +1000,7 @@ def main(argv=None):
         plot_loss_curve(train_loss_list, val_loss_list, paths.plot_path, test_loss_history=test_loss_history)
         plot_theta_metric_history(theta_metric_history, paths.theta_plot_path)
         plot_spatial_penalty_history(theta_metric_history, paths.spatial_penalty_plot_path)
+        plot_kalofolias_parameter_history(theta_metric_history, paths.kalofolias_parameter_plot_path)
         writer.close()
 
 

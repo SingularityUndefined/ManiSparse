@@ -127,6 +127,7 @@ class TrainingPaths:
     plot_path: str
     theta_plot_path: str
     spatial_penalty_plot_path: str
+    kalofolias_parameter_plot_path: str
     train_state_path: str
 
 
@@ -552,6 +553,7 @@ def create_training_paths(names):
     plot_path = os.path.join(plot_dir, f"{run_id}.png")
     theta_plot_path = os.path.join(plot_dir, f"{run_id}_theta_metrics.png")
     spatial_penalty_plot_path = os.path.join(plot_dir, f"{run_id}_spatial_penalties.png")
+    kalofolias_parameter_plot_path = os.path.join(plot_dir, f"{run_id}_kalofolias_alpha_beta.png")
     train_state_path = os.path.join(model_dir, "last_train_state.pth")
 
     for path in [tensorboard_logdir, log_dir, model_dir, plot_dir, os.path.dirname(debug_model_path)]:
@@ -566,6 +568,7 @@ def create_training_paths(names):
         plot_path,
         theta_plot_path,
         spatial_penalty_plot_path,
+        kalofolias_parameter_plot_path,
         train_state_path,
     )
 
@@ -1008,6 +1011,46 @@ def collect_spatial_penalty_vectors(model):
     return vectors
 
 
+def collect_kalofolias_parameter_vectors(model):
+    """Return learnable local-Kalofolias alpha/beta schedules by active block.
+
+    Every Theta-enabled block owns an independent local graph estimator and
+    therefore an independent schedule.
+    """
+    if not getattr(model, "kalofolias_learnable_alpha_beta", False):
+        return []
+    if not (
+        getattr(model, "theta_method", "").lower() == "kalofolias"
+        and getattr(model, "kalofolias_graph", "").lower() == "local"
+    ):
+        return []
+    if getattr(model, "ablation", None) == "Theta":
+        return []
+
+    estimators = getattr(model, "local_kalofolias_graph_estimators", None)
+    if estimators is None:
+        return []
+
+    vectors = []
+    for block_idx, estimator in enumerate(estimators, start=1):
+        if not getattr(estimator, "learnable_alpha_beta", False):
+            continue
+        alpha = torch.as_tensor(estimator.alpha).detach().to(torch.float32).reshape(-1).cpu().tolist()
+        beta = torch.as_tensor(estimator.beta).detach().to(torch.float32).reshape(-1).cpu().tolist()
+        share_interval = int(getattr(estimator, "parameter_share_interval", 1))
+        max_iter = int(getattr(estimator, "max_iter", max(len(alpha), len(beta)) * share_interval))
+        vectors.append(
+            {
+                "block_idx": block_idx,
+                "alpha": alpha,
+                "beta": beta,
+                "parameter_share_interval": share_interval,
+                "max_iter": max_iter,
+            }
+        )
+    return vectors
+
+
 def _format_coefficient(stats):
     """Format one coefficient summary for the sampled training output."""
     kind = stats["kind"]
@@ -1331,6 +1374,84 @@ def plot_spatial_penalty_history(theta_history, save_path):
         axis.set_xlabel("epoch")
     figure.savefig(save_path)
     plt.close(figure)
+
+
+def plot_kalofolias_parameter_history(theta_history, save_path):
+    """Plot every learnable alpha/beta component in one block-by-coefficient grid.
+
+    Each component controls one consecutive group of Kalofolias solver
+    iterations. Rows correspond to blocks; the left and right columns show
+    alpha and beta respectively, with one line per component.
+    """
+    block_ids = sorted(
+        {
+            item["block_idx"]
+            for epoch_data in theta_history
+            for item in epoch_data.get("kalofolias_parameters", [])
+        }
+    )
+    if not block_ids:
+        return []
+
+    import matplotlib.pyplot as plt
+
+    figure, axes = plt.subplots(
+        len(block_ids),
+        2,
+        sharex=True,
+        squeeze=False,
+        figsize=(14, 3.8 * len(block_ids)),
+        constrained_layout=True,
+    )
+    for row, block_idx in enumerate(block_ids):
+        block_entries = []
+        for epoch_data in theta_history:
+            item = next(
+                (
+                    entry
+                    for entry in epoch_data.get("kalofolias_parameters", [])
+                    if entry["block_idx"] == block_idx
+                ),
+                None,
+            )
+            if item is not None:
+                block_entries.append((epoch_data["epoch"], item))
+
+        for column, (coefficient, label) in enumerate((("alpha", r"$\alpha$"), ("beta", r"$\beta$"))):
+            axis = axes[row, column]
+            component_count = max((len(item[coefficient]) for _, item in block_entries), default=0)
+            for component_idx in range(component_count):
+                epochs, values = [], []
+                interval_label = f"component {component_idx}"
+                for epoch, item in block_entries:
+                    if component_idx >= len(item[coefficient]):
+                        continue
+                    epochs.append(epoch)
+                    values.append(item[coefficient][component_idx])
+                    share_interval = item.get("parameter_share_interval", 1)
+                    first_iteration = component_idx * share_interval + 1
+                    last_iteration = min((component_idx + 1) * share_interval, item.get("max_iter", first_iteration))
+                    interval_label = (
+                        f"iter {first_iteration}"
+                        if first_iteration == last_iteration
+                        else f"iters {first_iteration}-{last_iteration}"
+                    )
+                if values:
+                    axis.plot(epochs, values, linewidth=1.6, label=interval_label)
+
+            axis.set_title(f"block_{block_idx}: learnable Kalofolias {label}")
+            axis.set_ylabel("value")
+            axis.grid(True, alpha=0.3)
+            if component_count:
+                axis.legend(loc="best", ncol=3, fontsize="small")
+            else:
+                axis.text(0.5, 0.5, "no learned values", transform=axis.transAxes, ha="center", va="center")
+
+    for axis in axes[-1]:
+        axis.set_xlabel("epoch")
+    figure.savefig(save_path)
+    plt.close(figure)
+    return str(save_path)
 
 
 def _log_nested_config(logger, config):
