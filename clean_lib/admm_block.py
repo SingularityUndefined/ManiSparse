@@ -767,10 +767,6 @@ class ADMMBlock(nn.Module):
     def _normalize_mode(self, x, mode_idx):
         squared_norm = self._mode_inner(x, x)
         eps = torch.finfo(x.dtype).eps
-        # Clamping after sqrt is insufficient for autograd: sqrt(0) has an
-        # infinite derivative, and the inactive torch.where branch can still
-        # produce 0 * inf = NaN during backward. Clamp the squared norm before
-        # sqrt and treat numerically exhausted higher modes as zero.
         valid_norm = squared_norm > eps
         if torch.any(~valid_norm):
             detached_norm = squared_norm.detach()
@@ -786,9 +782,34 @@ class ADMMBlock(nn.Module):
                     "per_timestep": bool(self.deflation_per_timestep),
                 }
             )
-        norm = torch.sqrt(squared_norm.clamp_min(eps))
-        normalized = x / norm
-        return torch.where(valid_norm, normalized, torch.zeros_like(x))
+
+        # Branch 1 -- 2026-09-04 original implementation.
+        # This can produce NaN gradients because sqrt(0) has an infinite
+        # derivative even when torch.where selects the zero-valued branch.
+        # norm = torch.sqrt(squared_norm)
+        # return torch.where(norm > 0, x / norm.clamp_min(eps), torch.zeros_like(x))
+
+        # Branch 2 -- hard zeroing introduced by the numerical-stability fix.
+        # Near-zero modes are discarded completely when squared_norm <= eps.
+        # norm = torch.sqrt(squared_norm.clamp_min(eps))
+        # normalized = x / norm
+        # return torch.where(valid_norm, normalized, torch.zeros_like(x))
+
+        # Branch 3 -- previous recommendation (disabled): clamp before sqrt but
+        # do not hard-zero near-zero modes. Exact-zero inputs still return zero
+        # naturally; small nonzero modes remain small instead of becoming unit
+        # vectors or changing discontinuously to zero at the threshold.
+        # norm = torch.sqrt(squared_norm.clamp_min(eps))
+        # return x / norm
+
+        # Branch 4 -- active: preserve the 2026-09-04 behavior whenever the
+        # norm is above its original eps floor, while making exact zero
+        # autograd-safe. Replacing zero squared norms before sqrt avoids its
+        # infinite derivative; the final where returns a zero mode/gradient.
+        nonzero_norm = squared_norm > 0
+        safe_squared_norm = torch.where(nonzero_norm, squared_norm, torch.ones_like(squared_norm))
+        normalized = x / torch.sqrt(safe_squared_norm)
+        return torch.where(nonzero_norm, normalized, torch.zeros_like(x))
 
     def _remove_mode_projection(self, x, q):
         return x - self._mode_inner(x, q) * q
