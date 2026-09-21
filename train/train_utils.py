@@ -250,7 +250,7 @@ def parse_args(argv=None):
 
     parser.add_argument("--stepLR", dest="use_stepLR", action="store_true")
     parser.set_defaults(use_stepLR=False)
-    parser.add_argument("--stepsize", help="stepLR stepsize", default=8, type=int)
+    parser.add_argument("--stepsize", help="StepLR decay interval in epochs", default=30, type=int)
     parser.add_argument("--gamma", help="stepLR gamma", default=0.2, type=float)
     _add_bool_override(
         parser,
@@ -706,7 +706,7 @@ def create_model(config, args, train_set, device):
 
 
 def create_optimizer_and_scheduler(config, args, model):
-    """Create optimizer and optional ReduceLROnPlateau scheduler."""
+    """Create optimizer and an optional fixed-interval StepLR scheduler."""
     learning_rate = config["learning_rate"]
     if config["optim"] == "adam":
         optimizer = optim.Adam(model.parameters(), lr=learning_rate)
@@ -717,13 +717,10 @@ def create_optimizer_and_scheduler(config, args, model):
 
     scheduler = None
     if args.use_stepLR:
-        scheduler = lr_scheduler.ReduceLROnPlateau(
+        scheduler = lr_scheduler.StepLR(
             optimizer,
-            mode="min",
-            factor=args.gamma,
-            patience=5,
-            cooldown=5,
-            min_lr=5e-6,
+            step_size=args.stepsize,
+            gamma=args.gamma,
         )
     return optimizer, scheduler
 

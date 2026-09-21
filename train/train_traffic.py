@@ -962,7 +962,7 @@ def main(argv=None):
                 torch.save(model.state_dict(), os.path.join(paths.model_dir, f"val_{epoch + 1}.pth"))
 
             if scheduler is not None:
-                scheduler.step(val_loss)
+                scheduler.step()
                 logger.info("Current Learning Rate: %.2e", optimizer.param_groups[0]["lr"])
 
             test_point = maybe_periodic_test(
