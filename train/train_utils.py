@@ -251,7 +251,7 @@ def parse_args(argv=None):
     parser.add_argument("--stepLR", dest="use_stepLR", action="store_true")
     parser.set_defaults(use_stepLR=False)
     parser.add_argument("--stepsize", help="StepLR decay interval in epochs", default=30, type=int)
-    parser.add_argument("--gamma", help="stepLR gamma", default=0.2, type=float)
+    parser.add_argument("--gamma", help="StepLR multiplicative decay factor", default=0.5, type=float)
     _add_bool_override(
         parser,
         "project-admm-penalties",
