@@ -110,11 +110,12 @@ multiQ -> Q_df / Q_i -> exp(...) graph weights -> d_ew -> ADMMBlock -> output ->
 | Skip connection | `skip_connection_weights[i]` | 将当前 ADMM 输出和前一个 block 输出融合。 |
 | Deflation | `DeflationCGSolver` | 只在中间 block、`model.deflation.enabled=True` 且 `ablation!="Theta"` 时运行。默认 no-grad；实验性可微模式会保留 fixed-CG、正交化和 multi-mode 的计算图。 |
 
-当前有效消融名称为 `None`、`DGLR`、`DGTV`、`UT`、`simple` 和 `Theta`。
+当前有效分支名称为 `None`、`Full`、`DGLR`、`DGTV`、`UT`、`simple` 和 `Theta`。
 
 | Ablation | ADMM step 中的变化 | 跳过或修改的分支 |
 |---|---|---|
-| `None` | 完整 split ADMM。 | 使用空间 `z_u`、时间 `z_d`、有向时间 L1 `phi/gamma`、有向时间 L2 `cLdr`、dense `Theta` 和可选 deflation。 |
+| `None` | 原始 split ADMM。 | 使用同一个空间辅助变量 `z_u` 承载 learned `L_u` 和 Theta 正则项，同时使用时间 `z_d`、有向时间 L1 `phi/gamma` 和可选 deflation。 |
+| `Full` | 完全拆分所有二次正则项。 | 独立使用 `z_u`、`z_d`、`z_theta` 及其 `gamma_u`、`gamma_d`、`gamma_theta`，并新增 `rho_theta` 和专用 `ztheta_solver`；保留 `None` 的全部正则项。 |
 | `DGLR` | 去掉时间 L2 / graph Laplacian regularization 分支。 | 跳过 `z_d` solve 和 `gamma_d` update。没有 `mu_d2`、`rho_d`、`zd_solver`。 |
 | `DGTV` | 去掉有向时间 L1 / graph TV 分支。 | 跳过 `phi/gamma`、`phi_direct`、`gamma` update 和 `Ldr_T(gamma + rho * phi)` 项。没有 `mu_d1` 或 `rho`。 |
 | `UT` | 使用无向时间图归一化和无向时间算子。 | Graph learning 设置 `directed_time=False`；`z_d` 使用 `apply_op_Ln` 而不是 `apply_op_cLdr`。同时跳过 `phi/gamma` 和有向时间 L1 更新。 |
@@ -123,14 +124,15 @@ multiQ -> Q_df / Q_i -> exp(...) graph weights -> d_ew -> ADMMBlock -> output ->
 
 参数和 solver 是否存在：
 
-| Ablation | `mu_u` | `mu_d1` | `mu_d2` | `lambda_theta` | `rho` | `rho_u` | `rho_d` | `x_solver` | `zu_solver` | `zd_solver` | Deflation can run |
-|---|---|---|---|---|---|---|---|---|---|---|---|
-| `None` | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes |
-| `DGLR` | Yes | Yes | No | Yes | Yes | Yes | No | Yes | Yes | No | Yes |
-| `DGTV` | Yes | No | Yes | Yes | No | Yes | Yes | Yes | Yes | Yes | Yes |
-| `UT` | Yes | Yes* | Yes | Yes | Yes* | Yes | Yes | Yes | Yes | Yes | Yes |
-| `simple` | Yes | Yes | Yes | Yes | Yes | No | No | Yes | No | No | Yes |
-| `Theta` | Yes | Yes | Yes | No | Yes | Yes | Yes | Yes | Yes | Yes | No |
+| Ablation | `mu_u` | `mu_d1` | `mu_d2` | `lambda_theta` | `rho` | `rho_u` | `rho_d` | `rho_theta` | `x_solver` | `zu_solver` | `zd_solver` | `ztheta_solver` | Deflation can run |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| `None` | Yes | Yes | Yes | Yes | Yes | Yes | Yes | No | Yes | Yes | Yes | No | Yes |
+| `Full` | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes |
+| `DGLR` | Yes | Yes | No | Yes | Yes | Yes | No | No | Yes | Yes | No | No | Yes |
+| `DGTV` | Yes | No | Yes | Yes | No | Yes | Yes | No | Yes | Yes | Yes | No | Yes |
+| `UT` | Yes | Yes* | Yes | Yes | Yes* | Yes | Yes | No | Yes | Yes | Yes | No | Yes |
+| `simple` | Yes | Yes | Yes | Yes | Yes | No | No | No | Yes | No | No | No | Yes |
+| `Theta` | Yes | Yes | Yes | No | Yes | Yes | Yes | No | Yes | Yes | Yes | No | No |
 
 `Theta` 消融时，`lambda_theta` 是否存在目前等价于 `ablation!="Theta"`，但代码分支使用显式 ablation 状态，而不是 `hasattr(lambda_theta)`。`UT` 中 `mu_d1` 和 `rho` 仍然会创建，但 forward 路径不会使用有向时间 L1 更新。cleaned ADMM 路径只暴露实际使用的迭代配置：外层 `num_layers`、内层 `CG_iters` 和可选 deflation CG 设置。
 

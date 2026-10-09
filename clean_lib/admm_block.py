@@ -165,18 +165,18 @@ class ADMMBlock(nn.Module):
         output: (B, T, N, C)
 
     Internal convention after expanding graph heads:
-        x, y, zu, zd, gamma_*: (B, T, N, H, C)
+        x, y, zu, zd, z_theta, gamma_*: (B, T, N, H, C)
         u_ew: (B, T, N, K, H), where K is nearest_nodes.size(1) - 1
         d_ew: (B, T - 1, interval, N, H)
         Theta: optional dense node precision/affinity matrix, (N, N)
 
-    Each ADMMBlock owns its own x/zu/zd CG solvers. Since UnrollingModel
-    constructs one ADMMBlock per unrolled layer, CG parameters are not shared
-    across layers. Within each solver, alpha/beta are indexed by ADMM
-    iteration, so different outer iterations use different parameter slices.
+    Each ADMMBlock owns its own x/zu/zd CG solvers, plus ztheta for Full.
+    Since UnrollingModel constructs one ADMMBlock per unrolled layer, CG
+    parameters are not shared across layers. Within each solver, alpha/beta
+    are indexed by ADMM iteration, so outer iterations use distinct slices.
     """
 
-    VALID_ABLATIONS = {"None", "DGLR", "DGTV", "UT", "simple", "Theta"}
+    VALID_ABLATIONS = {"None", "DGLR", "DGTV", "UT", "simple", "Theta", "Full"}
 
     def __init__(
         self,
@@ -206,7 +206,7 @@ class ADMMBlock(nn.Module):
         self.ablation = ablation
 
         assert self.ablation in self.VALID_ABLATIONS, (
-            "ablation should be one of: None, Theta, DGLR, DGTV, UT, simple"
+            "ablation should be one of: None, Theta, DGLR, DGTV, UT, simple, Full"
         )
 
         # temp_indice[t-1, v] gives the source time index t - (v + 1) for
@@ -257,6 +257,10 @@ class ADMMBlock(nn.Module):
         return self._zd_solver
 
     @property
+    def ztheta_solver(self):
+        return self._ztheta_solver
+
+    @property
     def alpha_x(self):
         return self.x_solver.alpha
 
@@ -279,6 +283,14 @@ class ADMMBlock(nn.Module):
     @property
     def beta_zd(self):
         return self.zd_solver.beta
+
+    @property
+    def alpha_ztheta(self):
+        return self.ztheta_solver.alpha
+
+    @property
+    def beta_ztheta(self):
+        return self.ztheta_solver.beta
 
     @property
     def mu_u(self):
@@ -342,6 +354,8 @@ class ADMMBlock(nn.Module):
             self.rho_u = self._vector_parameter(self.rho_u_init)
         if self.ablation not in ["DGLR", "simple"]:
             self.rho_d = self._vector_parameter(self.rho_d_init)
+        if self.ablation == "Full":
+            self.rho_theta = self._vector_parameter(self.rho_theta_init)
 
     def _init_cg_solvers(self):
         alpha_init = 0.08
@@ -349,14 +363,16 @@ class ADMMBlock(nn.Module):
         self.alpha_x_init = alpha_init
         self.alpha_zu_init = alpha_init
         self.alpha_zd_init = alpha_init
+        self.alpha_ztheta_init = alpha_init
         self.beta_x_init = beta_init
         self.beta_zu_init = beta_init
         self.beta_zd_init = beta_init
+        self.beta_ztheta_init = beta_init
 
-        # One ADMM update has multiple linear solves. Keep x, z_u, and z_d as
-        # distinct child modules so they have independent alpha/beta
-        # parameters. Each solver still has an ADMM_iters dimension, so every
-        # outer ADMM iteration uses its own parameter slice.
+        # One ADMM update has multiple linear solves. Keep x, z_u, z_d, and
+        # the Full branch's z_theta as distinct child modules with independent
+        # alpha/beta parameters. Each solver still has an ADMM_iters
+        # dimension, so every outer ADMM iteration uses its own parameter slice.
         self._x_solver = self._make_cg_solver("x", self.alpha_x_init, self.beta_x_init)
 
         if self.ablation != "simple":
@@ -370,6 +386,12 @@ class ADMMBlock(nn.Module):
                 "zd",
                 self.alpha_zd_init,
                 self.beta_zd_init,
+            )
+        if self.ablation == "Full":
+            self._ztheta_solver = self._make_cg_solver(
+                "ztheta",
+                self.alpha_ztheta_init,
+                self.beta_ztheta_init,
             )
 
     def _init_deflation_solver(self):
@@ -649,12 +671,39 @@ class ADMMBlock(nn.Module):
 
         raise ValueError(f"Unsupported ablation: {self.ablation}")
 
+    def LHS_full_x(self, x, y, iters):
+        """Left-hand side for x when Lu, Ld, and Theta are fully split."""
+        if self.ablation != "Full":
+            raise ValueError("LHS_full_x is only available for ablation='Full'")
+
+        HtHx = x.clone()
+        HtHx[:, y.size(1) :] = torch.zeros_like(x[:, y.size(1) :])
+        constraint_rho = self.rho_u[iters] + self.rho_d[iters] + self.rho_theta[iters]
+        return (
+            HtHx
+            + constraint_rho / 2 * x
+            + self.rho[iters] / 2 * self.apply_op_cLdr(x)
+        )
+
     def LHS_zu(self, zu, iters):
         """Left-hand side for the spatial auxiliary variable z_u."""
         output = self.mu_u[iters] * self.apply_op_Lu(zu) + self.rho_u[iters] / 2 * zu
         if self.ablation != "Theta":
             output = output + self.lambda_theta[iters] * self.apply_op_Theta(zu)
         return output
+
+    def LHS_full_zu(self, zu, iters):
+        """Left-hand side for z_u when Theta has its own auxiliary variable."""
+        return self.mu_u[iters] * self.apply_op_Lu(zu) + self.rho_u[iters] / 2 * zu
+
+    def LHS_ztheta(self, z_theta, iters):
+        """Left-hand side for the independent Theta auxiliary variable."""
+        if self.ablation != "Full":
+            raise ValueError("LHS_ztheta is only available for ablation='Full'")
+        return (
+            self.lambda_theta[iters] * self.apply_op_Theta(z_theta)
+            + self.rho_theta[iters] / 2 * z_theta
+        )
 
     def LHS_zd(self, zd, iters):
         """Left-hand side for the temporal auxiliary variable z_d."""
@@ -929,9 +978,17 @@ class ADMMBlock(nn.Module):
         zu = x.clone()
         zd = x.clone()
 
+        # Full adds a third consensus constraint, x = z_theta. All existing
+        # ablations keep their original initialization and update paths.
+        if self.ablation == "Full":
+            # Theta is another spatial consensus term, so mirror gamma_u's
+            # initialization.
+            gamma_theta = torch.ones_like(x) * 0.05
+            z_theta = x.clone()
+
         # phi/gamma are used by the directed temporal L1 term. Ablating Theta
         # removes only the dense Theta regularizer, not this temporal term.
-        if self.ablation in ["None", "DGLR", "simple", "Theta"]:
+        if self.ablation in ["None", "DGLR", "simple", "Theta", "Full"]:
             gamma = torch.ones_like(x) * 0.1
             phi = self.apply_op_Ldr(x)
 
@@ -941,6 +998,23 @@ class ADMMBlock(nn.Module):
 
             if self.ablation == "simple":
                 x = self._update_simple_x(x, y, Hty, phi, gamma, i)
+            elif self.ablation == "Full":
+                x, zu, zd, z_theta, gamma_u, gamma_d, gamma_theta = (
+                    self._update_full_split_variables(
+                        x,
+                        y,
+                        Hty,
+                        zu,
+                        zd,
+                        z_theta,
+                        gamma_u,
+                        gamma_d,
+                        gamma_theta,
+                        i,
+                        gamma=gamma,
+                        phi=phi,
+                    )
+                )
             else:
                 x, zu, zd, gamma_u, gamma_d = self._update_split_variables(
                     x,
@@ -955,7 +1029,7 @@ class ADMMBlock(nn.Module):
                     phi=phi if self.ablation in ["None", "DGLR", "Theta"] else None,
                 )
 
-            if self.ablation in ["None", "DGLR", "simple", "Theta"]:
+            if self.ablation in ["None", "DGLR", "simple", "Theta", "Full"]:
                 phi = self.phi_direct(x, gamma, i)
                 gamma = gamma + self.rho[i] * (phi - self.apply_op_Ldr(x))
                 self._assert_finite(gamma, "gamma", i)
@@ -1032,6 +1106,140 @@ class ADMMBlock(nn.Module):
             self._assert_finite(gamma_d, "gamma_d", iteration)
 
         return x, zu, zd, gamma_u, gamma_d
+
+    def _update_full_split_variables(
+        self,
+        x,
+        y,
+        Hty,
+        zu,
+        zd,
+        z_theta,
+        gamma_u,
+        gamma_d,
+        gamma_theta,
+        iteration,
+        gamma=None,
+        phi=None,
+    ):
+        """Update x, z_u, z_d, z_theta and their dual variables once.
+
+        This is the update used by the ``Full`` branch in :meth:`forward`.
+        """
+        # Full-split problem:
+        #
+        #   min  ||H x - y||_F^2
+        #        + mu_u       <z_u,     L_u z_u>
+        #        + mu_d2      <z_d, L_d^T L_d z_d>
+        #        + lambda_theta <z_theta, Theta z_theta>
+        #        + mu_d1 ||phi||_1
+        #
+        #   s.t. x = z_u,  x = z_d,  x = z_theta,  phi = L_d x.
+        #
+        # With the same dual signs and factor-of-two convention as the current
+        # implementation, the proposed x normal equation is
+        #
+        #   [H^T H + (rho_u + rho_d + rho_theta) / 2 * I
+        #            + rho / 2 * L_d^T L_d] x
+        #     = H^T y
+        #       + (rho_u z_u         - gamma_u)     / 2
+        #       + (rho_d z_d         - gamma_d)     / 2
+        #       + (rho_theta z_theta - gamma_theta) / 2
+        #       + L_d^T(gamma + rho phi) / 2.
+        #
+        # The three auxiliary-variable normal equations are
+        #
+        #   [mu_u L_u + rho_u / 2 * I] z_u
+        #       = (gamma_u + rho_u x) / 2,
+        #
+        #   [mu_d2 L_d^T L_d + rho_d / 2 * I] z_d
+        #       = (gamma_d + rho_d x) / 2,
+        #
+        #   [lambda_theta Theta + rho_theta / 2 * I] z_theta
+        #       = (gamma_theta + rho_theta x) / 2.
+        #
+        # The dual updates are
+        #
+        #   gamma_u     <- gamma_u     + rho_u     (x - z_u),
+        #   gamma_d     <- gamma_d     + rho_d     (x - z_d),
+        #   gamma_theta <- gamma_theta + rho_theta (x - z_theta).
+        #
+        if self.ablation != "Full":
+            raise ValueError("full splitting is only available for ablation='Full'")
+
+        RHS_x = self._build_full_RHS_x(
+            Hty,
+            zu,
+            zd,
+            z_theta,
+            gamma_u,
+            gamma_d,
+            gamma_theta,
+            iteration,
+            gamma,
+            phi,
+        )
+        self._assert_finite(RHS_x, "RHS_x", iteration)
+
+        x = self.x_solver(self.LHS_full_x, RHS_x, x, iteration, args=y)
+        self._assert_finite(x, "x", iteration)
+
+        RHS_zu = gamma_u / 2 + self.rho_u[iteration] / 2 * x
+        zu = self.zu_solver(self.LHS_full_zu, RHS_zu, zu, iteration)
+        self._assert_finite(RHS_zu, "RHS_zu", iteration)
+        self._assert_finite(zu, "zu", iteration)
+
+        RHS_zd = gamma_d / 2 + self.rho_d[iteration] / 2 * x
+        zd = self.zd_solver(self.LHS_zd, RHS_zd, zd, iteration)
+        self._assert_finite(RHS_zd, "RHS_zd", iteration)
+        self._assert_finite(zd, "zd", iteration)
+
+        RHS_ztheta = gamma_theta / 2 + self.rho_theta[iteration] / 2 * x
+        z_theta = self.ztheta_solver(
+            self.LHS_ztheta,
+            RHS_ztheta,
+            z_theta,
+            iteration,
+        )
+        self._assert_finite(RHS_ztheta, "RHS_ztheta", iteration)
+        self._assert_finite(z_theta, "z_theta", iteration)
+
+        gamma_u = gamma_u + self.rho_u[iteration] * (x - zu)
+        self._assert_finite(gamma_u, "gamma_u", iteration)
+        gamma_d = gamma_d + self.rho_d[iteration] * (x - zd)
+        self._assert_finite(gamma_d, "gamma_d", iteration)
+        gamma_theta = gamma_theta + self.rho_theta[iteration] * (x - z_theta)
+        self._assert_finite(gamma_theta, "gamma_theta", iteration)
+
+        return x, zu, zd, z_theta, gamma_u, gamma_d, gamma_theta
+
+    def _build_full_RHS_x(
+        self,
+        Hty,
+        zu,
+        zd,
+        z_theta,
+        gamma_u,
+        gamma_d,
+        gamma_theta,
+        iteration,
+        gamma,
+        phi,
+    ):
+        """Build the x right-hand side for the fully split formulation."""
+        if self.ablation != "Full":
+            raise ValueError("full splitting is only available for ablation='Full'")
+        return (
+            self.apply_op_Ldr_T(gamma + self.rho[iteration] * phi) / 2
+            + (
+                self.rho_u[iteration] * zu
+                + self.rho_d[iteration] * zd
+                + self.rho_theta[iteration] * z_theta
+            )
+            / 2
+            - (gamma_u + gamma_d + gamma_theta) / 2
+            + Hty
+        )
 
     def _build_RHS_x(self, Hty, zu, zd, gamma_u, gamma_d, iteration, gamma, phi):
         """Build the right-hand side of the x linear solve for each ablation."""

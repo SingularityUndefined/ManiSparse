@@ -113,11 +113,12 @@ Each unrolled block follows the same high-level order:
 | Skip connection | `skip_connection_weights[i]` | Blends each block output with the previous block output. |
 | Deflation | `DeflationCGSolver` | Runs only on intermediate blocks when `model.deflation.enabled=True` and `ablation!="Theta"`. The first deflated mode is the normal ADMM output. The final block skips deflation and returns the normal ADMM output. It is detached by default and can be made differentiable experimentally. |
 
-Current valid ablation names are `None`, `DGLR`, `DGTV`, `UT`, `simple`, and `Theta`.
+Current valid branch names are `None`, `Full`, `DGLR`, `DGTV`, `UT`, `simple`, and `Theta`.
 
 | Ablation | What changes in the ADMM step | Branches skipped or modified |
 |---|---|---|
-| `None` | Full split ADMM. | Uses spatial `z_u`, temporal `z_d`, directed temporal L1 `phi/gamma`, directed temporal L2 `cLdr`, Theta, and optional deflation. Theta is dense for GLASSO and dense Kalofolias, and local for `theta.method=kalofolias, theta.kalofolias.graph=local`. |
+| `None` | Original split ADMM. | Uses one spatial auxiliary variable `z_u` for both the learned `L_u` and Theta regularizers, plus temporal `z_d`, directed temporal L1 `phi/gamma`, and optional deflation. |
+| `Full` | Fully separates all quadratic regularizers. | Uses independent `z_u`, `z_d`, and `z_theta` variables with `gamma_u`, `gamma_d`, and `gamma_theta`; adds `rho_theta` and a dedicated `ztheta_solver`. All regularizers used by `None` remain active. |
 | `DGLR` | Removes the temporal L2 / graph Laplacian regularization branch. | Skips `z_d` solve and `gamma_d` update. No `mu_d2`, `rho_d`, or `zd_solver`. |
 | `DGTV` | Removes the directed temporal L1 / graph TV branch. | Skips `phi/gamma`, `phi_direct`, `gamma` update, and the `Ldr_T(gamma + rho * phi)` term. No `mu_d1` or `rho`. |
 | `UT` | Uses undirected temporal graph normalization and an undirected temporal operator. | Graph learning sets `directed_time=False`; `z_d` uses `apply_op_Ln` instead of `apply_op_cLdr`. It also skips `phi/gamma` and the directed temporal L1 update. |
@@ -126,14 +127,15 @@ Current valid ablation names are `None`, `DGLR`, `DGTV`, `UT`, `simple`, and `Th
 
 Parameter and solver existence by ablation:
 
-| Ablation | `mu_u` | `mu_d1` | `mu_d2` | `lambda_theta` | `rho` | `rho_u` | `rho_d` | `x_solver` | `zu_solver` | `zd_solver` | Deflation can run |
-|---|---|---|---|---|---|---|---|---|---|---|---|
-| `None` | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes |
-| `DGLR` | Yes | Yes | No | Yes | Yes | Yes | No | Yes | Yes | No | Yes |
-| `DGTV` | Yes | No | Yes | Yes | No | Yes | Yes | Yes | Yes | Yes | Yes |
-| `UT` | Yes | Yes* | Yes | Yes | Yes* | Yes | Yes | Yes | Yes | Yes | Yes |
-| `simple` | Yes | Yes | Yes | Yes | Yes | No | No | Yes | No | No | Yes |
-| `Theta` | Yes | Yes | Yes | No | Yes | Yes | Yes | Yes | Yes | Yes | No |
+| Ablation | `mu_u` | `mu_d1` | `mu_d2` | `lambda_theta` | `rho` | `rho_u` | `rho_d` | `rho_theta` | `x_solver` | `zu_solver` | `zd_solver` | `ztheta_solver` | Deflation can run |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| `None` | Yes | Yes | Yes | Yes | Yes | Yes | Yes | No | Yes | Yes | Yes | No | Yes |
+| `Full` | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes |
+| `DGLR` | Yes | Yes | No | Yes | Yes | Yes | No | No | Yes | Yes | No | No | Yes |
+| `DGTV` | Yes | No | Yes | Yes | No | Yes | Yes | No | Yes | Yes | Yes | No | Yes |
+| `UT` | Yes | Yes* | Yes | Yes | Yes* | Yes | Yes | No | Yes | Yes | Yes | No | Yes |
+| `simple` | Yes | Yes | Yes | Yes | Yes | No | No | No | Yes | No | No | No | Yes |
+| `Theta` | Yes | Yes | Yes | No | Yes | Yes | Yes | No | Yes | Yes | Yes | No | No |
 
 For `Theta`, `lambda_theta` existence is currently equivalent to `ablation!="Theta"`, but the code uses the explicit ablation state rather than `hasattr(lambda_theta)` for branch decisions. For `UT`, `mu_d1` and `rho` are still created, but the forward path does not use the directed temporal L1 update. The cleaned ADMM path exposes only the iterations it actually uses: outer `num_layers`, inner `CG_iters`, and optional deflation CG settings.
 

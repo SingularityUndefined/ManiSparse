@@ -242,7 +242,12 @@ def parse_args(argv=None):
     parser.add_argument("--theta-neighbors", help="temporary override for model.theta.local_kNN", default=None, type=int)
     parser.add_argument("--interval", help="temporary override for model.graph.interval", default=None, type=int)
     parser.add_argument("--FElayers", help="feature extractor layers", default=1, type=int)
-    parser.add_argument("--ablation", help="operator to eliminate in ablation study", default="None", type=str)
+    parser.add_argument(
+        "--ablation",
+        help="ADMM branch: None, Full, DGLR, DGTV, UT, simple, or Theta",
+        default="None",
+        type=str,
+    )
 
     parser.add_argument("--seed", help="random seed", default=3407, type=int)
     parser.add_argument("--debug", dest="debug", help="save debug model every iteration", action="store_true")
@@ -529,7 +534,9 @@ def build_experiment_names(config, args):
     name = f"spatialCoupled{int(config.get('couple_spatial_penalties', True))}_" + name
     if args.trunc:
         name = "trunc_" + name
-    if args.ablation != "None":
+    if args.ablation == "Full":
+        name = "Full_" + name
+    elif args.ablation != "None":
         name = f"wo_{args.ablation}_" + name
     if not model_config["use_extrapolation"]:
         name = "LR_" + name

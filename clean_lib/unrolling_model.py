@@ -657,7 +657,8 @@ class UnrollingModel(nn.Module):
                         # This constructor is inside the layer loop, so every
                         # unrolled layer owns an independent ADMMBlock and an
                         # independent set of UnrolledCGSolver modules/parameters:
-                        #   x_solver, zu_solver, zd_solver
+                        #   x_solver, zu_solver, zd_solver, and for the Full
+                        #   split branch, ztheta_solver
                         "ADMM_block": ADMMBlock(
                             T=T,
                             n_nodes=graph_info["n_nodes"],
@@ -862,7 +863,7 @@ class UnrollingModel(nn.Module):
             self._clamp_cg_param(admm_block, "beta", beta_max)
             if project_admm_penalties:
                 eps = torch.finfo(admm_block.mu_u.dtype).eps
-                for name in ("mu_d1", "mu_d2", "rho", "rho_u", "rho_d"):
+                for name in ("mu_d1", "mu_d2", "rho", "rho_u", "rho_d", "rho_theta"):
                     parameter = getattr(admm_block, name, None)
                     if parameter is not None:
                         parameter.data.clamp_(min=eps)
@@ -888,6 +889,8 @@ class UnrollingModel(nn.Module):
             suffixes.append("zu")
         if self.ablation not in ["DGLR", "simple"]:
             suffixes.append("zd")
+        if self.ablation == "Full":
+            suffixes.append("ztheta")
 
         for suffix in suffixes:
             param = getattr(admm_block, f"{prefix}_{suffix}")
