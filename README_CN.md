@@ -5,17 +5,33 @@ English version: [README.md](README.md)
 
 ## 依赖
 
-运行训练前需要在 Python 环境中安装：
+本项目使用 Python 3.8.8。建议先创建并激活独立的 Conda 环境：
+
+```bash
+conda create -n manisparse python=3.8.8 -y
+conda activate manisparse
+```
+
+然后在仓库根目录安装锁定版本的依赖：
+
+```bash
+python -m pip install -r requirements.txt
+```
+
+`requirements.txt` 中包含以下依赖及其精确版本：
 
 ```text
-torch>=2.4.1
-tqdm
-numpy
-matplotlib
-networkx>=2.5
-pandas
-pyyaml
-tensorboard
+matplotlib==3.3.4
+networkx==2.5
+numpy==1.23.0
+pandas==1.2.4
+PyYAML==5.4.1
+scikit-learn==1.3.2
+scipy==1.10.1
+skggm==0.2.8
+tensorboard==2.13.0
+torch==2.4.1
+tqdm==4.59.0
 ```
 
 ## 数据集

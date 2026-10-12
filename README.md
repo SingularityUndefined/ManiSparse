@@ -5,19 +5,34 @@ Chinese version: [README_CN.md](README_CN.md)
 
 ## Requirements
 
-Required packages for this implementation:
+This project uses Python 3.8.8. Create and activate a dedicated Conda environment:
+
+```bash
+conda create -n manisparse python=3.8.8 -y
+conda activate manisparse
+```
+
+Install the pinned dependencies from the repository root:
+
+```bash
+python -m pip install -r requirements.txt
+```
+
+The required packages and their exact versions are listed in `requirements.txt`:
 
 ```
-torch>=2.4.1
-tqdm
-numpy
-matplotlib
-networkx>=2.5
-pandas
-pyyaml
-tensorboard
+matplotlib==3.3.4
+networkx==2.5
+numpy==1.23.0
+pandas==1.2.4
+PyYAML==5.4.1
+scikit-learn==1.3.2
+scipy==1.10.1
+skggm==0.2.8
+tensorboard==2.13.0
+torch==2.4.1
+tqdm==4.59.0
 ```
-Install the dependencies in your Python environment before running training.
 
 ## Datasets
 **PEMS0X datasets** are from repository [ASTGNN](https://github.com/guoshnBJTU/ASTGNN/tree/main/data). The training code expects them under `../TS_datasets/PEMS0X_data`:
