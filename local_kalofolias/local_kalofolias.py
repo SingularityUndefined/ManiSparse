@@ -278,7 +278,7 @@ def _solve_local(
         y = (w - gamma * (2.0 * beta_iter * w + st_d)) * mask
         y_bar = d + gamma * w.sum(dim=-1)
 
-        p = torch.clamp(y - 2.0 * gamma * distances, min=0.0) * mask
+        p = torch.relu(y - 2.0 * gamma * distances) * mask
         p_bar = 0.5 * (y_bar - torch.sqrt(y_bar.square() + 4.0 * alpha_iter * gamma))
 
         q = (p - gamma * (2.0 * beta_iter * p + p_bar.unsqueeze(-1))) * mask
