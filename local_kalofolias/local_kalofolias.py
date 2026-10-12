@@ -15,10 +15,11 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import List, Optional, Union
+from typing import List, Optional, Sequence, Union
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 
 @dataclass
@@ -36,7 +37,7 @@ class LocalKalofoliasResult:
     nnz_ratio_history: List[float]
     alpha: Union[float, List[float]]
     beta: Union[float, List[float]]
-    step_size: float
+    step_size: Union[float, List[float]]
 
 
 def build_ring_neighbor_list(n_nodes: int = 40, k: int = 10, device=None) -> torch.Tensor:
@@ -161,6 +162,33 @@ def _default_step_size(k_neighbors: int, beta: Union[float, torch.Tensor], safet
     return safety / (lipschitz + operator_norm + 1.0)
 
 
+def _gamma_schedule(value, max_iter: int, reference: torch.Tensor) -> torch.Tensor:
+    """Validate gamma and interpolate sequence control points over iterations."""
+    values = torch.as_tensor(value, device=reference.device, dtype=reference.dtype)
+    if values.ndim > 1 or values.numel() == 0:
+        raise ValueError("gamma schedule must be a non-empty scalar or one-dimensional sequence")
+    if torch.any(~torch.isfinite(values)) or torch.any(values <= 0):
+        raise ValueError("all gamma values must be finite and positive")
+    values = values.reshape(-1)
+    if values.numel() == 1:
+        return values[0]
+    if values.numel() == max_iter:
+        return values
+    return F.interpolate(
+        values.reshape(1, 1, -1),
+        size=max_iter,
+        mode="linear",
+        align_corners=True,
+    ).reshape(-1)
+
+
+def _gamma_snapshot(history: List[float]) -> Union[float, List[float]]:
+    """Return a scalar for a constant gamma history and a list otherwise."""
+    if all(math.isclose(value, history[0], rel_tol=1e-12, abs_tol=1e-15) for value in history[1:]):
+        return history[0]
+    return history
+
+
 def _local_objective(
     w: torch.Tensor,
     z: torch.Tensor,
@@ -203,7 +231,7 @@ def _solve_local(
     beta: Union[float, torch.Tensor],
     max_iter: int,
     tol: float,
-    step_size: Optional[float],
+    step_size: Optional[Union[float, Sequence[float], torch.Tensor]],
     step_safety: float,
     threshold: float,
     parameter_share_interval: int,
@@ -213,8 +241,7 @@ def _solve_local(
     k_neighbors = distances.size(-1)
     if parameter_share_interval <= 0:
         raise ValueError("parameter_share_interval must be positive")
-    if step_size is not None and step_size <= 0:
-        raise ValueError("step_size must be positive")
+    configured_gamma = None if step_size is None else _gamma_schedule(step_size, max_iter, distances)
 
     neighbor_mask = neighbor_mask.to(device=distances.device, dtype=torch.bool)
     if neighbor_mask.shape != distances.shape[-2:]:
@@ -231,11 +258,17 @@ def _solve_local(
     nnz_ratio_history: List[float] = []
     converged = False
     relative_change = float("inf")
+    gamma_history: List[float] = []
 
     for iteration in range(1, max_iter + 1):
         alpha_iter = _iteration_parameter(alpha, iteration, parameter_share_interval)
         beta_iter = _iteration_parameter(beta, iteration, parameter_share_interval)
-        gamma = _default_step_size(k_neighbors, beta_iter, step_safety) if step_size is None else float(step_size)
+        gamma = (
+            _default_step_size(k_neighbors, beta_iter, step_safety)
+            if configured_gamma is None
+            else configured_gamma if configured_gamma.ndim == 0 else configured_gamma[iteration - 1]
+        )
+        gamma_history.append(float(gamma.detach().cpu()) if torch.is_tensor(gamma) else float(gamma))
         w_prev = w
 
         # Local degree operator:
@@ -283,7 +316,7 @@ def _solve_local(
         nnz_ratio_history=nnz_ratio_history,
         alpha=_parameter_snapshot(alpha),
         beta=_parameter_snapshot(beta),
-        step_size=float(torch.as_tensor(gamma).detach().cpu()),
+        step_size=_gamma_snapshot(gamma_history),
     )
 
 
@@ -296,13 +329,14 @@ def learn_local_graph_from_smooth_signals(
     beta: Union[float, torch.Tensor] = 1.0,
     max_iter: int = 200,
     tol: float = 1e-4,
-    step_size: Optional[float] = None,
+    step_size: Optional[Union[float, Sequence[float], torch.Tensor]] = None,
     step_safety: float = 0.9,
     normalize_distances: bool = True,
     threshold: float = 1e-4,
     parameter_share_interval: int = 10,
     early_stopping: bool = True,
     return_info: bool = False,
+    gamma: Optional[Union[float, Sequence[float], torch.Tensor]] = None,
 ) -> Union[torch.Tensor, LocalKalofoliasResult]:
     """Learn local sparse graph weights from smooth node signals.
 
@@ -316,6 +350,9 @@ def learn_local_graph_from_smooth_signals(
             share one entry when alpha/beta are one-dimensional schedules.
         early_stopping: Stop when relative change reaches ``tol``. Learnable
             schedules disable this so every parameter group participates.
+        gamma: Public alias for ``step_size``. A sequence is interpreted as
+            evenly spaced control points and linearly interpolated across
+            ``max_iter``. Specify at most one of ``gamma`` and ``step_size``.
 
     Returns:
         Local weights with shape ``(N, K)`` or ``(B, N, K)`` by default.
@@ -330,6 +367,9 @@ def learn_local_graph_from_smooth_signals(
         raise ValueError("max_iter must be positive")
     if tol <= 0:
         raise ValueError("tol must be positive")
+    if step_size is not None and gamma is not None:
+        raise ValueError("specify only one of step_size and gamma")
+    configured_gamma = step_size if gamma is None else gamma
 
     signals = _validate_signals(signals)
     n_nodes = signals.size(-2)
@@ -349,7 +389,7 @@ def learn_local_graph_from_smooth_signals(
         beta,
         max_iter,
         tol,
-        step_size,
+        configured_gamma,
         step_safety,
         threshold,
         parameter_share_interval,
@@ -385,6 +425,7 @@ class LocalKalofoliasGraphLearning(nn.Module):
         threshold: float = 1e-4,
         allow_backward: bool = False,
         learnable_alpha_beta: bool = False,
+        gamma: Optional[Union[float, Sequence[float], torch.Tensor]] = None,
     ):
         super().__init__()
         self.register_buffer("neighbor_list", torch.as_tensor(neighbor_list, dtype=torch.long))
@@ -396,7 +437,19 @@ class LocalKalofoliasGraphLearning(nn.Module):
         self._fixed_beta = float(beta)
         self.max_iter = max_iter
         self.tol = tol
-        self.step_size = step_size
+        if step_size is not None and gamma is not None:
+            raise ValueError("specify only one of step_size and gamma")
+        resolved_gamma = step_size if gamma is None else gamma
+        if resolved_gamma is not None:
+            gamma_values = torch.as_tensor(resolved_gamma)
+            if gamma_values.ndim > 1 or gamma_values.numel() == 0:
+                raise ValueError("gamma must be a non-empty scalar or one-dimensional sequence")
+            if torch.any(~torch.isfinite(gamma_values)) or torch.any(gamma_values <= 0):
+                raise ValueError("all gamma values must be finite and positive")
+        self.gamma = resolved_gamma
+        # Keep the original attribute for backward compatibility with callers
+        # that used the solver's internal step_size terminology.
+        self.step_size = resolved_gamma
         self.step_safety = step_safety
         self.normalize_distances = normalize_distances
         self.threshold = threshold
@@ -450,7 +503,7 @@ class LocalKalofoliasGraphLearning(nn.Module):
                 beta=self.beta,
                 max_iter=self.max_iter,
                 tol=self.tol,
-                step_size=self.step_size,
+                gamma=self.gamma,
                 step_safety=self.step_safety,
                 normalize_distances=self.normalize_distances,
                 threshold=self.threshold,
@@ -467,7 +520,7 @@ class LocalKalofoliasGraphLearning(nn.Module):
                 beta=self.beta,
                 max_iter=self.max_iter,
                 tol=self.tol,
-                step_size=self.step_size,
+                gamma=self.gamma,
                 step_safety=self.step_safety,
                 normalize_distances=self.normalize_distances,
                 threshold=self.threshold,

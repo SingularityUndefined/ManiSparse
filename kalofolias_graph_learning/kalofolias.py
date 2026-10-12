@@ -18,7 +18,7 @@ vector.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import List, Optional, Tuple, Union
+from typing import List, Optional, Sequence, Tuple, Union
 
 import numpy as np
 
@@ -40,7 +40,7 @@ class KalofoliasResult:
     nnz_ratio_history: List[float]
     alpha: float
     beta: float
-    step_size: float
+    step_size: Union[float, List[float]]
 
 
 def _validate_signals(signals: Union[np.ndarray, object]) -> np.ndarray:
@@ -114,6 +114,27 @@ def _default_step_size(n_nodes: int, beta: float, safety: float) -> float:
     return float(safety / (lipschitz + operator_norm + 1.0))
 
 
+def _gamma_schedule(value, max_iter: int) -> Union[float, np.ndarray]:
+    """Validate gamma and interpolate sequence control points over iterations."""
+    values = np.asarray(value, dtype=np.float64)
+    if values.ndim == 0:
+        gamma = float(values)
+        if not np.isfinite(gamma) or gamma <= 0:
+            raise ValueError("gamma must be finite and positive")
+        return gamma
+    if values.ndim != 1 or values.size == 0:
+        raise ValueError("gamma schedule must be a non-empty one-dimensional sequence")
+    if not np.isfinite(values).all() or np.any(values <= 0):
+        raise ValueError("all gamma schedule values must be finite and positive")
+    if values.size == 1:
+        return float(values[0])
+    if values.size == max_iter:
+        return values.copy()
+    source = np.linspace(0.0, 1.0, values.size)
+    target = np.linspace(0.0, 1.0, max_iter)
+    return np.interp(target, source, values)
+
+
 def learn_graph_from_smooth_signals(
     signals: Union[np.ndarray, object],
     *,
@@ -121,12 +142,13 @@ def learn_graph_from_smooth_signals(
     beta: float = 1.0,
     max_iter: int = 1000,
     tol: float = 1e-5,
-    step_size: Optional[float] = None,
+    step_size: Optional[Union[float, Sequence[float], np.ndarray]] = None,
     step_safety: float = 0.9,
     distance_matrix: Optional[np.ndarray] = None,
     normalize_distances: bool = True,
     threshold: float = 1e-8,
     return_info: bool = False,
+    gamma: Optional[Union[float, Sequence[float], np.ndarray]] = None,
 ) -> Union[np.ndarray, KalofoliasResult]:
     """Learn a sparse weighted graph from smooth node signals.
 
@@ -141,6 +163,9 @@ def learn_graph_from_smooth_signals(
         step_size: Optional primal-dual step. If omitted, a conservative value
             is chosen from the degree operator norm and ``beta``.
         step_safety: Multiplier used only when ``step_size`` is omitted.
+        gamma: Public alias for ``step_size``. A sequence is interpreted as
+            evenly spaced control points and linearly interpolated across
+            ``max_iter``. Specify at most one of ``gamma`` and ``step_size``.
         distance_matrix: Optional precomputed squared-distance matrix,
             shape ``(n_nodes, n_nodes)``.
         normalize_distances: If True, median-normalize pairwise distances.
@@ -177,9 +202,14 @@ def learn_graph_from_smooth_signals(
     src, dst = _complete_graph_edges(n_nodes)
     z = distances[src, dst]
     n_edges = z.shape[0]
-    gamma = _default_step_size(n_nodes, beta, step_safety) if step_size is None else float(step_size)
-    if gamma <= 0:
-        raise ValueError("step_size must be positive")
+    if step_size is not None and gamma is not None:
+        raise ValueError("specify only one of step_size and gamma")
+    configured_gamma = step_size if gamma is None else gamma
+    gamma_schedule = (
+        _default_step_size(n_nodes, beta, step_safety)
+        if configured_gamma is None
+        else _gamma_schedule(configured_gamma, max_iter)
+    )
 
     # Edge weights w are initialized with positive degrees so the log-degree
     # barrier is finite from the first objective evaluation.
@@ -192,6 +222,7 @@ def learn_graph_from_smooth_signals(
     relative_change = float("inf")
 
     for iteration in range(1, max_iter + 1):
+        gamma = gamma_schedule[iteration - 1] if isinstance(gamma_schedule, np.ndarray) else gamma_schedule
         w_prev = w.copy()
 
         # S^T d maps node dual variables back to edge variables:
@@ -242,6 +273,6 @@ def learn_graph_from_smooth_signals(
         nnz_ratio_history=nnz_ratio_history,
         alpha=float(alpha),
         beta=float(beta),
-        step_size=float(gamma),
+        step_size=gamma_schedule.tolist() if isinstance(gamma_schedule, np.ndarray) else float(gamma_schedule),
     )
     return result if return_info else adjacency

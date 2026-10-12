@@ -65,6 +65,7 @@ MODEL_CONFIG_PATHS = {
     "kalofolias_graph": ("theta", "kalofolias", "graph"),
     "kalofolias_alpha": ("theta", "kalofolias", "alpha"),
     "kalofolias_beta": ("theta", "kalofolias", "beta"),
+    "kalofolias_gamma": ("theta", "kalofolias", "gamma"),
     "kalofolias_max_iter": ("theta", "kalofolias", "max_iter"),
     "kalofolias_tol": ("theta", "kalofolias", "tol"),
     "kalofolias_threshold": ("theta", "kalofolias", "threshold"),
@@ -97,6 +98,7 @@ MODEL_DEFAULTS = {
     "glasso_fallback": True,
     "kalofolias_alpha": 0.3,
     "kalofolias_beta": 1.0,
+    "kalofolias_gamma": None,
     "kalofolias_graph": "local",
     "kalofolias_max_iter": 200,
     "kalofolias_tol": 1e-4,
@@ -193,6 +195,12 @@ def _validate_model_config(model_config):
         raise ValueError("model.theta.glasso.backend must be one of: admm, quic, sklearn")
     if model_config["kalofolias_graph"] not in {"dense", "local"}:
         raise ValueError("model.theta.kalofolias.graph must be one of: dense, local")
+    if model_config["kalofolias_gamma"] is not None:
+        gamma_values = torch.as_tensor(model_config["kalofolias_gamma"])
+        if gamma_values.ndim > 1 or gamma_values.numel() == 0:
+            raise ValueError("model.theta.kalofolias.gamma must be a scalar, one-dimensional list, or null")
+        if torch.any(~torch.isfinite(gamma_values)) or torch.any(gamma_values <= 0):
+            raise ValueError("all model.theta.kalofolias.gamma values must be finite and positive")
     if model_config["theta_method"] == "kalofolias" and model_config["kalofolias_graph"] == "local":
         if model_config["theta_kNN"] <= model_config["kNN"]:
             raise ValueError("model.theta.local_kNN must be larger than model.graph.kNN for local Kalofolias")
@@ -212,6 +220,14 @@ def _add_bool_override(parser, name, dest, help_text):
     group = parser.add_mutually_exclusive_group()
     group.add_argument(f"--{name}", dest=dest, action="store_true", default=None, help=help_text)
     group.add_argument(f"--no-{name}", dest=dest, action="store_false", help=f"disable {help_text}")
+
+
+def _float_or_float_list(value):
+    """Parse one float or a comma-separated float schedule from the CLI."""
+    values = [float(item.strip()) for item in value.split(",") if item.strip()]
+    if not values:
+        raise argparse.ArgumentTypeError("expected a float or comma-separated float list")
+    return values[0] if len(values) == 1 else values
 
 
 def parse_args(argv=None):
@@ -331,6 +347,12 @@ def parse_args(argv=None):
     parser.add_argument("--kalofolias-graph", help="temporary override for model.theta.kalofolias.graph", default=None, type=str, choices=["dense", "local"])
     parser.add_argument("--kalofolias-alpha", help="temporary override for model.theta.kalofolias.alpha", default=None, type=float)
     parser.add_argument("--kalofolias-beta", help="temporary override for model.theta.kalofolias.beta", default=None, type=float)
+    parser.add_argument(
+        "--kalofolias-gamma",
+        help="Kalofolias gamma scalar or comma-separated schedule; omit to use YAML/automatic gamma",
+        default=None,
+        type=_float_or_float_list,
+    )
     parser.add_argument("--kalofolias-max-iter", help="temporary override for model.theta.kalofolias.max_iter", default=None, type=int)
     parser.add_argument("--kalofolias-tol", help="temporary override for model.theta.kalofolias.tol", default=None, type=float)
     parser.add_argument("--kalofolias-threshold", help="temporary override for model.theta.kalofolias.threshold", default=None, type=float)
@@ -409,6 +431,7 @@ def apply_args_to_config(config, args):
         "kalofolias_graph": "kalofolias_graph",
         "kalofolias_alpha": "kalofolias_alpha",
         "kalofolias_beta": "kalofolias_beta",
+        "kalofolias_gamma": "kalofolias_gamma",
         "kalofolias_max_iter": "kalofolias_max_iter",
         "kalofolias_tol": "kalofolias_tol",
         "kalofolias_threshold": "kalofolias_threshold",
@@ -700,6 +723,7 @@ def create_model(config, args, train_set, device):
         glasso_fallback=model_config["glasso_fallback"],
         kalofolias_alpha=model_config["kalofolias_alpha"],
         kalofolias_beta=model_config["kalofolias_beta"],
+        kalofolias_gamma=model_config["kalofolias_gamma"],
         kalofolias_graph=model_config["kalofolias_graph"],
         kalofolias_max_iter=model_config["kalofolias_max_iter"],
         kalofolias_tol=model_config["kalofolias_tol"],
@@ -1515,6 +1539,7 @@ def _log_cli_arguments(logger, args):
         "kalofolias_graph",
         "kalofolias_alpha",
         "kalofolias_beta",
+        "kalofolias_gamma",
         "kalofolias_max_iter",
         "kalofolias_tol",
         "kalofolias_threshold",
@@ -1552,7 +1577,7 @@ def _log_effective_model_flags(logger, config, model):
         model_config["deflation_per_timestep"],
     )
     logger.info(
-        "Effective Theta graph settings: theta_method=%s, glasso_backend=%s, kalofolias_graph=%s, kNN=%s, theta_local_kNN(requested/width; valid-per-node min-max)=%s/%s; %s-%s, kalofolias_output_mode=%s, kalofolias_learnable_alpha_beta=%s, kalofolias_allow_backward=%s",
+        "Effective Theta graph settings: theta_method=%s, glasso_backend=%s, kalofolias_graph=%s, kNN=%s, theta_local_kNN(requested/width; valid-per-node min-max)=%s/%s; %s-%s, kalofolias_gamma=%s, kalofolias_output_mode=%s, kalofolias_learnable_alpha_beta=%s, kalofolias_allow_backward=%s",
         model_config["theta_method"],
         model_config["glasso_backend"],
         model_config["kalofolias_graph"],
@@ -1561,6 +1586,7 @@ def _log_effective_model_flags(logger, config, model):
         getattr(model, "theta_effective_k_hop", model_config["theta_kNN"]),
         getattr(model, "theta_valid_k_min", model_config["theta_kNN"]),
         getattr(model, "theta_valid_k_max", model_config["theta_kNN"]),
+        model_config["kalofolias_gamma"],
         model_config["kalofolias_output_mode"],
         model_config["kalofolias_learnable_alpha_beta"],
         model_config["kalofolias_allow_backward"],

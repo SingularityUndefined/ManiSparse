@@ -90,6 +90,15 @@ In traffic training, use
 override `--kalofolias-learnable-alpha-beta`. This option applies only to the
 local Kalofolias graph.
 
+The solver step size can be set persistently with
+`model.theta.kalofolias.gamma` in `train/config.yaml`, or temporarily with
+`--kalofolias-gamma VALUE`. Leave the YAML value as `null` and omit the CLI
+flag to retain the automatic conservative gamma rule. A scalar keeps gamma
+constant. A list supplies evenly spaced control points that are linearly
+interpolated across `max_iter`, so `[0.05, 0.35]` is an increasing schedule.
+The equivalent CLI override is `--kalofolias-gamma 0.05,0.35`. Configured
+gamma values are passed to both dense and local Kalofolias solvers.
+
 In `clean_lib.unrolling_model.UnrollingModel`, set
 `model.theta.method: kalofolias` and `model.theta.kalofolias.graph: local` to
 use this solver for Theta. The main graph-learning neighbor count remains
@@ -165,3 +174,53 @@ convergence it keeps 104 of the 400 candidate slots, all inside the true local
 support, so precision is `1.0` and recall is `0.65`. The sparsity numbers in
 this benchmark are intentionally computed on the `(N, K)` candidate-slot matrix,
 because this is the representation used by sparse local graph operators.
+
+## Gamma Convergence Sweep
+
+The following experiment fixes `alpha=0.3` and `beta=1.0` and changes only the
+primal-dual step size `gamma`. It reuses the same synthetic local graph and
+signals as the benchmark above. The value named `default` is the solver's
+automatic conservative choice:
+
+```text
+gamma_default = 0.9 / (2 * beta + sqrt(K) + 1)
+              = 0.14604989  (beta=1, K=10)
+```
+
+Run from the repository root:
+
+```bash
+python -m local_kalofolias.sweep_gamma
+```
+
+The gamma list and output path can be overridden, while alpha and beta remain
+fixed by this experiment:
+
+```bash
+python -m local_kalofolias.sweep_gamma --gammas 0.05,0.1,default,0.2,0.35 --gamma-schedules increasing:0.05:0.35 --max-iter 1000 --output local_kalofolias/figures/gamma_convergence_sweep.png
+```
+
+Recorded result with convergence defined as relative change remaining below
+`1e-4` for the rest of the run:
+
+| gamma | iteration to `1e-4` | final relative change | nnz | F1 | relative weight error |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 0.025 | 353 | 2.35319e-12 | 104 | 0.7879 | 0.722341 |
+| 0.05 | 186 | 9.72126e-13 | 104 | 0.7879 | 0.722341 |
+| 0.1 | 99 | 9.96257e-13 | 104 | 0.7879 | 0.722341 |
+| 0.14604989 (default) | 70 | 9.46649e-13 | 104 | 0.7879 | 0.722341 |
+| 0.2 | 53 | 9.46841e-13 | 104 | 0.7879 | 0.722341 |
+| 0.35 | 42 | 8.79829e-13 | 104 | 0.7879 | 0.722341 |
+| 0.4 | 46 | 9.73148e-13 | 104 | 0.7879 | 0.722341 |
+| increasing 0.05 -> 0.35 | 139 | 9.33626e-13 | 104 | 0.7879 | 0.722341 |
+
+![Gamma convergence sweep](figures/gamma_convergence_sweep.png)
+
+All tested values reach the same recovered support and weight error, but their
+convergence rates differ substantially. In this problem, increasing gamma from
+the conservative default reduces the sustained-convergence point from 70
+iterations to 42 iterations at `gamma=0.35`, whereas `gamma=0.025` needs 353
+iterations. The linear increasing schedule from `0.05` to `0.35` reaches the
+same criterion at iteration 139. This is an empirical result for this synthetic
+problem; larger steps are not guaranteed to remain stable on other data or
+candidate graphs.

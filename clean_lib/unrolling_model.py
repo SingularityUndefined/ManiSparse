@@ -453,6 +453,7 @@ class UnrollingModel(nn.Module):
         kalofolias_allow_backward=True,
         use_deflation=True,
         deflation_samples=None,
+        kalofolias_gamma=None,
     ):
         super().__init__()
         graph_info = DEFAULT_GRAPH_INFO if graph_info is None else graph_info
@@ -492,6 +493,7 @@ class UnrollingModel(nn.Module):
         self.glasso_allow_backward = glasso_allow_backward
         self.kalofolias_alpha = kalofolias_alpha
         self.kalofolias_beta = kalofolias_beta
+        self.kalofolias_gamma = kalofolias_gamma
         self.kalofolias_max_iter = kalofolias_max_iter
         self.kalofolias_tol = kalofolias_tol
         self.kalofolias_threshold = kalofolias_threshold
@@ -502,6 +504,7 @@ class UnrollingModel(nn.Module):
         self.kalofolias_graph_estimator = KalofoliasGraphLearningModule(
             alpha=kalofolias_alpha,
             beta=kalofolias_beta,
+            gamma=kalofolias_gamma,
             max_iter=kalofolias_max_iter,
             tol=kalofolias_tol,
             threshold=kalofolias_threshold,
@@ -550,6 +553,7 @@ class UnrollingModel(nn.Module):
                     neighbor_mask=self.theta_neighbor_mask,
                     alpha=kalofolias_alpha,
                     beta=kalofolias_beta,
+                    gamma=kalofolias_gamma,
                     max_iter=kalofolias_max_iter,
                     tol=kalofolias_tol,
                     threshold=kalofolias_threshold,
