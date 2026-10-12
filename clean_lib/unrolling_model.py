@@ -15,7 +15,7 @@ from clean_lib.backup_modules import (
 from clean_lib.feature_extractor import FeatureExtractor, GNNExtrapolation, GraphSAGEExtrapolation
 from clean_lib.graph_learning_module import GraphLearningModule
 from kalofolias_graph_learning import KalofoliasGraphLearningModule
-from local_kalofolias import LocalKalofoliasGraphLearning
+from local_kalofolias import CleanLocalKalofolias
 
 
 def _single_glasso_estimation(
@@ -454,6 +454,7 @@ class UnrollingModel(nn.Module):
         use_deflation=True,
         deflation_samples=None,
         kalofolias_gamma=None,
+        kalofolias_learnable_gamma=False,
     ):
         super().__init__()
         graph_info = DEFAULT_GRAPH_INFO if graph_info is None else graph_info
@@ -500,6 +501,7 @@ class UnrollingModel(nn.Module):
         self.kalofolias_output_mode = kalofolias_output_mode
         self.kalofolias_normalize_distances = kalofolias_normalize_distances
         self.kalofolias_learnable_alpha_beta = kalofolias_learnable_alpha_beta
+        self.kalofolias_learnable_gamma = kalofolias_learnable_gamma
         self.kalofolias_allow_backward = kalofolias_allow_backward
         self.kalofolias_graph_estimator = KalofoliasGraphLearningModule(
             alpha=kalofolias_alpha,
@@ -548,18 +550,16 @@ class UnrollingModel(nn.Module):
         # signal presented at that depth of the unrolled model.
         self.local_kalofolias_graph_estimators = nn.ModuleList(
             [
-                LocalKalofoliasGraphLearning(
+                CleanLocalKalofolias(
                     self.theta_neighbor_list,
                     neighbor_mask=self.theta_neighbor_mask,
                     alpha=kalofolias_alpha,
                     beta=kalofolias_beta,
                     gamma=kalofolias_gamma,
                     max_iter=kalofolias_max_iter,
-                    tol=kalofolias_tol,
-                    threshold=kalofolias_threshold,
                     normalize_distances=kalofolias_normalize_distances,
-                    allow_backward=kalofolias_allow_backward,
                     learnable_alpha_beta=kalofolias_learnable_alpha_beta,
+                    learnable_gamma=kalofolias_learnable_gamma,
                 )
                 for _ in range(max(0, self.num_blocks - 1))
             ]
@@ -971,7 +971,9 @@ class UnrollingModel(nn.Module):
             signal_matrix = node_signal_matrix(signal[..., 0:1])
             signal_matrix = self._debug_tensor(f"block_{block_idx}.local_kalofolias_signal_matrix", signal_matrix)
             estimator = self.local_kalofolias_graph_estimators[block_idx - 1]
-            theta = estimator(signal_matrix)
+            z = estimator.compute_z(signal_matrix)
+            z = self._debug_tensor(f"block_{block_idx}.local_kalofolias_z", z)
+            theta = estimator(z)
             return self._debug_tensor(f"block_{block_idx}.Theta_local", theta)
 
         if self.theta_method == "kalofolias" and self._uses_dense_kalofolias():

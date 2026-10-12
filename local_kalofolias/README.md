@@ -79,25 +79,24 @@ signals = torch.randn(40, 200)
 local_weights = module(signals)  # (40, 10)
 ```
 
-Set `learnable_alpha_beta=True` to learn a separate bounded parameter pair for
-every 10 solver iterations. For the default `max_iter=200`, this creates 20
-shared pairs. Every pair starts from `alpha=0.3`, `beta=1.0`; sigmoid
-parameterization keeps alpha in `[0.1, 2.0]` and beta in `[0.5, 1.5]`. When enabled,
-the solver runs all `max_iter` iterations so every parameter group is used.
+The clean module can learn one independent parameter value per solver
+iteration. Set `learnable_alpha_beta=True` for alpha and beta, and
+`learnable_gamma=True` for gamma. For `max_iter=50`, each enabled parameter is
+a vector with shape `(50,)`. Every block owns independent vectors, while all
+blocks start from the same configured alpha, beta, and gamma. Sigmoid
+parameterization keeps alpha in `[0.1, 2.0]` and beta in `[0.5, 1.5]`; gamma
+uses a positive softplus parameterization.
 
-In traffic training, use
-`model.theta.kalofolias.learnable_alpha_beta: True`, or the temporary CLI
-override `--kalofolias-learnable-alpha-beta`. This option applies only to the
-local Kalofolias graph.
+In traffic training, use `model.theta.kalofolias.learnable_alpha_beta: True`
+and/or `model.theta.kalofolias.learnable_gamma: True`. The corresponding CLI
+overrides are `--kalofolias-learnable-alpha-beta` and
+`--kalofolias-learnable-gamma`. These options apply only to the local graph.
 
-The solver step size can be set persistently with
+The gamma initialization can be set persistently with
 `model.theta.kalofolias.gamma` in `train/config.yaml`, or temporarily with
-`--kalofolias-gamma VALUE`. Leave the YAML value as `null` and omit the CLI
-flag to retain the automatic conservative gamma rule. A scalar keeps gamma
-constant. A list supplies evenly spaced control points that are linearly
-interpolated across `max_iter`, so `[0.05, 0.35]` is an increasing schedule.
-The equivalent CLI override is `--kalofolias-gamma 0.05,0.35`. Configured
-gamma values are passed to both dense and local Kalofolias solvers.
+`--kalofolias-gamma VALUE`. Leave it as `null` to use the automatic
+conservative initialization. Training accepts one scalar initialization, not
+an interpolated gamma scheduler.
 
 In `clean_lib.unrolling_model.UnrollingModel`, set
 `model.theta.method: kalofolias` and `model.theta.kalofolias.graph: local` to

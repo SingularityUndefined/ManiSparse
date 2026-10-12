@@ -7,6 +7,7 @@ from .local_kalofolias import (
     learn_local_graph_from_smooth_signals,
     local_weights_to_dense,
 )
+from .clean_local_kalofolias import CleanLocalKalofolias
 
 __all__ = [
     "LocalKalofoliasGraphLearning",
@@ -14,4 +15,5 @@ __all__ = [
     "build_ring_neighbor_list",
     "learn_local_graph_from_smooth_signals",
     "local_weights_to_dense",
+    "CleanLocalKalofolias",
 ]

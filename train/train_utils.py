@@ -72,6 +72,7 @@ MODEL_CONFIG_PATHS = {
     "kalofolias_output_mode": ("theta", "kalofolias", "output_mode"),
     "kalofolias_normalize_distances": ("theta", "kalofolias", "normalize_distances"),
     "kalofolias_learnable_alpha_beta": ("theta", "kalofolias", "learnable_alpha_beta"),
+    "kalofolias_learnable_gamma": ("theta", "kalofolias", "learnable_gamma"),
     "kalofolias_allow_backward": ("theta", "kalofolias", "allow_backward"),
     "use_stable_graph_learning": ("graph_learning", "use_stable_graph_learning"),
     "sharedM": ("graph_learning", "sharedM"),
@@ -106,6 +107,7 @@ MODEL_DEFAULTS = {
     "kalofolias_output_mode": "laplacian",
     "kalofolias_normalize_distances": True,
     "kalofolias_learnable_alpha_beta": False,
+    "kalofolias_learnable_gamma": False,
     "kalofolias_allow_backward": True,
 }
 
@@ -196,11 +198,9 @@ def _validate_model_config(model_config):
     if model_config["kalofolias_graph"] not in {"dense", "local"}:
         raise ValueError("model.theta.kalofolias.graph must be one of: dense, local")
     if model_config["kalofolias_gamma"] is not None:
-        gamma_values = torch.as_tensor(model_config["kalofolias_gamma"])
-        if gamma_values.ndim > 1 or gamma_values.numel() == 0:
-            raise ValueError("model.theta.kalofolias.gamma must be a scalar, one-dimensional list, or null")
-        if torch.any(~torch.isfinite(gamma_values)) or torch.any(gamma_values <= 0):
-            raise ValueError("all model.theta.kalofolias.gamma values must be finite and positive")
+        gamma = torch.as_tensor(model_config["kalofolias_gamma"])
+        if gamma.ndim != 0 or not torch.isfinite(gamma) or gamma <= 0:
+            raise ValueError("model.theta.kalofolias.gamma must be one finite positive scalar or null")
     if model_config["theta_method"] == "kalofolias" and model_config["kalofolias_graph"] == "local":
         if model_config["theta_kNN"] <= model_config["kNN"]:
             raise ValueError("model.theta.local_kNN must be larger than model.graph.kNN for local Kalofolias")
@@ -208,6 +208,10 @@ def _validate_model_config(model_config):
         model_config["theta_method"] == "kalofolias" and model_config["kalofolias_graph"] == "local"
     ):
         raise ValueError("learnable Kalofolias alpha/beta requires theta.method=kalofolias and kalofolias.graph=local")
+    if model_config["kalofolias_learnable_gamma"] and not (
+        model_config["theta_method"] == "kalofolias" and model_config["kalofolias_graph"] == "local"
+    ):
+        raise ValueError("learnable Kalofolias gamma requires theta.method=kalofolias and kalofolias.graph=local")
     if model_config["kalofolias_learnable_alpha_beta"]:
         if not 0.1 <= model_config["kalofolias_alpha"] <= 2.0:
             raise ValueError("learnable Kalofolias alpha must initialize in [0.1, 2.0]")
@@ -220,14 +224,6 @@ def _add_bool_override(parser, name, dest, help_text):
     group = parser.add_mutually_exclusive_group()
     group.add_argument(f"--{name}", dest=dest, action="store_true", default=None, help=help_text)
     group.add_argument(f"--no-{name}", dest=dest, action="store_false", help=f"disable {help_text}")
-
-
-def _float_or_float_list(value):
-    """Parse one float or a comma-separated float schedule from the CLI."""
-    values = [float(item.strip()) for item in value.split(",") if item.strip()]
-    if not values:
-        raise argparse.ArgumentTypeError("expected a float or comma-separated float list")
-    return values[0] if len(values) == 1 else values
 
 
 def parse_args(argv=None):
@@ -349,9 +345,9 @@ def parse_args(argv=None):
     parser.add_argument("--kalofolias-beta", help="temporary override for model.theta.kalofolias.beta", default=None, type=float)
     parser.add_argument(
         "--kalofolias-gamma",
-        help="Kalofolias gamma scalar or comma-separated schedule; omit to use YAML/automatic gamma",
+        help="fixed Kalofolias gamma scalar; omit to use YAML/automatic gamma",
         default=None,
-        type=_float_or_float_list,
+        type=float,
     )
     parser.add_argument("--kalofolias-max-iter", help="temporary override for model.theta.kalofolias.max_iter", default=None, type=int)
     parser.add_argument("--kalofolias-tol", help="temporary override for model.theta.kalofolias.tol", default=None, type=float)
@@ -367,7 +363,13 @@ def parse_args(argv=None):
         parser,
         "kalofolias-learnable-alpha-beta",
         "kalofolias_learnable_alpha_beta",
-        "learn one bounded alpha/beta pair per 10 local Kalofolias iterations",
+        "learn one bounded alpha/beta value per local Kalofolias iteration",
+    )
+    _add_bool_override(
+        parser,
+        "kalofolias-learnable-gamma",
+        "kalofolias_learnable_gamma",
+        "learn one positive gamma value per local Kalofolias iteration",
     )
     _add_bool_override(
         parser,
@@ -438,6 +440,7 @@ def apply_args_to_config(config, args):
         "kalofolias_output_mode": "kalofolias_output_mode",
         "kalofolias_normalize_distances": "kalofolias_normalize_distances",
         "kalofolias_learnable_alpha_beta": "kalofolias_learnable_alpha_beta",
+        "kalofolias_learnable_gamma": "kalofolias_learnable_gamma",
         "kalofolias_allow_backward": "kalofolias_allow_backward",
     }
     for arg_name, config_key in arg_to_config_key.items():
@@ -548,6 +551,7 @@ def build_experiment_names(config, args):
         if not model_config["deflation_per_timestep"]:
             name = "deflatePerT0_" + name
     name = f"kaloAB{int(model_config['kalofolias_learnable_alpha_beta'])}_" + name
+    name = f"kaloG{int(model_config['kalofolias_learnable_gamma'])}_" + name
     # Full backward is the default experiment, so only detached ablations need
     # an explicit marker in the run name.
     if theta_method == "kalofolias" and not model_config["kalofolias_allow_backward"]:
@@ -731,6 +735,7 @@ def create_model(config, args, train_set, device):
         kalofolias_output_mode=model_config["kalofolias_output_mode"],
         kalofolias_normalize_distances=model_config["kalofolias_normalize_distances"],
         kalofolias_learnable_alpha_beta=model_config["kalofolias_learnable_alpha_beta"],
+        kalofolias_learnable_gamma=model_config["kalofolias_learnable_gamma"],
         kalofolias_allow_backward=model_config["kalofolias_allow_backward"],
     ).to(device)
     return model, admm_info
@@ -1040,12 +1045,15 @@ def collect_spatial_penalty_vectors(model):
 
 
 def collect_kalofolias_parameter_vectors(model):
-    """Return learnable local-Kalofolias alpha/beta schedules by active block.
+    """Return learnable per-iteration alpha/beta/gamma vectors by active block.
 
     Every Theta-enabled block owns an independent local graph estimator and
     therefore an independent schedule.
     """
-    if not getattr(model, "kalofolias_learnable_alpha_beta", False):
+    if not (
+        getattr(model, "kalofolias_learnable_alpha_beta", False)
+        or getattr(model, "kalofolias_learnable_gamma", False)
+    ):
         return []
     if not (
         getattr(model, "theta_method", "").lower() == "kalofolias"
@@ -1061,18 +1069,33 @@ def collect_kalofolias_parameter_vectors(model):
 
     vectors = []
     for block_idx, estimator in enumerate(estimators, start=1):
-        if not getattr(estimator, "learnable_alpha_beta", False):
+        learns_alpha_beta = getattr(estimator, "learnable_alpha_beta", False)
+        learns_gamma = getattr(estimator, "learnable_gamma", False)
+        if not (learns_alpha_beta or learns_gamma):
             continue
-        alpha = torch.as_tensor(estimator.alpha).detach().to(torch.float32).reshape(-1).cpu().tolist()
-        beta = torch.as_tensor(estimator.beta).detach().to(torch.float32).reshape(-1).cpu().tolist()
-        share_interval = int(getattr(estimator, "parameter_share_interval", 1))
-        max_iter = int(getattr(estimator, "max_iter", max(len(alpha), len(beta)) * share_interval))
+        alpha = (
+            torch.as_tensor(estimator.alpha).detach().to(torch.float32).reshape(-1).cpu().tolist()
+            if learns_alpha_beta
+            else []
+        )
+        beta = (
+            torch.as_tensor(estimator.beta).detach().to(torch.float32).reshape(-1).cpu().tolist()
+            if learns_alpha_beta
+            else []
+        )
+        gamma = (
+            torch.as_tensor(estimator.gamma).detach().to(torch.float32).reshape(-1).cpu().tolist()
+            if learns_gamma
+            else []
+        )
+        max_iter = int(getattr(estimator, "max_iter", max(len(alpha), len(beta), len(gamma))))
         vectors.append(
             {
                 "block_idx": block_idx,
                 "alpha": alpha,
                 "beta": beta,
-                "parameter_share_interval": share_interval,
+                "gamma": gamma,
+                "parameter_share_interval": 1,
                 "max_iter": max_iter,
             }
         )
@@ -1405,11 +1428,10 @@ def plot_spatial_penalty_history(theta_history, save_path):
 
 
 def plot_kalofolias_parameter_history(theta_history, save_path):
-    """Plot every learnable alpha/beta component in one block-by-coefficient grid.
+    """Plot every learnable alpha/beta/gamma value in a block-by-coefficient grid.
 
-    Each component controls one consecutive group of Kalofolias solver
-    iterations. Rows correspond to blocks; the left and right columns show
-    alpha and beta respectively, with one line per component.
+    Each component controls exactly one Kalofolias solver iteration. Rows
+    correspond to blocks and columns to alpha, beta, and gamma.
     """
     block_ids = sorted(
         {
@@ -1425,10 +1447,10 @@ def plot_kalofolias_parameter_history(theta_history, save_path):
 
     figure, axes = plt.subplots(
         len(block_ids),
-        2,
+        3,
         sharex=True,
         squeeze=False,
-        figsize=(14, 3.8 * len(block_ids)),
+        figsize=(20, 3.8 * len(block_ids)),
         constrained_layout=True,
     )
     for row, block_idx in enumerate(block_ids):
@@ -1445,7 +1467,8 @@ def plot_kalofolias_parameter_history(theta_history, save_path):
             if item is not None:
                 block_entries.append((epoch_data["epoch"], item))
 
-        for column, (coefficient, label) in enumerate((("alpha", r"$\alpha$"), ("beta", r"$\beta$"))):
+        coefficients = (("alpha", r"$\alpha$"), ("beta", r"$\beta$"), ("gamma", r"$\gamma$"))
+        for column, (coefficient, label) in enumerate(coefficients):
             axis = axes[row, column]
             component_count = max((len(item[coefficient]) for _, item in block_entries), default=0)
             for component_idx in range(component_count):
@@ -1546,6 +1569,7 @@ def _log_cli_arguments(logger, args):
         "kalofolias_output_mode",
         "kalofolias_normalize_distances",
         "kalofolias_learnable_alpha_beta",
+        "kalofolias_learnable_gamma",
         "kalofolias_allow_backward",
         "stride",
         "lr",
@@ -1577,7 +1601,7 @@ def _log_effective_model_flags(logger, config, model):
         model_config["deflation_per_timestep"],
     )
     logger.info(
-        "Effective Theta graph settings: theta_method=%s, glasso_backend=%s, kalofolias_graph=%s, kNN=%s, theta_local_kNN(requested/width; valid-per-node min-max)=%s/%s; %s-%s, kalofolias_gamma=%s, kalofolias_output_mode=%s, kalofolias_learnable_alpha_beta=%s, kalofolias_allow_backward=%s",
+        "Effective Theta graph settings: theta_method=%s, glasso_backend=%s, kalofolias_graph=%s, kNN=%s, theta_local_kNN(requested/width; valid-per-node min-max)=%s/%s; %s-%s, kalofolias_gamma=%s, kalofolias_output_mode=%s, kalofolias_learnable_alpha_beta=%s, kalofolias_learnable_gamma=%s, kalofolias_allow_backward=%s",
         model_config["theta_method"],
         model_config["glasso_backend"],
         model_config["kalofolias_graph"],
@@ -1589,6 +1613,7 @@ def _log_effective_model_flags(logger, config, model):
         model_config["kalofolias_gamma"],
         model_config["kalofolias_output_mode"],
         model_config["kalofolias_learnable_alpha_beta"],
+        model_config["kalofolias_learnable_gamma"],
         model_config["kalofolias_allow_backward"],
     )
     if len(model.model_blocks) == 0:

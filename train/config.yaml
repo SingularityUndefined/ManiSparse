@@ -67,21 +67,17 @@ model:
       graph: local
       alpha: 0.3
       beta: 1.0
-      # Optional primal-dual step size gamma. Null keeps the automatic rule:
-      # 0.9 / (2 * beta + operator_norm + 1). A list, e.g. [0.05, 0.35],
-      # defines evenly spaced control points interpolated across max_iter.
+      # Optional fixed primal-dual step size. Null keeps the automatic rule.
       gamma: 0.35
       max_iter: 50
-      tol: 1.0e-4
-      threshold: 1.0e-4
+      # Used only when reporting learned-Theta support statistics.
+      threshold: 1.0e-6
       output_mode: laplacian
       normalize_distances: True
-      # Learn one bounded alpha/beta pair for every 10 local-solver iterations.
-      # All groups start from alpha=0.3 and beta=1.0.
+      # When enabled, initialize one independent alpha/beta value per iteration.
       learnable_alpha_beta: False
-      # Let gradients flow through the local Kalofolias solver. This is the
-      # default experiment; disable it only for detached-Theta ablations.
-      allow_backward: True
+      # When enabled, initialize one independent positive gamma per iteration.
+      learnable_gamma: False
 
   graph_learning:
     use_stable_graph_learning: True
