@@ -226,7 +226,7 @@ def _add_bool_override(parser, name, dest, help_text):
     group.add_argument(f"--no-{name}", dest=dest, action="store_false", help=f"disable {help_text}")
 
 
-def parse_args(argv=None):
+def parse_args(argv=None, *, testing=False):
     """Parse command-line arguments for traffic training.
 
     YAML is the source of persistent defaults.  Most model/data hyperparameters
@@ -242,6 +242,8 @@ def parse_args(argv=None):
     parser.add_argument("--cuda", help="CUDA device", default=-1, type=int)
     parser.add_argument("--dataset", help="dataset name", type=str, required=True)
     parser.add_argument("--batchsize", help="batch size", type=int, required=True)
+    if testing:
+        parser.add_argument("--checkpoint", required=True, help="path to val_<epoch>.pth or last_train_state.pth")
     parser.add_argument(
         "--logs-dir",
         default=f"logs_{datetime.now().strftime('%m%d')}",

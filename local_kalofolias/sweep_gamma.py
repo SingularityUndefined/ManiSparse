@@ -95,16 +95,25 @@ def gamma_label(gamma: float, automatic_gamma: float) -> str:
     return label
 
 
+def recovery_metrics(weights: torch.Tensor, true_local: torch.Tensor, threshold: float) -> Dict[str, float]:
+    """Do not report support or weight recovery for non-finite iterates."""
+    if not torch.isfinite(weights).all():
+        return {key: math.nan for key in ("nnz", "nnz_ratio", "f1", "rel_fro")}
+    return local_metrics(weights, true_local, threshold)
+
+
 def print_summary(rows: List[Dict[str, object]], convergence_tol: float) -> None:
     """Print one final convergence/recovery row per gamma."""
-    headers = ["gamma", f"iter_to_{convergence_tol:g}", "final_rel_change", "nnz", "f1", "rel_fro"]
+    headers = ["gamma", "converged", f"iter_to_{convergence_tol:g}", "final_rel_change", "nnz", "f1", "rel_fro"]
     print(" | ".join(headers))
     print(" | ".join(["---"] * len(headers)))
     for row in rows:
         iteration = "-" if row["iter_to_tol"] < 0 else str(int(row["iter_to_tol"]))
         print(
-            f"{row['label']} | {iteration} | {row['rel_change']:.6g} | "
-            f"{int(row['nnz'])} | {row['f1']:.4f} | {row['rel_fro']:.6g}"
+            f"{row['label']} | {'yes' if row['iter_to_tol'] >= 0 else 'no'} | "
+            f"{iteration} | {row['rel_change']:.6g} | "
+            f"{int(row['nnz']) if math.isfinite(row['nnz']) else '-'} | "
+            f"{row['f1']:.4f} | {row['rel_fro']:.6g}"
         )
 
 
@@ -156,11 +165,11 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description="Compare Local Kalofolias gamma values with alpha=0.3 and beta=1.0 fixed."
     )
-    parser.add_argument("--gammas", type=str, default="0.025,0.05,0.1,default,0.2,0.35,0.4")
+    parser.add_argument("--gammas", type=str, default="0.025,0.05,0.1,default,0.2,0.35,0.4,0.5,0.6")
     parser.add_argument(
         "--gamma-schedules",
         type=str,
-        default="increasing:0.05:0.35",
+        default="increasing:0.05:0.35,decreasing:0.35:0.05",
         help="comma-separated name:start:end linear schedules; use an empty string to disable",
     )
     parser.add_argument("--n-samples", type=int, default=200)
@@ -224,13 +233,14 @@ def main() -> None:
                 tol=args.tol,
                 gamma=gamma,
                 threshold=args.threshold,
+                early_stopping=False,
                 return_info=True,
             )
             trace.append(
                 {
                     "iter": float(checkpoint),
                     "rel_change": result.relative_change,
-                    **local_metrics(result.local_weights, true_local, args.threshold),
+                    **recovery_metrics(result.local_weights, true_local, args.threshold),
                 }
             )
         traces[case.label] = trace
@@ -243,7 +253,7 @@ def main() -> None:
                 "label": case.label,
                 "iter_to_tol": -1.0 if convergence_iteration is None else float(convergence_iteration),
                 "rel_change": full_result.relative_change,
-                **local_metrics(full_result.local_weights, true_local, args.threshold),
+                **recovery_metrics(full_result.local_weights, true_local, args.threshold),
             }
         )
 

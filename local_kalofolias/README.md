@@ -196,30 +196,37 @@ The gamma list and output path can be overridden, while alpha and beta remain
 fixed by this experiment:
 
 ```bash
-python -m local_kalofolias.sweep_gamma --gammas 0.05,0.1,default,0.2,0.35 --gamma-schedules increasing:0.05:0.35 --max-iter 1000 --output local_kalofolias/figures/gamma_convergence_sweep.png
+python -m local_kalofolias.sweep_gamma --gammas 0.05,0.1,default,0.2,0.35 --gamma-schedules increasing:0.05:0.35,decreasing:0.35:0.05 --max-iter 1000 --output local_kalofolias/figures/gamma_convergence_sweep.png
 ```
 
-Recorded result with convergence defined as relative change remaining below
-`1e-4` for the rest of the run:
+Recorded result with `alpha=0.3`, `beta=1.0`, `max_iter=1000`, `seed=0`, and
+`float64`. Each gamma runs the full iteration budget. A case is marked
+converged if its relative weight change stays finite and below `1e-4` from
+the reported iteration through iteration 1000. `-` means this criterion was
+not met:
 
-| gamma | iteration to `1e-4` | final relative change | nnz | F1 | relative weight error |
-| ---: | ---: | ---: | ---: | ---: | ---: |
-| 0.025 | 353 | 2.35319e-12 | 104 | 0.7879 | 0.722341 |
-| 0.05 | 186 | 9.72126e-13 | 104 | 0.7879 | 0.722341 |
-| 0.1 | 99 | 9.96257e-13 | 104 | 0.7879 | 0.722341 |
-| 0.14604989 (default) | 70 | 9.46649e-13 | 104 | 0.7879 | 0.722341 |
-| 0.2 | 53 | 9.46841e-13 | 104 | 0.7879 | 0.722341 |
-| 0.35 | 42 | 8.79829e-13 | 104 | 0.7879 | 0.722341 |
-| 0.4 | 46 | 9.73148e-13 | 104 | 0.7879 | 0.722341 |
-| increasing 0.05 -> 0.35 | 139 | 9.33626e-13 | 104 | 0.7879 | 0.722341 |
+| gamma | converged | iteration to `1e-4` | final relative change | nnz | F1 | relative weight error |
+| ---: | :---: | ---: | ---: | ---: | ---: | ---: |
+| 0.025 | yes | 353 | 2.35319e-12 | 104 | 0.7879 | 0.722341 |
+| 0.05 | yes | 186 | 0 | 104 | 0.7879 | 0.722341 |
+| 0.1 | yes | 99 | 9.33241e-17 | 104 | 0.7879 | 0.722341 |
+| 0.14604989 (default) | yes | 70 | 0 | 104 | 0.7879 | 0.722341 |
+| 0.2 | yes | 53 | 0 | 104 | 0.7879 | 0.722341 |
+| 0.35 | yes | 42 | 1.24089e-15 | 104 | 0.7879 | 0.722341 |
+| 0.4 | yes | 46 | 2.17347e-15 | 104 | 0.7879 | 0.722341 |
+| 0.5 | no | - | 1.62878 | 0 | 0.0000 | 1 |
+| 0.6 | no | - | nan | - | nan | nan |
+| increasing 0.05 -> 0.35 | yes | 139 | 1.42147e-15 | 104 | 0.7879 | 0.722341 |
+| decreasing 0.35 -> 0.05 | yes | 42 | 2.95117e-17 | 104 | 0.7879 | 0.722341 |
 
 ![Gamma convergence sweep](figures/gamma_convergence_sweep.png)
 
-All tested values reach the same recovered support and weight error, but their
-convergence rates differ substantially. In this problem, increasing gamma from
+Values from `0.025` through `0.4` reach the same recovered support and weight
+error, with substantially different convergence rates. Increasing gamma from
 the conservative default reduces the sustained-convergence point from 70
-iterations to 42 iterations at `gamma=0.35`, whereas `gamma=0.025` needs 353
-iterations. The linear increasing schedule from `0.05` to `0.35` reaches the
-same criterion at iteration 139. This is an empirical result for this synthetic
-problem; larger steps are not guaranteed to remain stable on other data or
-candidate graphs.
+iterations to 42 at `gamma=0.35`, whereas `gamma=0.025` needs 353 iterations.
+The linear increasing schedule from `0.05` to `0.35` reaches the same criterion
+at iteration 139; the linear decreasing schedule from `0.35` to `0.05` reaches
+it at iteration 42. At `gamma=0.5`, the updates still oscillate after 1000
+iterations. At `gamma=0.6`, the computation produces non-finite values. These
+are empirical outcomes for this synthetic problem and iteration budget.

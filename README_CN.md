@@ -280,6 +280,18 @@ models/<experiment_name>/Huber/
 
 `last_train_state.pth` 包含模型、optimizer、scheduler、下一 epoch、最佳 validation 状态、loss/Theta 历史以及 Python/NumPy/PyTorch CPU/CUDA 的 RNG 状态。以相同实验目录再次启动时会自动恢复它；可用以下选项控制：
 
+### 指定 checkpoint 评估测试集
+
+从仓库根目录运行测试入口，`--checkpoint` 可以指向 `val_<epoch>.pth` 或 `last_train_state.pth`：
+
+```bash
+python -m train.test_traffic \
+  --dataset PEMS08 --batchsize 4 --cuda 0 \
+  --checkpoint /path/to/val_12.pth
+```
+
+测试时需要传入与训练时一致的 `--config`、`--dataset`、`--ablation` 和模型相关命令行参数；例如训练时设置了 `--neighbors 4 --theta-neighbors 10`，测试时也要加上。程序打印测试 loss、整体的重建 RMSE、预测 RMSE/MAE/MAPE/rNMSE，以及多通道数据的逐通道指标。`last_train_state.pth` 是最近一个 epoch 的模型状态；如果想评估验证集最优模型，请使用对应的 `val_<epoch>.pth`。只加载可信来源的 `.pth` 文件。
+
 ```bash
 # 指定一个完整训练状态文件
 --resume /path/to/last_train_state.pth
