@@ -202,7 +202,7 @@ def _format_deflation_zero_mode_event(event):
     """Format one protected zero/near-zero deflation-mode occurrence."""
     event_kind = "exact_zero" if event.get("exact_zero", 0) > 0 else "near_zero"
     return (
-        f"kind={event_kind}, block={event.get('block', '-')}, mode={event.get('mode', '-')}, "
+        f"kind={event_kind}, block={event.get('block', '-')}, head={event.get('head', '-')}, mode={event.get('mode', '-')}, "
         f"below_eps={event.get('below_eps', '-')}/{event.get('total', '-')}, "
         f"exact_zero={event.get('exact_zero', '-')}/{event.get('total', '-')}, "
         f"squared_norm_range=[{event.get('min_squared_norm', float('nan')):.3e}, "
@@ -234,6 +234,7 @@ def _log_new_deflation_zero_mode_events(model, logger, epoch, num_epochs, iterat
         signature = (
             event.get("block"),
             event.get("mode"),
+            event.get("head"),
             event.get("per_timestep"),
             event_kind,
         )

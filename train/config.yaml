@@ -44,6 +44,7 @@ model:
     # If true, perform one N-node deflation solve for each (batch, time)
     # signal.  If false, modes are orthogonal over the full sequence.
     per_timestep: True
+    per_head: False
 
   theta:
     # method: glasso or kalofolias
@@ -73,6 +74,9 @@ model:
       # Used only when reporting learned-Theta support statistics.
       threshold: 1.0e-6
       output_mode: laplacian
+      # Signed local Kalofolias uses sign-adjusted distances and an abs-degree normalized Laplacian.
+      signed: False
+      unbiased: False
       normalize_distances: True
       # When enabled, initialize one independent alpha/beta value per iteration.
       learnable_alpha_beta: False
