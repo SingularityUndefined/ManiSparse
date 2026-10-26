@@ -27,6 +27,8 @@ class CleanLocalKalofolias(nn.Module):
         normalize_distances=True,
         learnable_alpha_beta=False,
         learnable_gamma=False,
+        signed=False,
+        unbiased=False,
     ):
         super().__init__()
         if neighbor_list is None:
@@ -46,6 +48,8 @@ class CleanLocalKalofolias(nn.Module):
         self._fixed_gamma = None if gamma is None else float(gamma)
         self.max_iter = max_iter
         self.normalize_distances = normalize_distances
+        self.signed = signed
+        self.unbiased = unbiased
 
         if learnable_alpha_beta:
             alpha_ratio = (alpha - self.alpha_min) / (self.alpha_max - self.alpha_min)
@@ -88,12 +92,33 @@ class CleanLocalKalofolias(nn.Module):
             return value
         return value[iteration]
 
-    def compute_z(self, signals):
-        """Compute local squared distances from ``(N,S)`` or ``(B,N,S)`` signals."""
+    def compute_z(self, signals, return_sign=False, n_heads=1):
+        """Compute local distances and optionally return ``sign(x_i^T x_j)``.
+
+        With unbiased enabled, center ``(B,N,S)`` signals over B only when
+        B is greater than one. Shared two-dimensional inputs are unchanged.
+        Multiple heads use head-major ``(H*B,N,S)`` input; centering and
+        distance normalization remain independent within each head.
+        """
+        if not isinstance(n_heads, int) or n_heads < 1:
+            raise ValueError("n_heads must be a positive integer")
+        if n_heads > 1:
+            if signals.ndim != 3 or signals.size(0) % n_heads != 0:
+                raise ValueError("multiple heads require head-major (H*B,N,S) signals")
+            grouped_signals = signals.reshape(n_heads, -1, *signals.shape[1:])
+            if self.unbiased and grouped_signals.size(1) > 1:
+                grouped_signals = grouped_signals - grouped_signals.mean(dim=1, keepdim=True)
+                signals = grouped_signals.reshape_as(signals)
+        elif self.unbiased and signals.ndim == 3 and signals.size(0) > 1:
+            signals = signals - signals.mean(dim=0, keepdim=True)
+        s = None
         neighbors = self.neighbor_list
         if signals.ndim == 2:
             neighbor_signals = signals[neighbors]
-            z = (signals[:, None, :] - neighbor_signals).square().sum(dim=-1)
+            if self.signed:
+                s = (signals[:, None, :] * neighbor_signals).sum(dim=-1).sign()
+                neighbor_signals = neighbor_signals * s[:, :, None]
+            squared_differences = (signals[:, None, :] - neighbor_signals).square()
         else:
             batch_size = signals.size(0)
             neighbor_signals = signals[:, neighbors.reshape(-1), :].reshape(
@@ -102,18 +127,38 @@ class CleanLocalKalofolias(nn.Module):
                 neighbors.size(1),
                 signals.size(-1),
             )
-            z = (signals[:, :, None, :] - neighbor_signals).square().sum(dim=-1)
+            if self.signed:
+                s = (signals[:, :, None, :] * neighbor_signals).sum(dim=-1).sign()
+                neighbor_signals = s[..., None] * neighbor_signals
+            squared_differences = (signals[:, :, None, :] - neighbor_signals).square()
+
+        z = squared_differences.sum(dim=-1)
 
         mask = self.neighbor_mask if z.ndim == 2 else self.neighbor_mask.unsqueeze(0)
         z = z * mask
+        if s is not None:
+            s = s * mask
         if self.normalize_distances:
-            positive = z[(z > 0) & mask]
-            if positive.numel() > 0:
-                z = z / positive.median().clamp_min(torch.finfo(z.dtype).eps)
-        return z
+            if n_heads > 1:
+                grouped_z = z.reshape(n_heads, -1)
+                positive_mask = grouped_z > 0
+                medians = grouped_z.detach().masked_fill(~positive_mask, float("nan")).nanmedian(dim=1).values
+                median_mask = positive_mask & (grouped_z == medians[:, None])
+                median_counts = median_mask.sum(dim=1)
+                scales = (grouped_z * median_mask).sum(dim=1) / median_counts.clamp_min(1)
+                scales = torch.where(median_counts > 0, scales, torch.ones_like(scales))
+                grouped_z = grouped_z / scales.clamp_min(torch.finfo(z.dtype).eps)[:, None]
+                z = grouped_z.reshape_as(z)
+            else:
+                positive = z[(z > 0) & mask]
+                if positive.numel() > 0:
+                    z = z / positive.median().clamp_min(torch.finfo(z.dtype).eps)
+        return (z, s) if return_sign else z
 
-    def forward(self, z):
-        """Return local weights with the same ``(N,K)`` or ``(B,N,K)`` shape as ``z``."""
+    def forward(self, z, s=None):
+        """Return local weights; signed mode requires signs from ``compute_z``."""
+        if self.signed and (s is None or s.shape != z.shape):
+            raise ValueError("signed mode requires s with the same shape as z")
         if self.neighbor_mask is None:
             mask = torch.ones_like(z, dtype=torch.bool)
         else:
@@ -150,4 +195,7 @@ class CleanLocalKalofolias(nn.Module):
             W = (W - y + q) * mask
             d = d - y_bar + q_bar
 
-        return torch.relu(W) * mask
+        out = torch.relu(W) * mask
+        if self.signed:
+            out = out * s
+        return out
