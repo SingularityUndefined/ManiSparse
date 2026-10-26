@@ -148,6 +148,14 @@ added/node   = learned Theta edges outside the original kNN list
 removed/node = original kNN edges missing from learned Theta
 ```
 
+Signed local graphs also report `negative=count/selected (percentage)` in
+the sampled-batch support logs. Both counts use the existing support threshold
+(`abs(weight) > kalofolias_threshold`), exclude masked candidate slots, and
+aggregate all batch items and heads. The percentage is the fraction of selected
+edges with negative weights, not the fraction of all candidate slots. Empty
+support reports `0/0 (0.0%)`. Epoch logs report the sampled means of the negative
+counts and per-batch percentages. Unsigned logs remain unchanged.
+
 ## Benchmark
 
 Run from the repository root:

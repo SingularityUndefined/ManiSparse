@@ -981,6 +981,17 @@ def _theta_support_delta_against_knn(model, admm_block, theta):
         removed_per_node = (original_baseline_count - learned_base_count).clamp_min(0.0)
         learned_per_node = learned_support.sum(dim=-1).to(torch.float32)
 
+        graph_metrics = _theta_graph_metrics(
+            learned_support,
+            baseline_mask_batched,
+            candidate_mask_batched,
+        )
+        if uses_local_kalofolias and getattr(model, "kalofolias_signed", False):
+            negative_edges = torch.logical_and(theta < 0, learned_support).sum().item()
+            selected_edges = graph_metrics["selected_edges"]
+            graph_metrics["negative_edges"] = negative_edges
+            graph_metrics["negative_ratio"] = negative_edges / selected_edges if selected_edges else 0.0
+
         return {
             "kind": "local",
             "threshold": float(threshold),
@@ -988,11 +999,7 @@ def _theta_support_delta_against_knn(model, admm_block, theta):
             "learned_edges_per_node": float(learned_per_node.mean().detach().cpu()),
             "added_per_node": float(added_per_node.mean().detach().cpu()),
             "removed_per_node": float(removed_per_node.mean().detach().cpu()),
-            "graph_metrics": _theta_graph_metrics(
-                learned_support,
-                baseline_mask_batched,
-                candidate_mask_batched,
-            ),
+            "graph_metrics": graph_metrics,
         }
 
     if theta.ndim in (2, 3):
@@ -1225,6 +1232,11 @@ def format_theta_support_batch(theta_stats, epoch, iteration_count, total_batche
             if support_delta["kind"] == "local":
                 precision_text = "n/a" if graph_metrics["precision"] is None else f"{graph_metrics['precision']:.1%}"
                 metrics_text += f", kNN_precision={precision_text}"
+            if "negative_edges" in graph_metrics:
+                metrics_text += (
+                    f", negative={graph_metrics['negative_edges']}/{graph_metrics['selected_edges']} "
+                    f"({graph_metrics['negative_ratio']:.1%})"
+                )
             lines.append(
                 f"  {block_name} [{support_delta['kind']}]: {metrics_text}; "
                 f"selected={graph_metrics['selected_edges']}/{graph_metrics['candidate_edges']}, "
@@ -1268,6 +1280,10 @@ def summarize_theta_metric_samples(theta_samples):
                 },
             )
             item["sample_count"] += 1
+            for metric_key in ("negative_edges", "negative_ratio"):
+                value = graph_metrics.get(metric_key)
+                if value is not None:
+                    item.setdefault(metric_key, []).append(float(value))
             for source, target in (("sparsity", "sparsity"), ("recall", "recall")):
                 value = graph_metrics.get(source)
                 if value is not None:
@@ -1308,6 +1324,10 @@ def summarize_theta_metric_samples(theta_samples):
         for metric_key in ("theta_abs_q10", "theta_abs_q50", "theta_abs_q90"):
             values = item[metric_key]
             block_summary[metric_key] = sum(values) / len(values) if values else None
+        for metric_key in ("negative_edges", "negative_ratio"):
+            values = item.get(metric_key)
+            if values:
+                block_summary[metric_key] = sum(values) / len(values)
         summary.append(block_summary)
     return summary
 
@@ -1329,6 +1349,11 @@ def format_theta_epoch_summary(theta_summary, epoch):
         if item["kind"] == "local":
             precision = "n/a" if item["precision"] is None else f"{item['precision']:.1%}"
             line += f", kNN_precision={precision}"
+        if "negative_edges" in item:
+            line += (
+                f", sampled_mean_negative={item['negative_edges']:.1f}, "
+                f"sampled_mean_negative_ratio={item['negative_ratio']:.1%}"
+            )
         coefficient_text = ", ".join(
             f"{name}={'n/a' if item[name] is None else f'{item[name]:.4f}'}"
             for name in ("mu_u", "lambda_theta", "total", "mu_share")
