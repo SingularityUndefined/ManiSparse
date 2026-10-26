@@ -214,7 +214,15 @@ PEMS03、batch=1 的一次前向加反向测试中，默认 detached 路径峰�
 
 `Theta` 进入 ADMM 前会先把负的对角线元素 clamp 到 0，并把归一化分母为 0 的位置设为 0，以避免 NaN/Inf。
 
-Kalofolias 配置位于 `model.theta.kalofolias`，其中 `graph: dense|local` 选择图表示，`local_kNN` 指定 local 候选边宽度。local 模式在 ADMM 中应用归一化局部 Laplacian，而不物化 dense 矩阵。若物理传感器图的某一连通分量无法提供请求数量的邻居，代码保留请求宽度，将缺失 slot mask 为零；它们不会进入求解器、ADMM 算子或图指标。日志会报告每个节点可用邻居数的最小/最大值。
+Kalofolias 配置位于 `model.theta.kalofolias`，其中 `graph: dense|local` 选择图表示，`local_kNN` 指定 local 候选边宽度。默认 YAML 保持 `signed: False`、`lambda_theta: 0`；可用 `--kalofolias-signed` / `--no-kalofolias-signed` 临时覆盖。signed 仅支持 `method=kalofolias`、`graph=local`、`output_mode=laplacian`。
+
+`model.theta.kalofolias.unbiased` 默认为 `False`，可用 `--kalofolias-unbiased` / `--no-kalofolias-unbiased` 覆盖。仅当 local Kalofolias 的输入是三维 `(B,N,S)` 且 `B > 1` 时，先沿 batch 维减去均值，再计算距离和 signed 符号。二维共享图输入和 batch size 为 1 的输入跳过去均值，沿用原计算。
+
+`model.deflation.per_head` 默认为 `False`，保留先合并所有 head 再 deflation 的路径。设为 `True` 或传 `--deflation-per-head` 后，每个 head 独立使用自己的 `Lu` 和 `Theta` 做 deflation；中间 modes 保持 `(B,K,T,N,H,C)`，仅模块返回的信号合并 head。后续 Kalofolias 分别处理每个 head 的 modes，local Theta 为 `(B,H,N,K_theta)`，dense Theta 为 `(B,H,N,N)`。原有每个 block 的 Kalofolias 参数在 head 之间共享，但距离归一化、batch 去均值和图求解分别执行，不混合 head 的信号。图指标汇总所有 head。此选项要求开启 deflation，也可用 `--no-deflation-per-head` 关闭。
+
+Local Theta 的多个 head 使用批量张量一次求解，不再通过 Python 循环逐 head 求解；每个 head 的距离归一化和 batch 去均值仍独立，实际 batch size 为 1 时不去均值。Deflation 同样批量处理所有 head，其正交投影、CG 系数和 detached 分支的提前停止条件均保持逐 head 独立。计算在模型所在设备上执行，CUDA 模型可利用 GPU 的张量并行，不使用多进程；CG 迭代、deflation modes 和 Kalofolias 迭代之间仍依次执行。Dense Kalofolias 图估计暂时保留逐 head 循环。此优化自动生效，不改变原有模型配置或默认参数。
+
+signed 模式用节点信号内积的符号计算局部距离，输出正负边权，然后在 ADMM 和 deflation 中应用归一化 signed Laplacian `I - D_abs^(-1/2) W D_abs^(-1/2)`，其中 `D_abs[i,i] = sum_j |W[i,j]|`；零度节点的对角项取 0。距离始终按信号维求和，所以当所有符号都是 `+1` 时，signed 与 unsigned 的边权和算子完全一致。两种 local 模式都保留原来的有向候选边表示，不物化 dense 矩阵。若物理传感器图的某一连通分量无法提供请求数量的邻居，代码保留请求宽度，将缺失 slot mask 为零；它们不会进入求解器、ADMM 算子或图指标。日志会报告每个节点可用邻居数的最小/最大值。
 
 `model.glasso_method`、`model.glasso_alpha`、`model.glasso_rho`、`model.glasso_eps`、`model.glasso_eigh_shift`、`model.glasso_eigh_shift_retries` 和 `model.glasso_fallback` 在 `train/config.yaml` 中配置，也可以用命令行临时覆盖。`glasso_alpha` 是所有 Graphical Lasso 后端的正则强度；`glasso_rho` 只传给 `glasso_pytorch` ADMM solver，`quic` 和 `sklearn` 会忽略它。`glasso_eps` 是可选的协方差对角 jitter，默认是 `0.0`，因为它会改变原始 GLASSO 问题。现在默认使用的是只作用在特征值分解求解器上的 shift recovery：如果 ADMM Theta 更新中的 `torch.linalg.eigh(A)` 失败，solver 会尝试 `eigh(A + delta I)`，然后把返回的特征值减回 `delta`。在精确算术下，这不会改变原本的 ADMM 更新。只有这些不改变谱问题的重试仍失败时，`glasso_fallback=True` 才会在原始协方差矩阵上 fallback 到 sklearn/quic；ridge/pinv 只是所有 GLASSO solver 都失败后的最终有限输出保护。
 如果训练中 GLASSO 触发 eigensolver fallback，训练日志会写出 `GLASSO fallback observed`，包括 epoch/batch、block index、Theta 来源、协方差维度、ADMM iteration、backend、shift 数值、retry index，以及 solver 从 ADMM 切到 sklearn/ridge 的路径。
@@ -287,6 +295,7 @@ models/<experiment_name>/Huber/
 ```bash
 python -m train.test_traffic \
   --dataset PEMS08 --batchsize 4 --cuda 0 \
+  --neighbors 6 --theta-neighbors 10 \
   --checkpoint /path/to/val_12.pth
 ```
 

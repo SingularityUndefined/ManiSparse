@@ -107,6 +107,38 @@ candidate list and passes both `Theta: (N, local_kNN)` and
 local operator directly, without materializing a dense `(N, N)` Theta matrix.
 The default convention is `model.theta.local_kNN = model.graph.kNN + 4`.
 
+Set `model.theta.kalofolias.signed: true` or pass `--kalofolias-signed` to
+learn signed local weights. The solver uses the sign of each node-pair signal
+inner product and the squared distance between sign-aligned signals. ADMM and
+deflation apply the normalized signed Laplacian
+`I - D_abs^(-1/2) W D_abs^(-1/2)`, where `D_abs[i,i] = sum_j |W[i,j]|`.
+Zero-degree rows have zero diagonal. Distances retain the original sum over
+signal dimensions, so all-positive signs produce exactly the unsigned weights
+and operator. Signed mode requires `output_mode: laplacian`. The
+training YAML keeps signed mode disabled; `--no-kalofolias-signed` explicitly
+selects the nonnegative normalized local Laplacian.
+
+Set `model.theta.kalofolias.unbiased: true` or pass `--kalofolias-unbiased`
+to subtract the mean across the batch dimension before computing distances
+and signs. The default is `false`, with `--no-kalofolias-unbiased` as an
+explicit opt-out. Centering applies only to three-dimensional `(B,N,S)`
+input with `B > 1`. Shared two-dimensional input and single-sample batches
+use the original signals.
+
+`model.deflation.per_head: true` or `--deflation-per-head` keeps each ADMM
+head separate during deflation and Kalofolias estimation. Modes have shape
+`(B,K,T,N,H,C)` and local Theta has shape `(B,H,N,K_theta)`. Each head uses
+its own Lu and Theta; head combination occurs only for the block's returned
+signal. Kalofolias parameters remain shared within a block, while distances,
+normalization and batch centering remain independent for each head. Local
+Theta heads are solved together in one batched tensor operation, without a
+Python loop over heads. Deflation also batches all heads, keeping projections,
+CG coefficients and detached-mode early stopping independent per head. CG
+iterations, deflation modes and Kalofolias iterations still execute sequentially;
+dense Kalofolias estimation retains its per-head loop. Batching uses the current
+device (including GPU when the model is on CUDA), not separate processes.
+The default is `false`; the option requires deflation to be enabled.
+
 Training logs compare learned local Theta support against the original
 `model.kNN` graph. The recorded sparsity diagnostic is not a global nnz ratio;
 it is the average per-node support change:
