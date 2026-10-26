@@ -94,12 +94,13 @@ class DeflationCGSolver(nn.Module):
         self.tol = tol
         self.allow_backward = allow_backward
 
-    def solve(self, A_func, b, x0=None, reduce_dims=None):
+    def solve(self, A_func, b, x0=None, *, reduce_dims, stop_group_dim=None):
         """Solve ``A x = b`` with reductions over ``reduce_dims``.
 
-        The default reduces every non-batch dimension, i.e. one CG problem per
-        batch item.  Deflation can instead retain the time dimension and solve
-        one independent CG problem for every ``(batch, time)`` pair.
+        Explicit reduction dimensions specify one CG problem per batch item,
+        or retain the time dimension for independent ``(batch, time)`` solves.
+        ``stop_group_dim`` retains independent early stopping for groups of
+        problems, such as heads, rather than waiting for every group.
         """
         if self.allow_backward:
             return self._solve(A_func, b, x0, early_stop=False, reduce_dims=reduce_dims)
@@ -110,21 +111,26 @@ class DeflationCGSolver(nn.Module):
                 None if x0 is None else x0.detach(),
                 early_stop=True,
                 reduce_dims=reduce_dims,
+                stop_group_dim=stop_group_dim,
             )
 
-    def _solve(self, A_func, b, x0=None, early_stop=True, reduce_dims=None):
+    def _solve(self, A_func, b, x0=None, early_stop=True, *, reduce_dims, stop_group_dim=None):
         if x0 is None:
             x = torch.zeros_like(b)
         else:
             x = x0.clone()
 
-        if reduce_dims is None:
-            reduce_dims = tuple(range(1, b.ndim))
         r = b - A_func(x)
         p = r.clone()
         rsold = (r * r).sum(dim=reduce_dims)
         eps = torch.finfo(b.dtype).eps
 
+        active_groups = None
+        if early_stop and stop_group_dim is not None:
+            stop_reduce_dims = tuple(dim for dim in range(rsold.ndim) if dim != stop_group_dim)
+            active_groups = ~(torch.sqrt(rsold) < self.tol).all(dim=stop_reduce_dims, keepdim=True)
+            active_shape = tuple(active_groups.shape) + (1,) * (b.ndim - active_groups.ndim)
+            p = torch.where(active_groups.view(active_shape), p, torch.zeros_like(p))
         if early_stop and torch.all(torch.sqrt(rsold) < self.tol):
             return x
 
@@ -134,11 +140,17 @@ class DeflationCGSolver(nn.Module):
             valid_denom = torch.abs(denom) > eps
             denom_safe = torch.where(valid_denom, denom, torch.ones_like(denom))
             alpha = torch.where(valid_denom, rsold / denom_safe, torch.zeros_like(rsold))
+            if active_groups is not None:
+                alpha = torch.where(active_groups, alpha, torch.zeros_like(alpha))
             view_shape = tuple(alpha.shape) + (1,) * (b.ndim - alpha.ndim)
 
             x = x + alpha.view(view_shape) * p
             r = r - alpha.view(view_shape) * Ap
             rsnew = (r * r).sum(dim=reduce_dims)
+            if active_groups is not None:
+                active_groups = active_groups & ~(torch.sqrt(rsnew) < self.tol).all(dim=stop_reduce_dims, keepdim=True)
+                if not torch.any(active_groups):
+                    break
             if early_stop and torch.all(torch.sqrt(rsnew) < self.tol):
                 break
 
@@ -146,6 +158,8 @@ class DeflationCGSolver(nn.Module):
             rsold_safe = torch.where(valid_rsold, rsold, torch.ones_like(rsold))
             beta = torch.where(valid_rsold, rsnew / rsold_safe, torch.zeros_like(rsold))
             p = r + beta.view(view_shape) * p
+            if active_groups is not None:
+                p = torch.where(active_groups.view(active_shape), p, torch.zeros_like(p))
             rsold = rsnew
 
         return x
@@ -219,6 +233,7 @@ class ADMMBlock(nn.Module):
         self.theta_neighbor_list = None
         self.theta_neighbor_mask = None
         self.theta_operator_mode = "matrix"
+        self.theta_signed = False
         self.last_deflation_zero_mode_events = []
 
         self.ADMM_iters = ADMM_info["ADMM_iters"]
@@ -228,6 +243,7 @@ class ADMMBlock(nn.Module):
         self.deflation_tol = ADMM_info.get("deflation_tol", 1e-6)
         self.deflation_allow_backward = ADMM_info.get("deflation_allow_backward", False)
         self.deflation_per_timestep = ADMM_info.get("deflation_per_timestep", False)
+        self.deflation_per_head = ADMM_info.get("deflation_per_head", False)
         self.couple_spatial_penalties = ADMM_info.get("couple_spatial_penalties", True)
 
         self.mu_u_init = ADMM_info["mu_u_init"]
@@ -456,7 +472,9 @@ class ADMMBlock(nn.Module):
             self.Theta: (N, N), shared by the batch, or (B, N, N), one dense
                 node matrix per batch sample. For local Kalofolias, Theta is a
                 local edge-weight tensor with shape (N, K_theta) or
-                (B, N, K_theta), and `theta_neighbor_list` gives the
+                (B, N, K_theta), or (B, H, N, K_theta) for separate heads.
+                Dense per-head matrices have shape (B, H, N, N).
+                `theta_neighbor_list` gives the
                 corresponding node indices with shape (N, K_theta).
 
         Returns:
@@ -473,11 +491,15 @@ class ADMMBlock(nn.Module):
             if Theta.size(0) != x.size(0):
                 raise ValueError("batched Theta must have the same batch size as x")
             return torch.einsum("bij,btjhc->btihc", Theta, x)
-        raise ValueError("Theta must have shape (N, N), (B, N, N), (N, K_theta), or (B, N, K_theta)")
+        if Theta.ndim == 4:
+            if Theta.shape[:2] != (x.size(0), self.n_heads):
+                raise ValueError("per-head Theta must match the batch size and number of heads")
+            return torch.einsum("bhij,btjhc->btihc", Theta, x)
+        raise ValueError("Theta must be shared, batched, or per-head dense/local node weights")
 
     def _is_local_theta(self, Theta):
         """Whether Theta is stored on a local candidate neighbor list."""
-        if self.theta_neighbor_list is None or Theta.ndim not in (2, 3):
+        if self.theta_neighbor_list is None or Theta.ndim not in (2, 3, 4):
             return False
         theta_neighbor_list = torch.as_tensor(self.theta_neighbor_list, device=Theta.device, dtype=torch.long)
         return Theta.size(-2) == self.n_nodes and Theta.size(-1) == theta_neighbor_list.size(1)
@@ -500,11 +522,19 @@ class ADMMBlock(nn.Module):
         eps = torch.finfo(weights.dtype).eps
         return torch.where(denom > 0, weights / denom.clamp_min(eps), torch.zeros_like(weights))
 
+    def _local_laplacian_terms(self, weights, neighbor_list):
+        """Return the diagonal and edge terms of the local Laplacian."""
+        degree = weights.abs().sum(dim=-1) if self.theta_signed else weights.sum(dim=-1)
+        neighbor_degree = degree[neighbor_list] if weights.ndim == 2 else degree[..., neighbor_list]
+        diagonal = (degree > 0).to(weights.dtype)
+        normalized_weights = self._safe_local_laplacian_weights(weights, degree, neighbor_degree)
+        return diagonal, normalized_weights
+
     def _apply_local_theta_to_head_x(self, Theta, x):
-        """Apply local adjacency or normalized local Laplacian to ADMM head tensors.
+        """Apply local adjacency or Laplacian to ADMM head tensors.
 
         Args:
-            Theta: local edge weights, (N, K_theta) or (B, N, K_theta).
+            Theta: (N, K_theta), (B, N, K_theta), or (B, H, N, K_theta).
             x: ADMM head tensor, (B, T, N, H, C).
         """
         theta_neighbor_list = self._theta_neighbor_list(x.device)
@@ -522,28 +552,30 @@ class ADMMBlock(nn.Module):
             if Theta.size(0) != self.n_nodes:
                 raise ValueError("local Theta must have shape (N, K_theta)")
             weights = Theta.view(1, 1, self.n_nodes, -1, 1, 1)
-            degree = Theta.sum(dim=-1)
-            neighbor_degree = degree[theta_neighbor_list]
-            diag_scale = (degree > 0).to(x.dtype).view(1, 1, self.n_nodes, 1, 1)
             local_weights = weights
             if self.theta_operator_mode == "laplacian":
-                local_weights = self._safe_local_laplacian_weights(Theta, degree, neighbor_degree).view(
-                    1, 1, self.n_nodes, -1, 1, 1
-                )
+                diagonal, laplacian_weights = self._local_laplacian_terms(Theta, theta_neighbor_list)
+                diag_scale = diagonal.view(1, 1, self.n_nodes, 1, 1)
+                local_weights = laplacian_weights.view(1, 1, self.n_nodes, -1, 1, 1)
         elif Theta.ndim == 3:
             if Theta.size(0) != x.size(0):
                 raise ValueError("batched local Theta must have the same batch size as x")
             weights = Theta.view(x.size(0), 1, self.n_nodes, -1, 1, 1)
-            degree = Theta.sum(dim=-1)
-            neighbor_degree = degree[:, theta_neighbor_list]
-            diag_scale = (degree > 0).to(x.dtype).view(x.size(0), 1, self.n_nodes, 1, 1)
             local_weights = weights
             if self.theta_operator_mode == "laplacian":
-                local_weights = self._safe_local_laplacian_weights(Theta, degree, neighbor_degree).view(
-                    x.size(0), 1, self.n_nodes, -1, 1, 1
-                )
+                diagonal, laplacian_weights = self._local_laplacian_terms(Theta, theta_neighbor_list)
+                diag_scale = diagonal.view(x.size(0), 1, self.n_nodes, 1, 1)
+                local_weights = laplacian_weights.view(x.size(0), 1, self.n_nodes, -1, 1, 1)
+        elif Theta.ndim == 4:
+            if Theta.shape[:2] != (x.size(0), self.n_heads):
+                raise ValueError("per-head local Theta must match the batch size and number of heads")
+            local_weights = Theta.permute(0, 2, 3, 1).unsqueeze(1).unsqueeze(-1)
+            if self.theta_operator_mode == "laplacian":
+                diagonal, laplacian_weights = self._local_laplacian_terms(Theta, theta_neighbor_list)
+                diag_scale = diagonal.permute(0, 2, 1).unsqueeze(1).unsqueeze(-1)
+                local_weights = laplacian_weights.permute(0, 2, 3, 1).unsqueeze(1).unsqueeze(-1)
         else:
-            raise ValueError("local Theta must have shape (N, K_theta) or (B, N, K_theta)")
+            raise ValueError("local Theta must have shape (N, K_theta), (B, N, K_theta), or (B, H, N, K_theta)")
 
         neighbor_term = (local_weights * neighbor_x).sum(dim=3)
         if self.theta_operator_mode == "adjacency":
@@ -727,11 +759,15 @@ class ADMMBlock(nn.Module):
         return torch.einsum("btnhc,h->btnc", x, self.comb_weights)
 
     def _apply_deflation_Lu(self, x):
-        """Apply the same learned Lu operator used by ADMM to output-scale x."""
+        """Apply Lu to combined signals or batched (B,H,T,N,C) signals."""
+        if x.ndim == 5:
+            return self.apply_op_Lu(x.permute(0, 2, 3, 1, 4)).permute(0, 3, 1, 2, 4)
         return self._combine_heads(self.apply_op_Lu(self._expand_heads(x)))
 
     def _apply_deflation_Theta(self, x):
-        """Apply the block's current Theta parameter to output-scale x."""
+        """Apply Theta to combined signals or batched (B,H,T,N,C) signals."""
+        if x.ndim == 5:
+            return self.apply_op_Theta(x.permute(0, 2, 3, 1, 4)).permute(0, 3, 1, 2, 4)
         if self.Theta is None:
             return torch.zeros_like(x)
         Theta = torch.as_tensor(self.Theta, device=x.device, dtype=x.dtype)
@@ -762,26 +798,20 @@ class ADMMBlock(nn.Module):
 
         if Theta.ndim == 2:
             weights = Theta.view(1, 1, self.n_nodes, -1, 1)
-            degree = Theta.sum(dim=-1)
-            neighbor_degree = degree[theta_neighbor_list]
-            diag_scale = (degree > 0).to(x.dtype).view(1, 1, self.n_nodes, 1)
             local_weights = weights
             if self.theta_operator_mode == "laplacian":
-                local_weights = self._safe_local_laplacian_weights(Theta, degree, neighbor_degree).view(
-                    1, 1, self.n_nodes, -1, 1
-                )
+                diagonal, laplacian_weights = self._local_laplacian_terms(Theta, theta_neighbor_list)
+                diag_scale = diagonal.view(1, 1, self.n_nodes, 1)
+                local_weights = laplacian_weights.view(1, 1, self.n_nodes, -1, 1)
         elif Theta.ndim == 3:
             if Theta.size(0) != x.size(0):
                 raise ValueError("batched local Theta must have the same batch size as x")
             weights = Theta.view(x.size(0), 1, self.n_nodes, -1, 1)
-            degree = Theta.sum(dim=-1)
-            neighbor_degree = degree[:, theta_neighbor_list]
-            diag_scale = (degree > 0).to(x.dtype).view(x.size(0), 1, self.n_nodes, 1)
             local_weights = weights
             if self.theta_operator_mode == "laplacian":
-                local_weights = self._safe_local_laplacian_weights(Theta, degree, neighbor_degree).view(
-                    x.size(0), 1, self.n_nodes, -1, 1
-                )
+                diagonal, laplacian_weights = self._local_laplacian_terms(Theta, theta_neighbor_list)
+                diag_scale = diagonal.view(x.size(0), 1, self.n_nodes, 1)
+                local_weights = laplacian_weights.view(x.size(0), 1, self.n_nodes, -1, 1)
         else:
             raise ValueError("local Theta must have shape (N, K_theta) or (B, N, K_theta)")
 
@@ -805,8 +835,11 @@ class ADMMBlock(nn.Module):
         In the default sequence-level mode we solve one problem per batch item.
         With ``deflation_per_timestep=True``, time is retained, so every
         (batch, time) pair solves its own N-dimensional spatial problem.
+        Batched per-head tensors use (B,H,T,N,C); H is never reduced.
         """
         start_dim = 2 if self.deflation_per_timestep else 1
+        if x.ndim == 5:
+            start_dim += 1
         return tuple(range(start_dim, x.ndim))
 
     def _mode_inner(self, x, y):
@@ -819,18 +852,23 @@ class ADMMBlock(nn.Module):
         valid_norm = squared_norm > eps
         if torch.any(~valid_norm):
             detached_norm = squared_norm.detach()
-            self.last_deflation_zero_mode_events.append(
-                {
+            head_norms = detached_norm.unbind(dim=1) if x.ndim == 5 else (detached_norm,)
+            for head_idx, head_norm in enumerate(head_norms):
+                if x.ndim == 5 and not torch.any(head_norm <= eps):
+                    continue
+                event = {
                     "mode": int(mode_idx),
-                    "below_eps": int((detached_norm <= eps).sum().cpu()),
-                    "exact_zero": int((detached_norm == 0).sum().cpu()),
-                    "total": detached_norm.numel(),
-                    "min_squared_norm": float(detached_norm.min().cpu()),
-                    "max_squared_norm": float(detached_norm.max().cpu()),
+                    "below_eps": int((head_norm <= eps).sum().cpu()),
+                    "exact_zero": int((head_norm == 0).sum().cpu()),
+                    "total": head_norm.numel(),
+                    "min_squared_norm": float(head_norm.min().cpu()),
+                    "max_squared_norm": float(head_norm.max().cpu()),
                     "eps": float(eps),
                     "per_timestep": bool(self.deflation_per_timestep),
                 }
-            )
+                if x.ndim == 5:
+                    event["head"] = head_idx
+                self.last_deflation_zero_mode_events.append(event)
 
         # Branch 1 -- 2026-09-04 original implementation.
         # This can produce NaN gradients because sqrt(0) has an infinite
@@ -864,8 +902,6 @@ class ADMMBlock(nn.Module):
         return x - self._mode_inner(x, q) * q
 
     def _project_orthogonal(self, x, basis, n_basis):
-        if n_basis == 0:
-            return x
         output = x
         for basis_idx in range(n_basis):
             q = basis[basis_idx] if isinstance(basis, list) else basis[:, basis_idx]
@@ -896,13 +932,14 @@ class ADMMBlock(nn.Module):
         """Generate multi-signal deflation modes from the original ADMM output.
 
         Args:
-            rhs: full sequence used as the deflation right-hand side, (B, T, N, C).
-            e_step_x: original ADMM forward output, (B, T, N, C).
+            rhs: deflation right-hand side, (B,T,N,C) or (B,H,T,N,C).
+            e_step_x: original ADMM output, with the same shape as rhs.
             n_modes: number of modes to return. Mode 0 is always e_step_x.
             iteration: ADMM parameter index used for mu_u/lambda_theta.
 
         Returns:
             multi_x: (B, n_modes, T, N, C).
+                Batched heads return (B, n_modes, H, T, N, C).
         """
         if n_modes < 1:
             raise ValueError("deflation requires at least one mode")
@@ -918,6 +955,7 @@ class ADMMBlock(nn.Module):
                 projected_A_func,
                 projected_rhs,
                 reduce_dims=self._deflation_reduce_dims(projected_rhs),
+                stop_group_dim=1 if projected_rhs.ndim == 5 else None,
             )
             x_k = self._project_orthogonal(z, basis, mode_idx)
             q_k = self._normalize_mode(x_k, mode_idx=mode_idx)
@@ -953,6 +991,8 @@ class ADMMBlock(nn.Module):
             If deflation=True:
                 output, multi_x where multi_x is (B, K, T, N, C) and
                 multi_x[:, 0] is exactly output.
+                With deflation_per_head, multi_x is (B, K, T, N, H, C),
+                and mode zero retains each head's original ADMM result.
         """
         self.last_deflation_zero_mode_events = []
         if mask is None:
@@ -1046,6 +1086,15 @@ class ADMMBlock(nn.Module):
         if not 0 <= deflation_iteration < self.ADMM_iters:
             raise ValueError("deflation_iteration must be in [0, ADMM_iters)")
         deflation_rhs_for_solver = deflation_rhs if self.deflation_allow_backward else deflation_rhs.detach()
+        if self.deflation_per_head:
+            head_output = x if self.deflation_allow_backward else x.detach()
+            head_output = head_output.permute(0, 3, 1, 2, 4)
+            head_rhs = deflation_rhs_for_solver.unsqueeze(1).expand_as(head_output)
+            multi_x = self._run_deflation(
+                head_rhs, head_output, deflation_samples, deflation_iteration
+            ).permute(0, 1, 3, 4, 2, 5)
+            assert torch.equal(multi_x[:, 0], x), "mode zero must retain every head's ADMM output"
+            return output, multi_x
         output_for_solver = output if self.deflation_allow_backward else output.detach()
         multi_x = self._run_deflation(
             deflation_rhs_for_solver,
