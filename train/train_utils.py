@@ -268,6 +268,10 @@ def parse_args(argv=None, *, testing=False):
     parser.add_argument("--batchsize", help="batch size", type=int, required=True)
     if testing:
         parser.add_argument("--checkpoint", required=True, help="path to val_<epoch>.pth or last_train_state.pth")
+        parser.add_argument(
+            "--eval-horizons", nargs="+", type=int, default=None,
+            help="report metrics over forecast steps 1..H (e.g. 6 12), after full model inference; does not change --tout",
+        )
     parser.add_argument(
         "--logs-dir",
         default=f"logs_{datetime.now().strftime('%m%d')}",

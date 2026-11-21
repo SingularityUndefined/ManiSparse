@@ -301,6 +301,42 @@ python -m train.test_traffic \
 
 测试时需要传入与训练时一致的 `--config`、`--dataset`、`--ablation` 和模型相关命令行参数；例如训练时设置了 `--neighbors 4 --theta-neighbors 10`，测试时也要加上。程序打印测试 loss、整体的重建 RMSE、预测 RMSE/MAE/MAPE/rNMSE，以及多通道数据的逐通道指标。`last_train_state.pth` 是最近一个 epoch 的模型状态；如果想评估验证集最优模型，请使用对应的 `val_<epoch>.pth`。只加载可信来源的 `.pth` 文件。
 
+### 完整预测后评估前 6 步和前 12 步
+
+使用 `--eval-horizons 6 12`，模型对每个 batch 只运行一次完整前向，然后分别统计预测区间第 1–6 步和第 1–12 步的整体 RMSE、MAE、MAPE，均打印四位小数，MAPE 单位为百分比。这不是只统计第 6 或第 12 个时间步。指标沿用 `utils.compute_metrics`：恢复原始数据尺度，将负预测 clamp 到 0；RMSE/MAE 包含真实值为 0 的元素，MAPE 排除绝对值不大于 `1e-8` 的真实值。新增区间指标为所有输入通道的整体指标。
+
+`--tout 12` 保持模型实际预测长度；`--eval-horizons` 只控制统计区间。不要为了评估前 6 步把这些 checkpoint 的 `--tout` 改成 6，否则权重尺寸不匹配。输入长度来自 `train/config.yaml` 的 `model.sequence.t_in`，这两个模型应保持为 12。可指定其他区间，如 `--eval-horizons 3 6 12`，每个值必须介于 1 和模型的 `t_out` 之间。
+
+在其他设备上，复制当前代码、原训练配置、checkpoint 和数据，从仓库根目录运行。默认数据目录为仓库同级的 `TS_datasets`；METR-LA 需要 `TS_datasets/METR-LA/{adj_mat.npy,node_values.npy}`，PEMS03 需要 `TS_datasets/PEMS0X_data/PEMS03/{PEMS03.npz,PEMS03.csv,PEMS03.txt}`。`--cuda 0` 选择目标机器的第 0 张 GPU，`--cuda -1` 使用 CPU。为复现结果，保持训练时的 batch size、seed、stride 和归一化设置。
+
+METR-LA，`val_40.pth`：
+
+```bash
+python -m train.test_traffic \
+  --config train/config.yaml --dataset METR-LA --cuda 0 --batchsize 12 \
+  --seed 42 --mode standardize --stride 3 --tout 12 \
+  --neighbors 4 --theta-neighbors 10 \
+  --theta-method kalofolias --kalofolias-graph local \
+  --kalofolias-signed --deflation-per-head \
+  --eval-horizons 6 12 \
+  --checkpoint logs_1102/models/kalofolias_local_signed/METR-LA/lr_1e-03_seed_42/thetaK10_k4_5b_25l_4h_6f_s3_int6_1FE/muU3_lambdaTheta0/spatialCoupled0_kaloG0_kaloAB0_deflatePerHead1_deflate5_true_loss/Huber/val_40.pth
+```
+
+PEMS03，`val_93.pth`：
+
+```bash
+python -m train.test_traffic \
+  --config train/config.yaml --dataset PEMS03 --cuda 0 --batchsize 8 \
+  --seed 3407 --mode standardize --stride 3 --tout 12 \
+  --neighbors 4 --theta-neighbors 10 \
+  --theta-method kalofolias --kalofolias-graph local \
+  --kalofolias-signed --kalofolias-allow-backward --deflation-per-head \
+  --eval-horizons 6 12 \
+  --checkpoint logs_1031/models/kalofolias_local_signed/PEMS03/lr_1e-03_seed_3407/thetaK10_k4_5b_25l_4h_6f_s3_int6_1FE/muU3_lambdaTheta0/spatialCoupled0_kaloG0_kaloAB0_deflatePerHead1_deflate5_true_loss/Huber/val_93.pth
+```
+
+输出的 `Forecast steps 1-6 (ALL)` 和 `Forecast steps 1-12 (ALL)` 分别对应两个区间；原有 `ALL: ...` 仍报告模型完整预测区间的指标。Python 调用也可使用 `utils.test(..., eval_horizons=[6, 12])`，结果位于返回的 `metrics['horizon_metrics'][6]` 和 `[12]`。
+
 ```bash
 # 指定一个完整训练状态文件
 --resume /path/to/last_train_state.pth

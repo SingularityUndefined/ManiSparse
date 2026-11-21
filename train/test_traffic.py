@@ -57,6 +57,11 @@ def load_checkpoint(model, path, device):
 def main(argv=None):
     args, config = parse_args(argv, testing=True)
     config = apply_args_to_config(config, args)
+    model_config = get_model_config(config)
+    if args.eval_horizons is not None and any(
+        not 1 <= horizon <= model_config['t_out'] for horizon in args.eval_horizons
+    ):
+        raise ValueError(f"--eval-horizons must be between 1 and model t_out={model_config['t_out']}")
     device = prepare_runtime(args)
     datasets_and_loaders, data_normalization = create_data(config, args, device)
     train_set, _, test_set, _, _, test_loader = datasets_and_loaders
@@ -71,7 +76,7 @@ def main(argv=None):
     result = evaluate_batches(
         model, test_loader, data_normalization, False, config, device,
         train_set.signal_channel, mode="val", loss_fn=loss_fn,
-        use_one_channel=use_one_channel,
+        use_one_channel=use_one_channel, eval_horizons=args.eval_horizons,
     )
     if use_one_channel:
         loss, metrics = result
@@ -82,6 +87,16 @@ def main(argv=None):
     print(f"Checkpoint: {checkpoint_path}")
     print(f"Dataset: {args.dataset} | test samples: {len(test_set)} | device: {device}")
     print(f"Test loss ({config['loss_function']}): {loss:.4f}")
+    if args.eval_horizons is not None:
+        print(f"Sequence: tin={model_config['t_in']} | model tout={model_config['t_out']}")
+        for horizon, span_metrics in metrics['horizon_metrics'].items():
+            mape = span_metrics['pred_MAPE']
+            mape_text = 'N/A' if mape is None else f'{mape:.4f}%'
+            print(
+                f"Forecast steps 1-{horizon} (ALL): "
+                f"RMSE={span_metrics['pred_RMSE']:.4f}, "
+                f"MAE={span_metrics['pred_MAE']:.4f}, MAPE={mape_text}"
+            )
     print(
         "ALL: rec_RMSE={rec_RMSE:.4f}, pred_RMSE={pred_RMSE:.4f}, "
         "pred_MAE={pred_MAE:.4f}, pred_MAPE={pred_MAPE:.4f}%, "

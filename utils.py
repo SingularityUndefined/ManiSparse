@@ -274,7 +274,7 @@ def _add_rmse_metrics(metrics):
     return metrics
 
 
-def test(model, val_loader, data_normalization, masked_flag, config, device, signal_channels, mode='test', loss_fn=None, use_one_channel=False, use_tqdm=True):
+def test(model, val_loader, data_normalization, masked_flag, config, device, signal_channels, mode='test', loss_fn=None, use_one_channel=False, use_tqdm=True, eval_horizons=None):
     """评估模型并返回汇总 metric。
 
     `test` 做的是“评价指标汇总”，不是保存每个样本的完整过程:
@@ -291,10 +291,17 @@ def test(model, val_loader, data_normalization, masked_flag, config, device, sig
        `pred_MSE/pred_RMSE/pred_MAE/pred_MAPE/rNMSE` 衡量 `t_in:` 后的预测。
     5. 多通道输入时额外返回 `metrics_d`，即每个 channel 各自的
        `rec_RMSE/pred_RMSE/pred_MAE/pred_MAPE`。
+    6. `eval_horizons` 可指定额外的预测前缀长度；完整前向只运行一次，
+       结果位于 `metrics['horizon_metrics'][H]`，不改变模型输出长度或 loss。
     """
     assert mode in ['val', 'test']
     model.eval()
     t_in = config['model']['sequence']['t_in']
+    if eval_horizons is not None:
+        t_out = config['model']['sequence']['t_out']
+        eval_horizons = list(dict.fromkeys(eval_horizons))
+        if any(not isinstance(h, int) or not 1 <= h <= t_out for h in eval_horizons):
+            raise ValueError(f"eval_horizons must contain integers between 1 and model t_out={t_out}")
     output_list = []
     x_list = []
     running_loss = 0.0
@@ -325,6 +332,18 @@ def test(model, val_loader, data_normalization, masked_flag, config, device, sig
     full_output = torch.cat(output_list, 0)
     full_x = torch.cat(x_list, 0)
     metrics = _add_rmse_metrics(compute_metrics(full_output, full_x, masked_flag, t_in))
+    if eval_horizons is not None:
+        horizon_metrics = {}
+        for horizon in eval_horizons:
+            span_metrics = metrics if horizon == full_output.shape[1] - t_in else compute_metrics(
+                full_output[:, :t_in + horizon], full_x[:, :t_in + horizon], masked_flag, t_in
+            )
+            horizon_metrics[horizon] = {
+                'pred_RMSE': math.sqrt(span_metrics['pred_MSE']),
+                'pred_MAE': span_metrics['pred_MAE'],
+                'pred_MAPE': span_metrics['pred_MAPE'],
+            }
+        metrics['horizon_metrics'] = horizon_metrics
     metrics_d = None if use_one_channel else _finalize_channel_metrics(channel_sums, len(val_loader))
 
     if mode == 'val':
