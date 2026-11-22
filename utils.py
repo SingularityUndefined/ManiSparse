@@ -411,6 +411,19 @@ def test_series(model, val_loader, data_normalization, masked_flag, config, devi
     }
 
 
+def _abs_error_quantiles(abs_error):
+    """计算全量 P95/P99，避免 torch.quantile 的 2**24 元素数限制。"""
+    if abs_error.numel() <= 2**24:
+        quantiles = abs_error.new_tensor([0.95, 0.99])
+        return torch.quantile(abs_error, quantiles).tolist()
+
+    # NumPy uses linear interpolation by default, matching torch.quantile.
+    # Keep all errors; averaging per-batch quantiles would change the metric.
+    # Leave overwrite_input disabled because other diagnostics reuse abs_error.
+    errors = abs_error.detach().cpu().numpy()
+    return np.quantile(errors, [0.95, 0.99]).tolist()
+
+
 def compute_metrics(output, x, masked_flag, t_in):
     """
     计算全局重建和预测指标。
@@ -441,6 +454,7 @@ def compute_metrics(output, x, masked_flag, t_in):
     pred_mse = ((x_pred - output_pred) ** 2).mean().item()
     pred_mae = torch.abs(output_pred - x_pred).mean().item()
     abs_error = torch.abs(output_pred - x_pred)
+    pred_abs_error_p95, pred_abs_error_p99 = _abs_error_quantiles(abs_error)
     # Keep this definition explicit instead of constructing a loss module on
     # every evaluation.  It is equivalent to HuberLoss(delta=1,
     # reduction="mean") and uses the same clamped predictions as RMSE/MAE.
@@ -468,8 +482,8 @@ def compute_metrics(output, x, masked_flag, t_in):
         'pred_MAE': pred_mae,
         'pred_MAPE': pred_mape,
         'pred_Huber': pred_huber,
-        'pred_abs_error_p95': torch.quantile(abs_error, 0.95).item(),
-        'pred_abs_error_p99': torch.quantile(abs_error, 0.99).item(),
+        'pred_abs_error_p95': pred_abs_error_p95,
+        'pred_abs_error_p99': pred_abs_error_p99,
         'pred_abs_error_max': abs_error.max().item(),
         'pred_abs_error_gt_100_rate': (abs_error > 100).float().mean().item(),
         'pred_max_error_sample': max_sample,
